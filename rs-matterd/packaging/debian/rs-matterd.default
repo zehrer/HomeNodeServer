@@ -2,4 +2,5 @@
 # The daemon starts without this file; uncomment to change defaults.
 #
 # RS_MATTERD_STATE_DIR=/var/lib/rs-matterd
-# RS_MATTERD_HEARTBEAT_SECS=60
+# RS_MATTERD_SETUP_PIN=20202021
+# RS_MATTERD_DISCRIMINATOR=3840
