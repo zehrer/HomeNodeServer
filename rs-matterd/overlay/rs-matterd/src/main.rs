@@ -69,6 +69,7 @@ fn run() -> Result<(), Error> {
     let state_dir = PathBuf::from(
         env::var("RS_MATTERD_STATE_DIR").unwrap_or_else(|_| String::from("/var/lib/rs-matterd")),
     );
+    let state_file = state_dir.join("state.psm");
 
     fs::create_dir_all(&state_dir).map_err(|_| rs_matter::error::ErrorCode::StdIoError)?;
 
@@ -116,10 +117,11 @@ fn run() -> Result<(), Error> {
     let mut transport = pin!(matter.run(&crypto, &socket, &socket));
 
     let psm = PSM.uninit().init_with(Psm::init());
-    psm.load(&state_dir, matter, NO_NETWORKS, NO_EVENTS)?;
+    psm.load(&state_file, matter, NO_NETWORKS, NO_EVENTS)?;
 
     log_startup(
         state_dir.as_path(),
+        state_file.as_path(),
         setup_pin,
         discriminator,
         matter.is_commissioned(),
@@ -133,11 +135,11 @@ fn run() -> Result<(), Error> {
     } else {
         info!(
             "loaded existing commissioning state from {}",
-            state_dir.display()
+            state_file.display()
         );
     }
 
-    let mut persist = pin!(psm.run(&state_dir, matter, NO_NETWORKS, NO_EVENTS));
+    let mut persist = pin!(psm.run(&state_file, matter, NO_NETWORKS, NO_EVENTS));
 
     let all = select4(
         &mut transport,
@@ -172,12 +174,14 @@ fn read_u16(key: &str, default: u16) -> u16 {
 
 fn log_startup(
     state_dir: &std::path::Path,
+    state_file: &std::path::Path,
     setup_pin: u32,
     discriminator: u16,
     commissioned: bool,
 ) {
     info!("starting rs-matterd");
     info!("state directory: {}", state_dir.display());
+    info!("state file: {}", state_file.display());
     info!(
         "device: vendor='{}' product='{}' node='{}'",
         DEFAULT_VENDOR_NAME, DEFAULT_PRODUCT_NAME, DEFAULT_DEVICE_NAME
