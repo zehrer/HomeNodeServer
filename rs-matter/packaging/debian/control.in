@@ -1,0 +1,10 @@
+Package: @PACKAGE_NAME@
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Depends: libc6 (>= 2.28), systemd
+Description: Minimal HomeNodeServer rs-matter systemd daemon package
+ A minimal daemon skeleton built against the rs-matter project for
+ HomeNodeServer.

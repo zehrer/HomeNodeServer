@@ -1,0 +1,5 @@
+# Optional overrides for rs-matterd.
+# The daemon starts without this file; uncomment to change defaults.
+#
+# RS_MATTERD_STATE_DIR=/var/lib/rs-matterd
+# RS_MATTERD_HEARTBEAT_SECS=60

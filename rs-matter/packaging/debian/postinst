@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+install -d -m 0755 /var/lib/rs-matterd
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

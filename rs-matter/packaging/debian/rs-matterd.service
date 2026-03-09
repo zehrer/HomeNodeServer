@@ -1,0 +1,15 @@
+[Unit]
+Description=HomeNodeServer rs-matter daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/rs-matterd
+WorkingDirectory=/var/lib/rs-matterd
+ExecStart=/usr/bin/rs-matterd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[package]
+name = "rs-matterd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+env_logger = "0.11"
+log = "0.4"
+rs-matter = { path = "../../rs-matter", features = ["async-io"] }
