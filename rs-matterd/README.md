@@ -1,4 +1,4 @@
-## rs-matter packaging
+## rs-matterd packaging
 
 This directory contains the `rs-matter` packaging and build automation for
 `HomeNodeServer`.
@@ -17,7 +17,7 @@ The build flow is:
 ### Entry point
 
 ```sh
-./rs-matter/scripts/rs-matter/build-deb.sh
+./rs-matterd/scripts/rs-matter/build-deb.sh
 ```
 
 Useful overrides:
@@ -26,16 +26,16 @@ Useful overrides:
 RS_MATTER_UPSTREAM_URL=https://github.com/project-chip/rs-matter.git \
 RS_MATTER_UPSTREAM_REF=main \
 DEB_MAINTAINER="Your Name <you@example.com>" \
-./rs-matter/scripts/rs-matter/build-deb.sh
+./rs-matterd/scripts/rs-matter/build-deb.sh
 ```
 
 ### Output
 
-The generated package is written to `rs-matter/dist/`.
+The generated package is written to `rs-matterd/dist/`.
 
 Install it on the Pi with:
 
 ```sh
-sudo apt install ./rs-matter/dist/rs-matterd_<version>_armhf.deb
+sudo apt install ./rs-matterd/dist/rs-matterd_<version>_armhf.deb
 sudo systemctl enable --now rs-matterd
 ```
