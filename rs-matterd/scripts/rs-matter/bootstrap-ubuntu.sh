@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+DEB_ARCH="${DEB_ARCH:-armhf}"
 
 if ! command -v apt-get >/dev/null 2>&1; then
     echo "This bootstrap script expects an apt-based Linux host." >&2
@@ -28,9 +29,18 @@ packages=(
     gcc-arm-linux-gnueabihf
     git
     libc6-dev-armhf-cross
+    "libdbus-1-dev:${DEB_ARCH}"
     pkg-config
     xz-utils
 )
+
+need_apt_update=0
+
+if ! dpkg --print-foreign-architectures | grep -qx "${DEB_ARCH}"; then
+    echo "Adding foreign architecture: ${DEB_ARCH}"
+    ${APT_BIN% apt-get} dpkg --add-architecture "${DEB_ARCH}"
+    need_apt_update=1
+fi
 
 missing_packages=()
 for package in "${packages[@]}"; do
@@ -42,7 +52,15 @@ done
 if [[ "${#missing_packages[@]}" -gt 0 ]]; then
     echo "Installing host packages: ${missing_packages[*]}"
     export DEBIAN_FRONTEND=noninteractive
+    need_apt_update=1
+fi
+
+if [[ "${need_apt_update}" -eq 1 ]]; then
+    export DEBIAN_FRONTEND=noninteractive
     ${APT_BIN} update
+fi
+
+if [[ "${#missing_packages[@]}" -gt 0 ]]; then
     ${APT_BIN} install -y "${missing_packages[@]}"
 fi
 

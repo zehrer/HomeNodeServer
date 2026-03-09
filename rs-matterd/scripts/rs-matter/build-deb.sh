@@ -23,10 +23,15 @@ export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
 source "${CARGO_HOME}/env"
 
 export CARGO_BUILD_TARGET="${TARGET_TRIPLE}"
+export CARGO_TARGET_DIR="${UPSTREAM_DIR}/target"
 export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER="${CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER:-arm-linux-gnueabihf-gcc}"
 export CC_armv7_unknown_linux_gnueabihf="${CC_armv7_unknown_linux_gnueabihf:-arm-linux-gnueabihf-gcc}"
 export CXX_armv7_unknown_linux_gnueabihf="${CXX_armv7_unknown_linux_gnueabihf:-arm-linux-gnueabihf-g++}"
 export PKG_CONFIG_ALLOW_CROSS=1
+export PKG_CONFIG_DIR=
+export PKG_CONFIG_PATH=
+export PKG_CONFIG_LIBDIR="${PKG_CONFIG_LIBDIR:-/usr/lib/arm-linux-gnueabihf/pkgconfig:/usr/share/pkgconfig}"
+export PKG_CONFIG_SYSROOT_DIR="${PKG_CONFIG_SYSROOT_DIR:-/}"
 
 rm -rf "${OVERLAY_DEST}" "${STAGING_ROOT}"
 mkdir -p "${OVERLAY_DEST}" "${DIST_DIR}"
