@@ -31,7 +31,6 @@ use rs_matter::pairing::qr::QrTextType;
 use rs_matter::pairing::DiscoveryCapabilities;
 use rs_matter::persist::{Psm, NO_NETWORKS};
 use rs_matter::respond::DefaultResponder;
-use rs_matter::sc::pase::spake2p::{Spake2pVerifierPassword, Spake2pVerifierPasswordRef};
 use rs_matter::sc::pase::MAX_COMM_WINDOW_TIMEOUT_SECS;
 use rs_matter::transport::MATTER_SOCKET_BIND_ADDR;
 use rs_matter::utils::init::InitMaybeUninit;
@@ -151,12 +150,8 @@ fn run() -> Result<(), Error> {
 }
 
 fn build_commissioning_data(setup_pin: u32, discriminator: u16) -> BasicCommData {
-    let setup_pin_bytes = setup_pin.to_le_bytes();
-
     BasicCommData {
-        password: Spake2pVerifierPassword::new_from_ref(Spake2pVerifierPasswordRef::new(
-            &setup_pin_bytes,
-        )),
+        password: setup_pin.to_le_bytes().into(),
         discriminator,
     }
 }

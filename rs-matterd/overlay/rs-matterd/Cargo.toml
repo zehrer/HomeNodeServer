@@ -7,6 +7,18 @@ license = "MIT OR Apache-2.0"
 
 [workspace]
 
+[features]
+default = ["log"]
+log = []
+mbedtls = ["rs-matter/mbedtls"]
+openssl = ["rs-matter/openssl"]
+zbus = ["rs-matter/zbus"]
+astro-dnssd = ["rs-matter/astro-dnssd"]
+zeroconf = ["rs-matter/zeroconf"]
+avahi = ["rs-matter/zbus"]
+resolve = ["rs-matter/zbus"]
+defmt = []
+
 [dependencies]
 async-io = "2"
 embassy-futures = "0.1"
