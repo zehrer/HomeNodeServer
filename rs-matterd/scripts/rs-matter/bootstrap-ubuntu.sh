@@ -57,40 +57,46 @@ fi
 configure_ubuntu_armhf_sources() {
     local main_sources="/etc/apt/sources.list.d/ubuntu.sources"
     local armhf_sources="/etc/apt/sources.list.d/ubuntu-armhf.sources"
+    local main_uri
+    local security_uri
+    local main_suites
+    local security_suites
+    local components
 
     if [[ "${os_id}" != "ubuntu" || -z "${os_codename}" || ! -f "${main_sources}" ]]; then
         return
     fi
 
-    if ! grep -q "^Architectures: ${native_arch}\$" "${main_sources}"; then
-        echo "Constraining native Ubuntu sources to ${native_arch}"
-        ${SUDO} cp "${main_sources}" "${main_sources}.codex.bak"
-        ${SUDO} python3 - "${main_sources}" "${native_arch}" <<'PY'
-from pathlib import Path
-import sys
+    main_uri="$(sed -n 's/^URIs: //p' "${main_sources}" | sed -n '1p')"
+    security_uri="$(sed -n 's/^URIs: //p' "${main_sources}" | sed -n '2p')"
+    main_suites="$(sed -n 's/^Suites: //p' "${main_sources}" | sed -n '1p')"
+    security_suites="$(sed -n 's/^Suites: //p' "${main_sources}" | sed -n '2p')"
+    components="$(sed -n 's/^Components: //p' "${main_sources}" | sed -n '1p')"
 
-path = Path(sys.argv[1])
-native_arch = sys.argv[2]
-paragraphs = path.read_text().strip().split("\n\n")
-updated = []
-for paragraph in paragraphs:
-    lines = paragraph.splitlines()
-    if not any(line.startswith("Architectures:") for line in lines):
-        insert_at = len(lines)
-        for idx, line in enumerate(lines):
-            if line.startswith("Components:"):
-                insert_at = idx + 1
-                break
-        lines.insert(insert_at, f"Architectures: {native_arch}")
-    updated.append("\n".join(lines))
-path.write_text("\n\n".join(updated) + "\n")
-PY
-        need_apt_update=1
+    if [[ -z "${main_uri}" || -z "${security_uri}" || -z "${main_suites}" || -z "${security_suites}" || -z "${components}" ]]; then
+        echo "Failed to parse Ubuntu source configuration from ${main_sources}" >&2
+        exit 1
     fi
 
-    if [[ ! -f "${armhf_sources}" ]]; then
-        echo "Adding Ubuntu ports sources for ${DEB_ARCH}"
-        ${SUDO} tee "${armhf_sources}" >/dev/null <<EOF
+    echo "Configuring Ubuntu package sources for native ${native_arch} and ${DEB_ARCH}"
+    ${SUDO} cp "${main_sources}" "${main_sources}.codex.bak"
+    ${SUDO} tee "${main_sources}" >/dev/null <<EOF
+Types: deb
+URIs: ${main_uri}
+Suites: ${main_suites}
+Components: ${components}
+Architectures: ${native_arch}
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: ${security_uri}
+Suites: ${security_suites}
+Components: ${components}
+Architectures: ${native_arch}
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+
+    ${SUDO} tee "${armhf_sources}" >/dev/null <<EOF
 Types: deb
 URIs: http://ports.ubuntu.com/ubuntu-ports/
 Suites: ${os_codename} ${os_codename}-updates ${os_codename}-backports
@@ -105,8 +111,7 @@ Components: main restricted universe multiverse
 Architectures: ${DEB_ARCH}
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
-        need_apt_update=1
-    fi
+    need_apt_update=1
 }
 
 configure_ubuntu_armhf_sources
