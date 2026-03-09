@@ -23,6 +23,8 @@ defmt = []
 async-io = "2"
 embassy-futures = "0.1"
 embassy-sync = "0.7"
+embassy-time = { version = "0.5", features = ["std"] }
+embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-64"] }
 env_logger = "0.11"
 futures-lite = "2"
 log = "0.4"

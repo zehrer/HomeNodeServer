@@ -112,7 +112,7 @@ async fn run_builtin_mdns<C: Crypto>(
         MDNS_IPV4_BROADCAST_ADDR, MDNS_IPV6_BROADCAST_ADDR, MDNS_SOCKET_DEFAULT_BIND_ADDR,
     };
 
-    let mut socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     socket.set_only_v6(false)?;
     socket.bind(&MDNS_SOCKET_DEFAULT_BIND_ADDR.into())?;
