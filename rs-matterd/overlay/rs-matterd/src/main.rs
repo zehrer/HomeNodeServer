@@ -1,20 +1,23 @@
+use core::cell::Cell;
 use core::pin::pin;
 
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
 use std::net::UdpSocket;
 use std::path::PathBuf;
 
 use embassy_futures::select::{select, select4};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use log::info;
+use log::{error, info};
 use rand::RngCore;
 use rs_matter::crypto::{default_crypto, Crypto};
 use rs_matter::dm::clusters::basic_info::BasicInfoConfig;
+use rs_matter::dm::clusters::decl::on_off as on_off_cluster;
 use rs_matter::dm::clusters::desc::{self, ClusterHandler as _};
 use rs_matter::dm::clusters::level_control::LevelControlHooks;
 use rs_matter::dm::clusters::net_comm::NetworkType;
-use rs_matter::dm::clusters::on_off::{self, test::TestOnOffDeviceLogic, OnOffHooks};
+use rs_matter::dm::clusters::on_off::{self, EffectVariantEnum, OnOffHooks, StartUpOnOffEnum};
 use rs_matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_DET};
 use rs_matter::dm::devices::DEV_TYPE_ON_OFF_LIGHT;
 use rs_matter::dm::endpoints;
@@ -32,11 +35,12 @@ use rs_matter::pairing::DiscoveryCapabilities;
 use rs_matter::persist::{Psm, NO_NETWORKS};
 use rs_matter::respond::DefaultResponder;
 use rs_matter::sc::pase::MAX_COMM_WINDOW_TIMEOUT_SECS;
+use rs_matter::tlv::Nullable;
 use rs_matter::transport::MATTER_SOCKET_BIND_ADDR;
 use rs_matter::utils::init::InitMaybeUninit;
 use rs_matter::utils::select::Coalesce;
 use rs_matter::utils::storage::pooled::PooledBuffers;
-use rs_matter::{clusters, devices, BasicCommData, Matter, MATTER_PORT};
+use rs_matter::{clusters, devices, with, BasicCommData, Cluster, Matter, MATTER_PORT};
 use static_cell::StaticCell;
 
 mod mdns;
@@ -46,6 +50,7 @@ const DEFAULT_DISCRIMINATOR: u16 = 3840;
 const DEFAULT_DEVICE_NAME: &str = "HomeNodeServer";
 const DEFAULT_PRODUCT_NAME: &str = "rs-matterd";
 const DEFAULT_VENDOR_NAME: &str = "HomeNode";
+const ON_OFF_STATE_FILE_NAME: &str = "onoff-state.bin";
 
 static MATTER: StaticCell<Matter> = StaticCell::new();
 static BUFFERS: StaticCell<PooledBuffers<10, NoopRawMutex, IMBuffer>> = StaticCell::new();
@@ -70,6 +75,7 @@ fn run() -> Result<(), Error> {
         env::var("RS_MATTERD_STATE_DIR").unwrap_or_else(|_| String::from("/var/lib/rs-matterd")),
     );
     let state_file = state_dir.join("state.psm");
+    let on_off_state_file = state_dir.join(ON_OFF_STATE_FILE_NAME);
 
     fs::create_dir_all(&state_dir).map_err(|_| rs_matter::error::ErrorCode::StdIoError)?;
 
@@ -96,7 +102,7 @@ fn run() -> Result<(), Error> {
     let on_off_handler = on_off::OnOffHandler::new_standalone(
         Dataver::new_rand(&mut rand),
         1,
-        TestOnOffDeviceLogic::new(true),
+        HomeNodeOnOffLogic::load(on_off_state_file),
     );
 
     let dm = DataModel::new(
@@ -201,7 +207,7 @@ const NODE: Node<'static> = Node {
         Endpoint {
             id: 1,
             device_types: devices!(DEV_TYPE_ON_OFF_LIGHT),
-            clusters: clusters!(desc::DescHandler::CLUSTER, TestOnOffDeviceLogic::CLUSTER),
+            clusters: clusters!(desc::DescHandler::CLUSTER, HomeNodeOnOffLogic::CLUSTER_DEF),
         },
     ],
 };
@@ -225,7 +231,7 @@ fn dm_handler<'a, OH: OnOffHooks, LH: LevelControlHooks>(
                         Async(desc::DescHandler::new(Dataver::new_rand(&mut rand)).adapt()),
                     )
                     .chain(
-                        EpClMatcher::new(Some(1), Some(TestOnOffDeviceLogic::CLUSTER.id)),
+                        EpClMatcher::new(Some(1), Some(HomeNodeOnOffLogic::CLUSTER_DEF.id)),
                         on_off::HandlerAsyncAdaptor(on_off),
                     ),
             ),
@@ -240,3 +246,130 @@ const RS_MATTERD_DEV_DET: BasicInfoConfig<'static> = BasicInfoConfig {
     device_name: DEFAULT_DEVICE_NAME,
     ..TEST_DEV_DET
 };
+
+#[derive(Default)]
+struct OnOffPersistentState {
+    on_off: bool,
+    start_up_on_off: Option<StartUpOnOffEnum>,
+}
+
+impl OnOffPersistentState {
+    fn encode(on_off: bool, start_up_on_off: Option<StartUpOnOffEnum>) -> u8 {
+        let on_off = on_off as u8;
+        let start_up_on_off = match start_up_on_off {
+            Some(StartUpOnOffEnum::Off) => 0,
+            Some(StartUpOnOffEnum::On) => 1,
+            Some(StartUpOnOffEnum::Toggle) => 2,
+            None => 3,
+        };
+
+        on_off + (start_up_on_off << 1)
+    }
+
+    fn decode(data: u8) -> Result<Self, Error> {
+        Ok(Self {
+            on_off: data & 1 != 0,
+            start_up_on_off: match data >> 1 {
+                0 => Some(StartUpOnOffEnum::Off),
+                1 => Some(StartUpOnOffEnum::On),
+                2 => Some(StartUpOnOffEnum::Toggle),
+                3 => None,
+                _ => return Err(rs_matter::error::ErrorCode::Failure.into()),
+            },
+        })
+    }
+}
+
+struct HomeNodeOnOffLogic {
+    on_off: Cell<bool>,
+    start_up_on_off: Cell<Option<StartUpOnOffEnum>>,
+    storage_path: PathBuf,
+}
+
+impl HomeNodeOnOffLogic {
+    const CLUSTER_DEF: Cluster<'static> = on_off_cluster::FULL_CLUSTER
+        .with_revision(6)
+        .with_attrs(with!(
+            required;
+            on_off_cluster::AttributeId::OnOff
+                | on_off_cluster::AttributeId::StartUpOnOff
+        ))
+        .with_cmds(with!(
+            on_off_cluster::CommandId::Off
+                | on_off_cluster::CommandId::On
+                | on_off_cluster::CommandId::Toggle
+        ));
+
+    fn load(storage_path: PathBuf) -> Self {
+        let state = match fs::File::open(storage_path.as_path()) {
+            Ok(mut file) => {
+                let mut buf = [0_u8; 1];
+
+                match file.read_exact(&mut buf) {
+                    Ok(()) => OnOffPersistentState::decode(buf[0]).unwrap_or_default(),
+                    Err(err) => {
+                        error!(
+                            "failed to read on/off state from {}: {}",
+                            storage_path.display(),
+                            err
+                        );
+                        OnOffPersistentState::default()
+                    }
+                }
+            }
+            Err(_) => OnOffPersistentState::default(),
+        };
+
+        Self {
+            on_off: Cell::new(state.on_off),
+            start_up_on_off: Cell::new(state.start_up_on_off),
+            storage_path,
+        }
+    }
+
+    fn save_state(&self) -> Result<(), Error> {
+        let mut file = fs::File::create(self.storage_path.as_path())?;
+        let data = [OnOffPersistentState::encode(
+            self.on_off.get(),
+            self.start_up_on_off.get(),
+        )];
+
+        file.write_all(&data)?;
+
+        Ok(())
+    }
+}
+
+impl OnOffHooks for HomeNodeOnOffLogic {
+    const CLUSTER: Cluster<'static> = Self::CLUSTER_DEF;
+
+    fn on_off(&self) -> bool {
+        self.on_off.get()
+    }
+
+    fn set_on_off(&self, on: bool) {
+        self.on_off.set(on);
+
+        if let Err(err) = self.save_state() {
+            error!("failed to persist on/off state: {}", err);
+        } else {
+            info!("on/off state set to {}", on);
+        }
+    }
+
+    fn start_up_on_off(&self) -> Nullable<StartUpOnOffEnum> {
+        match self.start_up_on_off.get() {
+            Some(value) => Nullable::some(value),
+            None => Nullable::none(),
+        }
+    }
+
+    fn set_start_up_on_off(&self, value: Nullable<StartUpOnOffEnum>) -> Result<(), Error> {
+        self.start_up_on_off.set(value.into_option());
+        self.save_state()
+    }
+
+    async fn handle_off_with_effect(&self, _effect: EffectVariantEnum) {
+        // No device-specific side effects yet.
+    }
+}
