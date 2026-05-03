@@ -1,0 +1,13 @@
+health_message = "Network discovery stub active"
+
+[[demo_devices]]
+device_id = "router-01"
+display_name = "Core Router"
+kind = "network-router"
+capabilities = ["icmp", "mdns"]
+
+[[demo_devices]]
+device_id = "printer-01"
+display_name = "Office Printer"
+kind = "network-printer"
+capabilities = ["ipp"]

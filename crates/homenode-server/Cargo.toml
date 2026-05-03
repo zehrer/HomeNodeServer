@@ -1,0 +1,32 @@
+[package]
+name = "homenode-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "homenode-server"
+
+[lib]
+name = "homenode_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "homenode-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "homenode-fake-module"
+path = "src/bin/homenode-fake-module.rs"
+
+[dependencies]
+anyhow.workspace = true
+homenode-sdk = { path = "../homenode-sdk" }
+serde.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+toml.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

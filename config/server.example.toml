@@ -1,0 +1,66 @@
+[server]
+socket_path = "../.tmp/homenode-server.sock"
+log_filter = "info"
+
+[modules.web]
+enabled = true
+module_id = "web"
+program = "cargo"
+args = ["run", "-p", "homenode-module-web", "--"]
+config = "config/modules/web.example.toml"
+
+[modules.matter_controller]
+enabled = true
+module_id = "matter-controller"
+program = "cargo"
+args = ["run", "-p", "homenode-module-matter-controller", "--"]
+config = "config/modules/matter-controller.example.toml"
+
+[modules.matter_bridge]
+enabled = true
+module_id = "matter-bridge"
+program = "cargo"
+args = ["run", "-p", "homenode-module-matter-bridge", "--"]
+config = "config/modules/matter-bridge.example.toml"
+
+[modules.network_discovery]
+enabled = true
+module_id = "network-discovery"
+program = "cargo"
+args = ["run", "-p", "homenode-module-network-discovery", "--"]
+config = "config/modules/network-discovery.example.toml"
+
+[modules.shelly]
+enabled = false
+module_id = "shelly"
+config = "config/modules/shelly.example.toml"
+
+[modules.govee]
+enabled = false
+module_id = "govee"
+config = "config/modules/govee.example.toml"
+
+[modules.zigbee]
+enabled = false
+module_id = "zigbee"
+config = "config/modules/zigbee.example.toml"
+
+[modules.switchbot]
+enabled = false
+module_id = "switchbot"
+config = "config/modules/switchbot.example.toml"
+
+[modules.native_devices]
+enabled = false
+module_id = "native-devices"
+config = "config/modules/native-devices.example.toml"
+
+[modules.ai_local]
+enabled = false
+module_id = "ai-local"
+config = "config/modules/ai-local.example.toml"
+
+[modules.extensions]
+enabled = false
+module_id = "extensions"
+config = "config/modules/extensions.example.toml"

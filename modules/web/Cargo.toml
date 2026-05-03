@@ -1,0 +1,16 @@
+[package]
+name = "homenode-module-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+homenode-sdk = { path = "../../crates/homenode-sdk" }
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

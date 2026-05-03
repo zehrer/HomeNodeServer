@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package homenode.v1;
+
+message Empty {}
+
+enum HealthState {
+  UNSPECIFIED = 0;
+  STARTING = 1;
+  READY = 2;
+  DEGRADED = 3;
+  STOPPED = 4;
+  FAILED = 5;
+}
+
+message ModuleManifest {
+  string id = 1;
+  string display_name = 2;
+  string version = 3;
+  repeated string capabilities = 4;
+}
+
+message ModuleHealth {
+  string module_id = 1;
+  HealthState state = 2;
+  string message = 3;
+  int64 updated_at = 4;
+}
+
+message DeviceRecord {
+  string module_id = 1;
+  string device_id = 2;
+  string display_name = 3;
+  string kind = 4;
+  repeated string capabilities = 5;
+  map<string, string> metadata = 6;
+}
+
+message ModuleRegistration {
+  ModuleManifest manifest = 1;
+  ModuleHealth initial_health = 2;
+}
+
+message UpsertDevicesRequest {
+  string module_id = 1;
+  repeated DeviceRecord devices = 2;
+}
+
+message ModuleRuntime {
+  ModuleManifest manifest = 1;
+  ModuleHealth health = 2;
+  bool connected = 3;
+}
+
+message RuntimeSnapshot {
+  repeated ModuleRuntime modules = 1;
+  repeated DeviceRecord devices = 2;
+}
+
+service HomeNodeControl {
+  rpc RegisterModule(ModuleRegistration) returns (Empty);
+  rpc ReportHealth(ModuleHealth) returns (Empty);
+  rpc UpsertDevices(UpsertDevicesRequest) returns (Empty);
+  rpc GetRuntimeSnapshot(Empty) returns (RuntimeSnapshot);
+}

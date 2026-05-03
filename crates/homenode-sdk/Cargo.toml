@@ -1,0 +1,18 @@
+[package]
+name = "homenode-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hyper-util.workspace = true
+prost.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tower.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored.workspace = true
+tonic-build.workspace = true

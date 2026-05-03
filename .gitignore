@@ -1,0 +1,5 @@
+target/
+.DS_Store
+*.sock
+.tmp/
+config/server.toml
