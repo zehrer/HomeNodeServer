@@ -1067,6 +1067,7 @@ dependencies = [
  "if-addrs 0.13.4",
  "ipnet",
  "serde",
+ "serde_json",
  "surge-ping",
  "tokio",
  "toml",

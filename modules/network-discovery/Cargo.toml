@@ -13,6 +13,7 @@ homenode-sdk = { path = "../../crates/homenode-sdk" }
 if-addrs.workspace = true
 ipnet.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 surge-ping.workspace = true
 tokio.workspace = true
 toml.workspace = true

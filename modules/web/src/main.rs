@@ -47,6 +47,25 @@ pub struct DeviceDocumentation {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MatterFabricMeta {
+    pub name: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientMatterFabric {
+    pub fabric_id: String,
+    pub node_id: String,
+    pub port: u16,
+    pub interface: String,
+    pub fabric_name: String,
+    pub fabric_icon: String,
+}
+
 #[derive(Clone)]
 struct WebState {
     socket_path: PathBuf,
@@ -54,6 +73,7 @@ struct WebState {
     docs_path: PathBuf,
     links_path: PathBuf,
     categories_path: PathBuf,
+    matter_fabrics_path: PathBuf,
     definitions_dir: PathBuf,
     #[allow(dead_code)]
     catalog_path: PathBuf,
@@ -61,6 +81,7 @@ struct WebState {
     docs_store: Arc<RwLock<HashMap<String, DeviceDocumentation>>>,
     links_store: Arc<RwLock<HashMap<String, Vec<String>>>>,
     categories_store: Arc<RwLock<HashMap<String, String>>>,
+    matter_fabrics_store: Arc<RwLock<HashMap<String, MatterFabricMeta>>>,
     catalog_store: Arc<RwLock<homenode_definitions::CatalogDatabase>>,
 }
 
@@ -99,6 +120,7 @@ async fn main() -> Result<()> {
     let docs_path = data_dir.join("device_documentation.json");
     let links_path = data_dir.join("device_links.json");
     let categories_path = data_dir.join("device_categories.json");
+    let matter_fabrics_path = data_dir.join("matter_fabrics.json");
     let definitions_dir = workspace_root.join("definitions").join("devices");
     let catalog_path = workspace_root.join("definitions").join("catalog.json");
     let catalog_overrides_path = data_dir.join("catalog_overrides.json");
@@ -106,6 +128,45 @@ async fn main() -> Result<()> {
     let initial_docs = load_json_map(&docs_path);
     let initial_links = load_json_map(&links_path);
     let initial_categories = load_json_map(&categories_path);
+    let mut initial_fabrics: HashMap<String, MatterFabricMeta> = load_json_map(&matter_fabrics_path);
+    let mut modified_fabrics = false;
+    if !initial_fabrics.contains_key("6ABEDCB982EC2223") {
+        initial_fabrics.insert(
+            "6ABEDCB982EC2223".to_string(),
+            MatterFabricMeta {
+                name: "Apple Home".to_string(),
+                icon: "🍎".to_string(),
+                description: "Apple Home ecosystem fabric".to_string(),
+            },
+        );
+        modified_fabrics = true;
+    }
+    if !initial_fabrics.contains_key("4518A03EC84FB6E7") {
+        initial_fabrics.insert(
+            "4518A03EC84FB6E7".to_string(),
+            MatterFabricMeta {
+                name: "Secondary Fabric".to_string(),
+                icon: "⚡".to_string(),
+                description: "Multi-admin fabric shared across bridges and lights".to_string(),
+            },
+        );
+        modified_fabrics = true;
+    }
+    if !initial_fabrics.contains_key("A38D674BFAAFF432") {
+        initial_fabrics.insert(
+            "A38D674BFAAFF432".to_string(),
+            MatterFabricMeta {
+                name: "Direct Device Fabric".to_string(),
+                icon: "💡".to_string(),
+                description: "Direct vendor fabric (e.g. Govee)".to_string(),
+            },
+        );
+        modified_fabrics = true;
+    }
+    if modified_fabrics {
+        let _ = persist_json(&matter_fabrics_path, &initial_fabrics);
+    }
+
     let mut initial_catalog = if catalog_path.exists() {
         homenode_definitions::CatalogDatabase::load_from_path(&catalog_path).unwrap_or_default()
     } else {
@@ -120,6 +181,7 @@ async fn main() -> Result<()> {
     let docs_store = Arc::new(RwLock::new(initial_docs));
     let links_store = Arc::new(RwLock::new(initial_links));
     let categories_store = Arc::new(RwLock::new(initial_categories));
+    let matter_fabrics_store = Arc::new(RwLock::new(initial_fabrics));
     let catalog_store = Arc::new(RwLock::new(initial_catalog));
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
@@ -137,6 +199,8 @@ async fn main() -> Result<()> {
         .route("/status", get(status_handler))
         .route("/scan", post(scan_trigger_form_handler))
         .route("/api/scan", post(scan_trigger_api_handler))
+        .route("/api/matter/fabrics", get(get_matter_fabrics_handler))
+        .route("/api/matter/fabrics/:id", post(update_matter_fabric_handler))
         .route("/api/catalog", get(get_catalog_handler))
         .route("/api/catalog/vendor", post(add_vendor_handler))
         .route("/api/catalog/product", post(add_product_handler))
@@ -156,12 +220,14 @@ async fn main() -> Result<()> {
             docs_path,
             links_path,
             categories_path,
+            matter_fabrics_path,
             definitions_dir,
             catalog_path,
             catalog_overrides_path,
             docs_store,
             links_store,
             categories_store,
+            matter_fabrics_store,
             catalog_store,
         });
 
@@ -226,8 +292,17 @@ async fn devices_handler(State(state): State<WebState>) -> Html<String> {
     let links = state.links_store.read().await.clone();
     let catalog = state.catalog_store.read().await.clone();
     let categories = state.categories_store.read().await.clone();
+    let matter_fabrics = state.matter_fabrics_store.read().await.clone();
     let body = match load_snapshot(&state.socket_path).await {
-        Ok(snapshot) => render_devices_page(&state.status_title, &snapshot, &docs, &links, &catalog, &categories),
+        Ok(snapshot) => render_devices_page(
+            &state.status_title,
+            &snapshot,
+            &docs,
+            &links,
+            &catalog,
+            &categories,
+            &matter_fabrics,
+        ),
         Err(error) => render_error(&state.status_title, "devices", &error.to_string()),
     };
     Html(body)
@@ -362,6 +437,56 @@ async fn update_device_category_handler(
     }
     if let Err(err) = persist_json(&state.categories_path, &*categories) {
         error!("Failed to persist device categories: {err}");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({"status": "updated"})).into_response()
+}
+
+// ------------------------------------------------------------------------------------------------
+// Matter Fabrics API Handlers
+// ------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct UpdateMatterFabricPayload {
+    name: String,
+    #[serde(default)]
+    icon: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+async fn get_matter_fabrics_handler(State(state): State<WebState>) -> Response {
+    let fabrics = state.matter_fabrics_store.read().await;
+    Json(&*fabrics).into_response()
+}
+
+async fn update_matter_fabric_handler(
+    AxumPath(fabric_id): AxumPath<String>,
+    State(state): State<WebState>,
+    Json(payload): Json<UpdateMatterFabricPayload>,
+) -> Response {
+    let mut fabrics = state.matter_fabrics_store.write().await;
+    let key = fabric_id.trim().to_uppercase();
+    let entry = fabrics.entry(key).or_insert_with(|| MatterFabricMeta {
+        name: String::new(),
+        icon: "✨".to_string(),
+        description: String::new(),
+    });
+    entry.name = payload.name.trim().to_string();
+    if let Some(icon) = payload.icon {
+        if !icon.trim().is_empty() {
+            entry.icon = icon.trim().to_string();
+        }
+    }
+    if let Some(desc) = payload.description {
+        entry.description = desc.trim().to_string();
+    }
+    if let Err(err) = persist_json(&state.matter_fabrics_path, &*fabrics) {
+        error!("Failed to persist matter fabrics: {err}");
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": err.to_string()})),
@@ -1405,6 +1530,55 @@ struct DynamicCategory {
     devices: Vec<UnifiedDevice>,
 }
 
+fn extract_device_matter_fabrics(
+    dev: &DeviceRecord,
+    secondaries: &[DeviceRecord],
+    fabric_metas: &HashMap<String, MatterFabricMeta>,
+) -> Vec<ClientMatterFabric> {
+    let mut fabrics = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut raw_strings = Vec::new();
+    if let Some(s) = dev.metadata.get("matter_fabrics") {
+        raw_strings.push(s.as_str());
+    }
+    for sec in secondaries {
+        if let Some(s) = sec.metadata.get("matter_fabrics") {
+            raw_strings.push(s.as_str());
+        }
+    }
+
+    for raw in raw_strings {
+        if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
+            for item in parsed {
+                let fabric_id = item.get("fabric_id").and_then(|v| v.as_str()).unwrap_or_default().to_uppercase();
+                let node_id = item.get("node_id").and_then(|v| v.as_str()).unwrap_or_default().to_uppercase();
+                let port = item.get("port").and_then(|v| v.as_u64()).unwrap_or(5540) as u16;
+                let interface = item.get("interface").and_then(|v| v.as_str()).unwrap_or("wifi").to_string();
+
+                if !fabric_id.is_empty() && seen.insert((fabric_id.clone(), node_id.clone())) {
+                    let meta = fabric_metas.get(&fabric_id);
+                    let fabric_name = meta.map(|m| m.name.clone()).unwrap_or_else(|| {
+                        format!("Fabric {}", &fabric_id[..fabric_id.len().min(8)])
+                    });
+                    let fabric_icon = meta.map(|m| m.icon.clone()).unwrap_or_else(|| "✨".to_string());
+
+                    fabrics.push(ClientMatterFabric {
+                        fabric_id,
+                        node_id,
+                        port,
+                        interface,
+                        fabric_name,
+                        fabric_icon,
+                    });
+                }
+            }
+        }
+    }
+
+    fabrics
+}
+
 fn render_devices_page(
     title: &str,
     snapshot: &RuntimeSnapshot,
@@ -1412,6 +1586,7 @@ fn render_devices_page(
     links: &HashMap<String, Vec<String>>,
     catalog: &homenode_definitions::CatalogDatabase,
     category_overrides: &HashMap<String, String>,
+    matter_fabric_metas: &HashMap<String, MatterFabricMeta>,
 ) -> String {
     if snapshot.devices.is_empty() {
         let content = r#"
@@ -1564,6 +1739,8 @@ fn render_devices_page(
                 })
             });
 
+            let dev_matter_fabrics = extract_device_matter_fabrics(p, &udev.secondary_interfaces, matter_fabric_metas);
+
             serde_json::json!({
                 "device_id": p.device_id,
                 "display_name": p.display_name,
@@ -1582,6 +1759,7 @@ fn render_devices_page(
                 "secondaries": secondaries_json,
                 "candidate": candidate_json,
                 "product": product_json,
+                "matter_fabrics": dev_matter_fabrics,
             })
         })
         .collect();
@@ -1616,6 +1794,15 @@ fn render_devices_page(
                 let doc_key = if !mac.is_empty() { mac.clone() } else { device.device_id.clone() };
                 let has_docs = docs.get(&doc_key).is_some_and(|d| !d.notes.trim().is_empty());
 
+                let dev_fabrics = extract_device_matter_fabrics(device, &udev.secondary_interfaces, matter_fabric_metas);
+                let mut matter_badges = String::new();
+                for fab in &dev_fabrics {
+                    matter_badges.push_str(&format!(
+                        r#" <span class="badge" style="background:#059669; color:#fff; font-size:10px; padding:2px 6px; border-radius:4px; margin-left:3px;" title="Matter Fabric: {} (Node ID: {})">✨ {} {}</span>"#,
+                        fab.fabric_id, fab.node_id, fab.fabric_icon, fab.fabric_name
+                    ));
+                }
+
                 let mut iface_badges = String::new();
                 if !udev.secondary_interfaces.is_empty() {
                     iface_badges.push_str(&format!(
@@ -1643,7 +1830,7 @@ fn render_devices_page(
 
                 format!(
                     r#"<tr class="device-item" data-id="{}" onclick="selectDevice('{}')">
-                        <td><strong>{}</strong>{doc_icon}<br><small style="color:var(--muted)">{} &bull; {}</small></td>
+                        <td><strong>{}</strong>{}{}<br><small style="color:var(--muted)">{} &bull; {}</small></td>
                         <td><span class="badge badge-kind">{} {}</span></td>
                         <td>{}</td>
                         <td style="text-align:right;">{}</td>
@@ -1651,6 +1838,8 @@ fn render_devices_page(
                     device.device_id,
                     device.device_id,
                     device.display_name,
+                    doc_icon,
+                    matter_badges,
                     device.device_id,
                     device.module_id,
                     cat.icon,
@@ -1835,6 +2024,39 @@ fn render_devices_page(
             `;
         }}
 
+        // Matter Operational Fabrics (Fabric IDs, Node IDs, Ports, and Custom Friendly Labels)
+        let matterFabricsCard = '';
+        if (dev.matter_fabrics && dev.matter_fabrics.length > 0) {{
+            let fabricsListHtml = dev.matter_fabrics.map(f => `
+                <div style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:8px 10px; margin-top:6px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <div style="font-weight:600; font-size:13px;">
+                            <span>${{f.fabric_icon}}</span> ${{escapeHtml(f.fabric_name)}}
+                        </div>
+                        <button type="button" class="btn-sm" style="font-size:10px; padding:2px 6px; cursor:pointer;" onclick="renameMatterFabric('${{f.fabric_id}}', '${{escapeAttr(f.fabric_name)}}', '${{escapeAttr(f.fabric_icon)}}')">✏️ Rename</button>
+                    </div>
+                    <div style="margin-top:6px; font-size:11px; color:var(--muted); display:grid; grid-template-columns: 80px 1fr; gap: 3px 6px;">
+                        <span style="font-weight:600;">Fabric ID:</span> <code>${{f.fabric_id}}</code>
+                        <span style="font-weight:600;">Node ID:</span> <code>${{f.node_id}}</code>
+                        <span style="font-weight:600;">Port:</span> <code>${{f.port}}</code>
+                        <span style="font-weight:600;">Interface:</span> <code>${{f.interface}}</code>
+                    </div>
+                </div>
+            `).join('');
+
+            matterFabricsCard = `
+                <div class="inspector-sec" style="background:linear-gradient(135deg, rgba(5,150,105,0.06) 0%, rgba(16,185,129,0.06) 100%); border:1px solid rgba(5,150,105,0.25); border-radius:8px; padding:10px; margin-top:10px;">
+                    <div class="inspector-title" style="color:#059669; font-weight:700; margin-bottom:2px; display:flex; justify-content:space-between; align-items:center;">
+                        <span>✨ Matter Operational Fabrics (${{dev.matter_fabrics.length}})</span>
+                    </div>
+                    <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">
+                        Active operational fabrics discovered via mDNS (<code>_matter._tcp</code>).
+                    </div>
+                    ${{fabricsListHtml}}
+                </div>
+            `;
+        }}
+
         // Product assignment dropdown
         let productOptions = '<option value="">-- Associate Product / Model --</option>';
         if (typeof allProducts !== 'undefined') {{
@@ -1902,6 +2124,7 @@ fn render_devices_page(
                 ${{categorySelectorBox}}
                 ${{webBtn}}
                 ${{productCard}}
+                ${{matterFabricsCard}}
                 ${{assignBox}}
             </div>
 
@@ -2148,6 +2371,27 @@ fn render_devices_page(
         }});
         if (res.ok) {{
             window.location.reload();
+        }}
+    }}
+
+    async function renameMatterFabric(fabricId, currentName, currentIcon) {{
+        const newName = prompt(`Enter friendly label for Matter Fabric (${{fabricId}}):`, currentName);
+        if (!newName || !newName.trim()) return;
+        const newIcon = prompt(`Enter emoji/icon for ${{newName}}:`, currentIcon || '✨') || '✨';
+
+        try {{
+            const res = await fetch('/api/matter/fabrics/' + encodeURIComponent(fabricId), {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ name: newName.trim(), icon: newIcon.trim() }})
+            }});
+            if (res.ok) {{
+                window.location.reload();
+            }} else {{
+                alert('Failed to update Matter fabric label.');
+            }}
+        }} catch (e) {{
+            alert('Network error: ' + e);
         }}
     }}
 

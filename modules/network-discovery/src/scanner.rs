@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use dns_lookup::lookup_addr;
+use dns_lookup::{lookup_addr, lookup_host};
 use if_addrs::get_if_addrs;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,8 @@ pub struct DiscoveredDevice {
     pub product_name: Option<String>,
     #[serde(default)]
     pub vendor_id: Option<String>,
+    #[serde(default)]
+    pub matter_fabrics: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,7 +123,10 @@ impl NetworkScanner {
         // 6. Aggregate by IP/MAC and classify devices using Rhai engine & Hardware Catalog
         let mut devices = aggregate_and_classify(observations, &self.definitions_engine, &self.catalog);
 
-        // 7. Probe for web interfaces (ports 80, 5000, 8080, 443)
+        // 7. Matter operational discovery and fabrics enrichment
+        enrich_matter_fabrics(&mut devices).await;
+
+        // 8. Probe for web interfaces (ports 80, 5000, 8080, 443)
         enrich_web_urls(&mut devices).await;
 
         info!("Network scan completed: found {} unique devices", devices.len());
@@ -544,6 +549,7 @@ fn aggregate_and_classify(
                 product_id,
                 product_name,
                 vendor_id: vendor_id.clone(),
+                matter_fabrics: None,
             }
         });
 
@@ -734,6 +740,323 @@ fn guess_vendor(mac: &str) -> Option<&'static str> {
         "70:ee:50" => Some("Netatmo"),
         "cc:40:85" | "be:39:d4" | "90:dd:5d" => Some("Apple Inc."),
         _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredMatterFabric {
+    pub fabric_id: String,
+    pub node_id: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveredMatterNode {
+    fabric_id: String,
+    node_id: String,
+    target_host: String,
+    port: u16,
+    mac: Option<String>,
+    ip: Option<String>,
+}
+
+fn parse_matter_instance(inst: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = inst.split('-').collect();
+    if parts.len() == 2
+        && parts[0].len() == 16
+        && parts[1].len() == 16
+        && parts[0].chars().all(|c| c.is_ascii_hexdigit())
+        && parts[1].chars().all(|c| c.is_ascii_hexdigit())
+    {
+        Some((parts[0].to_uppercase(), parts[1].to_uppercase()))
+    } else {
+        None
+    }
+}
+
+fn parse_reached_at(line: &str) -> Option<(String, u16)> {
+    let marker = "can be reached at ";
+    let idx = line.find(marker)?;
+    let rem = &line[idx + marker.len()..];
+    let token = rem.split_whitespace().next()?;
+    let parts: Vec<&str> = token.split(':').collect();
+    if parts.len() == 2 {
+        let host = parts[0].trim_end_matches('.');
+        let port = parts[1].parse::<u16>().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        None
+    }
+}
+
+fn extract_mac_from_target(target: &str) -> Option<String> {
+    let raw = target.trim_end_matches('.').trim_end_matches(".local");
+    if raw.len() == 12 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(normalize_mac(&format!(
+            "{}:{}:{}:{}:{}:{}",
+            &raw[0..2],
+            &raw[2..4],
+            &raw[4..6],
+            &raw[6..8],
+            &raw[8..10],
+            &raw[10..12]
+        )))
+    } else {
+        None
+    }
+}
+
+async fn resolve_host_ip(target_host: &str) -> Option<String> {
+    let host = target_host.to_string();
+    tokio::task::spawn_blocking(move || {
+        let clean = host.trim_end_matches('.');
+        lookup_host(clean).ok()?.into_iter().next().map(|ip| ip.to_string())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn collect_matter_nodes() -> Vec<DiscoveredMatterNode> {
+    let mut instances = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(mut child) = Command::new("dns-sd")
+            .args(["-B", "_matter._tcp", "local"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(stdout) = child.stdout.take() {
+                let reader = tokio::io::BufReader::new(stdout);
+                use tokio::io::AsyncBufReadExt;
+                let mut lines = reader.lines();
+                let collect_fut = async {
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if line.contains("Add") && line.contains("_matter._tcp") {
+                            if let Some(inst) = line.split_whitespace().last() {
+                                if inst.contains('-') && !instances.contains(&inst.to_string()) {
+                                    instances.push(inst.to_string());
+                                }
+                            }
+                        }
+                    }
+                };
+                let _ = tokio::time::timeout(Duration::from_millis(1500), collect_fut).await;
+            }
+            let _ = child.kill().await;
+        }
+    }
+
+    if instances.is_empty() {
+        if let Ok(output) = Command::new("avahi-browse")
+            .args(["-rtp", "_matter._tcp"])
+            .output()
+            .await
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let mut nodes = Vec::new();
+                for line in text.lines() {
+                    if !line.starts_with('=') {
+                        continue;
+                    }
+                    let fields: Vec<&str> = line.split(';').collect();
+                    if fields.len() >= 9 {
+                        let inst = fields[3];
+                        if let Some((fab_id, node_id)) = parse_matter_instance(inst) {
+                            let target_host = fields[6].to_string();
+                            let ip = fields[7].to_string();
+                            let port = fields[8].parse::<u16>().unwrap_or(5540);
+                            let mac = extract_mac_from_target(&target_host);
+                            nodes.push(DiscoveredMatterNode {
+                                fabric_id: fab_id,
+                                node_id,
+                                target_host,
+                                port,
+                                mac,
+                                ip: if ip.is_empty() { None } else { Some(ip) },
+                            });
+                        }
+                    }
+                }
+                if !nodes.is_empty() {
+                    return nodes;
+                }
+            }
+        }
+    }
+
+    let mut results = Vec::new();
+    let mut join_set = JoinSet::new();
+
+    for inst in instances {
+        if let Some((fabric_id, node_id)) = parse_matter_instance(&inst) {
+            join_set.spawn(async move {
+                let resolve_fut = async {
+                    let mut cmd = Command::new("dns-sd");
+                    cmd.args(["-L", &inst, "_matter._tcp", "local"])
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null());
+                    if let Ok(mut child) = cmd.spawn() {
+                        if let Some(stdout) = child.stdout.take() {
+                            let reader = tokio::io::BufReader::new(stdout);
+                            use tokio::io::AsyncBufReadExt;
+                            let mut lines = reader.lines();
+                            while let Ok(Some(l)) = lines.next_line().await {
+                                if l.contains("can be reached at") {
+                                    let _ = child.kill().await;
+                                    return parse_reached_at(&l);
+                                }
+                            }
+                        }
+                        let _ = child.kill().await;
+                    }
+                    None
+                };
+
+                let resolved = tokio::time::timeout(Duration::from_millis(500), resolve_fut)
+                    .await
+                    .ok()
+                    .flatten();
+
+                (fabric_id, node_id, resolved)
+            });
+        }
+    }
+
+    while let Some(res) = join_set.join_next().await {
+        if let Ok((fabric_id, node_id, Some((target_host, port)))) = res {
+            let mac = extract_mac_from_target(&target_host);
+            let ip = resolve_host_ip(&target_host).await;
+            results.push(DiscoveredMatterNode {
+                fabric_id,
+                node_id,
+                target_host,
+                port,
+                mac,
+                ip,
+            });
+        }
+    }
+
+    results
+}
+
+async fn enrich_matter_fabrics(devices: &mut Vec<DiscoveredDevice>) {
+    let matter_nodes = collect_matter_nodes().await;
+    if matter_nodes.is_empty() {
+        return;
+    }
+
+    info!("Discovered {} Matter operational node instances", matter_nodes.len());
+
+    let mut matched_node_targets = HashSet::new();
+
+    for dev in devices.iter_mut() {
+        let dev_mac_norm = dev.mac.as_deref().map(normalize_mac);
+        let dev_ip = &dev.ip;
+
+        let mut fabrics: Vec<DiscoveredMatterFabric> = Vec::new();
+        for node in &matter_nodes {
+            let mut is_match = false;
+            if let Some(ref node_mac) = node.mac {
+                if let Some(ref d_mac) = dev_mac_norm {
+                    if node_mac == d_mac {
+                        is_match = true;
+                    }
+                }
+            }
+            if !is_match {
+                if let Some(ref node_ip) = node.ip {
+                    if node_ip == dev_ip {
+                        is_match = true;
+                    }
+                }
+            }
+            if !is_match {
+                if let Some(ref host) = dev.hostname {
+                    let h_clean = host.trim_end_matches('.');
+                    let node_h_clean = node.target_host.trim_end_matches('.');
+                    if h_clean.eq_ignore_ascii_case(node_h_clean) {
+                        is_match = true;
+                    }
+                }
+            }
+
+            if is_match {
+                matched_node_targets.insert(node.target_host.clone());
+                if !fabrics.iter().any(|f| f.fabric_id == node.fabric_id) {
+                    fabrics.push(DiscoveredMatterFabric {
+                        fabric_id: node.fabric_id.clone(),
+                        node_id: node.node_id.clone(),
+                        port: node.port,
+                    });
+                }
+            }
+        }
+
+        if !fabrics.is_empty() {
+            if !dev.capabilities.contains(&"matter".to_string()) {
+                dev.capabilities.push("matter".to_string());
+            }
+            dev.matter_fabrics = serde_json::to_string(&fabrics).ok();
+        }
+    }
+
+    // Capture Thread/IPv6-only Matter nodes that didn't match an IPv4 device
+    let mut unmatched_by_target: HashMap<String, Vec<&DiscoveredMatterNode>> = HashMap::new();
+    for node in &matter_nodes {
+        if !matched_node_targets.contains(&node.target_host) {
+            unmatched_by_target.entry(node.target_host.clone()).or_default().push(node);
+        }
+    }
+
+    for (target_host, nodes) in unmatched_by_target {
+        let mut fabrics: Vec<DiscoveredMatterFabric> = Vec::new();
+        for n in &nodes {
+            if !fabrics.iter().any(|f| f.fabric_id == n.fabric_id) {
+                fabrics.push(DiscoveredMatterFabric {
+                    fabric_id: n.fabric_id.clone(),
+                    node_id: n.node_id.clone(),
+                    port: n.port,
+                });
+            }
+        }
+
+        let clean_host = target_host.trim_end_matches('.').trim_end_matches(".local");
+        let short_id = if clean_host.len() >= 8 {
+            &clean_host[..8]
+        } else {
+            clean_host
+        };
+
+        let device_id = format!("net-matter-{}", clean_host.to_lowercase());
+        let display_name = format!("Matter Thread Device ({short_id})");
+        let ip = nodes[0].ip.clone().unwrap_or_else(|| target_host.clone());
+        let mac = nodes[0].mac.clone();
+
+        devices.push(DiscoveredDevice {
+            device_id,
+            display_name,
+            kind: "sensor".to_string(),
+            category_title: Some("Sensors & Detectors".to_string()),
+            category_icon: Some("👁️".to_string()),
+            script_id: None,
+            ip,
+            mac,
+            hostname: Some(target_host),
+            interface: "thread".to_string(),
+            vendor: None,
+            capabilities: vec!["thread".to_string(), "matter".to_string()],
+            source: "matter-mdns".to_string(),
+            web_url: None,
+            product_id: None,
+            product_name: None,
+            vendor_id: None,
+            matter_fabrics: serde_json::to_string(&fabrics).ok(),
+        });
     }
 }
 

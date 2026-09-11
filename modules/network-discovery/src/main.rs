@@ -329,6 +329,9 @@ fn convert_device(
     if let Some(vendor_id) = device.vendor_id {
         metadata.insert("vendor_id".to_string(), vendor_id);
     }
+    if let Some(matter_fabrics) = device.matter_fabrics {
+        metadata.insert("matter_fabrics".to_string(), matter_fabrics);
+    }
     metadata.insert("category".to_string(), device.kind.clone());
     metadata.insert("source".to_string(), device.source);
 
