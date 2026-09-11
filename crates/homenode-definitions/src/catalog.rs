@@ -168,14 +168,41 @@ impl CatalogDatabase {
         vendor_hint: Option<&str>,
         open_ports: &[u16],
     ) -> Option<&Product> {
-        let host_lower = hostname.to_lowercase();
+        let raw_host = hostname.to_lowercase();
         let vendor_lower = vendor_hint.unwrap_or("").to_lowercase();
 
-        // 1. High confidence: exact hostname substring matches
+        // Strip local DNS suffixes (.fritz.box, .local, .lan, .home.arpa, .home, etc.)
+        let mut host_clean = raw_host.as_str();
+        for suffix in &[
+            ".fritz.box",
+            ".fritz.box.",
+            ".local",
+            ".local.",
+            ".lan",
+            ".lan.",
+            ".home",
+            ".home.arpa",
+            ".internal",
+        ] {
+            if let Some(stripped) = host_clean.strip_suffix(suffix) {
+                host_clean = stripped;
+                break;
+            }
+        }
+
+        // 1. High confidence: hostname pattern matching
         for product in &self.products {
             for pattern in &product.hostname_patterns {
                 let pat = pattern.to_lowercase();
-                if !pat.is_empty() && host_lower.contains(&pat) {
+                if pat.is_empty() {
+                    continue;
+                }
+                // If pattern contains a dot (e.g. "fritz.box"), match only when raw_host is exactly that domain
+                if pat.contains('.') {
+                    if raw_host == pat || raw_host == format!("{pat}.") {
+                        return Some(product);
+                    }
+                } else if host_clean.contains(&pat) {
                     return Some(product);
                 }
             }
@@ -282,6 +309,14 @@ mod tests {
             let prod = catalog.match_product("shellypro3em.fritz.box", None, &[80]);
             assert!(prod.is_some());
             assert_eq!(prod.unwrap().id, "shelly_pro_3em");
+
+            // Test fritz.box exact match vs fritz.box suffix
+            let fritz = catalog.match_product("fritz.box", None, &[]);
+            assert!(fritz.is_some());
+            assert_eq!(fritz.unwrap().id, "fritzbox_gateway");
+
+            let non_fritz = catalog.match_product("espressif2.fritz.box", None, &[]);
+            assert!(non_fritz.is_none() || non_fritz.unwrap().id != "fritzbox_gateway");
         }
     }
 }

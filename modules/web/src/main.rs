@@ -51,12 +51,14 @@ struct WebState {
     status_title: String,
     docs_path: PathBuf,
     links_path: PathBuf,
+    categories_path: PathBuf,
     definitions_dir: PathBuf,
     #[allow(dead_code)]
     catalog_path: PathBuf,
     catalog_overrides_path: PathBuf,
     docs_store: Arc<RwLock<HashMap<String, DeviceDocumentation>>>,
     links_store: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    categories_store: Arc<RwLock<HashMap<String, String>>>,
     catalog_store: Arc<RwLock<homenode_definitions::CatalogDatabase>>,
 }
 
@@ -94,12 +96,14 @@ async fn main() -> Result<()> {
     let _ = std::fs::create_dir_all(&data_dir);
     let docs_path = data_dir.join("device_documentation.json");
     let links_path = data_dir.join("device_links.json");
+    let categories_path = data_dir.join("device_categories.json");
     let definitions_dir = workspace_root.join("definitions").join("devices");
     let catalog_path = workspace_root.join("definitions").join("catalog.json");
     let catalog_overrides_path = data_dir.join("catalog_overrides.json");
 
     let initial_docs = load_json_map(&docs_path);
     let initial_links = load_json_map(&links_path);
+    let initial_categories = load_json_map(&categories_path);
     let mut initial_catalog = if catalog_path.exists() {
         homenode_definitions::CatalogDatabase::load_from_path(&catalog_path).unwrap_or_default()
     } else {
@@ -113,6 +117,7 @@ async fn main() -> Result<()> {
 
     let docs_store = Arc::new(RwLock::new(initial_docs));
     let links_store = Arc::new(RwLock::new(initial_links));
+    let categories_store = Arc::new(RwLock::new(initial_categories));
     let catalog_store = Arc::new(RwLock::new(initial_catalog));
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
@@ -138,6 +143,7 @@ async fn main() -> Result<()> {
             "/api/devices/:id/documentation",
             get(get_device_doc_handler).post(save_device_doc_handler),
         )
+        .route("/api/devices/:id/category", post(update_device_category_handler))
         .route("/api/devices/:id/analyze", post(analyze_device_handler))
         .route("/api/devices/link", post(link_devices_handler))
         .route("/api/devices/unlink", post(unlink_devices_handler))
@@ -147,11 +153,13 @@ async fn main() -> Result<()> {
             status_title: config.status_title,
             docs_path,
             links_path,
+            categories_path,
             definitions_dir,
             catalog_path,
             catalog_overrides_path,
             docs_store,
             links_store,
+            categories_store,
             catalog_store,
         });
 
@@ -215,8 +223,9 @@ async fn devices_handler(State(state): State<WebState>) -> Html<String> {
     let docs = state.docs_store.read().await.clone();
     let links = state.links_store.read().await.clone();
     let catalog = state.catalog_store.read().await.clone();
+    let categories = state.categories_store.read().await.clone();
     let body = match load_snapshot(&state.socket_path).await {
-        Ok(snapshot) => render_devices_page(&state.status_title, &snapshot, &docs, &links, &catalog),
+        Ok(snapshot) => render_devices_page(&state.status_title, &snapshot, &docs, &links, &catalog, &categories),
         Err(error) => render_error(&state.status_title, "devices", &error.to_string()),
     };
     Html(body)
@@ -328,6 +337,34 @@ async fn unlink_devices_handler(
             .into_response();
     }
     Json(serde_json::json!({"status": "unlinked"})).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateDeviceCategoryPayload {
+    category: String,
+}
+
+async fn update_device_category_handler(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<WebState>,
+    Json(payload): Json<UpdateDeviceCategoryPayload>,
+) -> Response {
+    let mut categories = state.categories_store.write().await;
+    let clean_cat = payload.category.trim().to_lowercase();
+    if clean_cat.is_empty() {
+        categories.remove(&id);
+    } else {
+        categories.insert(id.clone(), clean_cat);
+    }
+    if let Err(err) = persist_json(&state.categories_path, &*categories) {
+        error!("Failed to persist device categories: {err}");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({"status": "updated"})).into_response()
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1369,6 +1406,7 @@ fn render_devices_page(
     docs: &HashMap<String, DeviceDocumentation>,
     links: &HashMap<String, Vec<String>>,
     catalog: &homenode_definitions::CatalogDatabase,
+    category_overrides: &HashMap<String, String>,
 ) -> String {
     if snapshot.devices.is_empty() {
         let content = r#"
@@ -1389,23 +1427,31 @@ fn render_devices_page(
     let mut category_map: HashMap<String, DynamicCategory> = HashMap::new();
     for udev in &unified_devices {
         let dev = &udev.primary;
-        let cat_key = dev
-            .metadata
-            .get("category")
-            .cloned()
-            .unwrap_or_else(|| dev.kind.clone());
+        let mac = dev.metadata.get("mac").cloned().unwrap_or_default();
+        let doc_key = if !mac.is_empty() { mac.clone() } else { dev.device_id.clone() };
 
-        let (fallback_title, fallback_icon) = default_category_presentation(&cat_key);
-        let title = dev
-            .metadata
-            .get("category_title")
-            .cloned()
-            .unwrap_or_else(|| fallback_title.to_string());
-        let icon = dev
-            .metadata
-            .get("category_icon")
-            .cloned()
-            .unwrap_or_else(|| fallback_icon.to_string());
+        let (cat_key, title, icon) = if let Some(over_cat) = category_overrides.get(&doc_key).or_else(|| category_overrides.get(&dev.device_id)) {
+            let (f_title, f_icon) = default_category_presentation(over_cat);
+            (over_cat.clone(), f_title.to_string(), f_icon.to_string())
+        } else {
+            let cat = dev
+                .metadata
+                .get("category")
+                .cloned()
+                .unwrap_or_else(|| dev.kind.clone());
+            let (fallback_title, fallback_icon) = default_category_presentation(&cat);
+            let t = dev
+                .metadata
+                .get("category_title")
+                .cloned()
+                .unwrap_or_else(|| fallback_title.to_string());
+            let i = dev
+                .metadata
+                .get("category_icon")
+                .cloned()
+                .unwrap_or_else(|| fallback_icon.to_string());
+            (cat, t, i)
+        };
 
         let entry = category_map
             .entry(cat_key.clone())
@@ -1445,12 +1491,19 @@ fn render_devices_page(
             let vendor = p.metadata.get("vendor").cloned().unwrap_or_default();
             let hostname = p.metadata.get("hostname").cloned().unwrap_or_default();
             let web_url = p.metadata.get("web_url").cloned();
-            let category = p.metadata.get("category").cloned().unwrap_or_else(|| p.kind.clone());
-            let (fallback_title, fallback_icon) = default_category_presentation(&category);
-            let category_title = p.metadata.get("category_title").cloned().unwrap_or_else(|| fallback_title.to_string());
-            let category_icon = p.metadata.get("category_icon").cloned().unwrap_or_else(|| fallback_icon.to_string());
-
             let doc_key = if !mac.is_empty() { mac.clone() } else { p.device_id.clone() };
+
+            let (category, category_title, category_icon) = if let Some(over_cat) = category_overrides.get(&doc_key).or_else(|| category_overrides.get(&p.device_id)) {
+                let (f_title, f_icon) = default_category_presentation(over_cat);
+                (over_cat.clone(), f_title.to_string(), f_icon.to_string())
+            } else {
+                let cat = p.metadata.get("category").cloned().unwrap_or_else(|| p.kind.clone());
+                let (fallback_title, fallback_icon) = default_category_presentation(&cat);
+                let t = p.metadata.get("category_title").cloned().unwrap_or_else(|| fallback_title.to_string());
+                let i = p.metadata.get("category_icon").cloned().unwrap_or_else(|| fallback_icon.to_string());
+                (cat, t, i)
+            };
+
             let doc = docs.get(&doc_key).cloned().unwrap_or_default();
 
             // Match product
@@ -1584,7 +1637,7 @@ fn render_devices_page(
                 format!(
                     r#"<tr class="device-item" data-id="{}" onclick="selectDevice('{}')">
                         <td><strong>{}</strong>{doc_icon}<br><small style="color:var(--muted)">{} &bull; {}</small></td>
-                        <td><span class="badge badge-kind">{}</span></td>
+                        <td><span class="badge badge-kind">{} {}</span></td>
                         <td>{}</td>
                         <td style="text-align:right;">{}</td>
                     </tr>"#,
@@ -1593,7 +1646,8 @@ fn render_devices_page(
                     device.display_name,
                     device.device_id,
                     device.module_id,
-                    device.kind,
+                    cat.icon,
+                    cat.title,
                     network_info,
                     web_button,
                 )
@@ -1698,13 +1752,61 @@ fn render_devices_page(
             webBtn = `<div style="margin-top:10px;"><a href="${{dev.web_url}}" target="_blank" class="btn btn-primary btn-sm" style="font-size:12px; width:100%; justify-content:center;">🌐 Open Web Interface</a></div>`;
         }}
 
-        // Hardware Product Profile
+        // Category options generator
+        const standardCategories = [
+            {{ key: 'phone', label: '📱 Smartphones' }},
+            {{ key: 'tablet', label: '📟 Tablets' }},
+            {{ key: 'computer', label: '💻 Computers & Laptops' }},
+            {{ key: 'lighting', label: '💡 Smart Lighting' }},
+            {{ key: 'smart-plug', label: '🔌 Smart Plugs & Sockets' }},
+            {{ key: 'display', label: '⏰ Smart Clocks & Displays' }},
+            {{ key: 'sensor', label: '👁️ Sensors & Detectors' }},
+            {{ key: 'energy', label: '☀️ Solar & Energy Systems' }},
+            {{ key: 'appliance', label: '🧺 Home Appliances' }},
+            {{ key: 'radio', label: '📻 LoRa & Mesh Radios' }},
+            {{ key: 'hub', label: '🎛️ Smart Home Hubs' }},
+            {{ key: 'nas', label: '🗄️ Network Storage & NAS' }},
+            {{ key: 'router', label: '🌐 Routers & Gateways' }},
+            {{ key: 'voip-phone', label: '☎️ VoIP Phones' }},
+            {{ key: 'camera', label: '📷 Cameras' }},
+            {{ key: 'audio', label: '🔊 Audio & Speakers' }},
+            {{ key: 'streaming', label: '📺 TV & Streaming' }},
+            {{ key: 'printer', label: '🖨️ Printers' }},
+            {{ key: 'iot', label: '💡 Smart Home & IoT' }},
+            {{ key: 'network-device', label: '🔌 Network & Other Devices' }}
+        ];
+
+        let catOptions = '';
+        let foundCat = false;
+        standardCategories.forEach(c => {{
+            const sel = (dev.category === c.key) ? 'selected' : '';
+            if (dev.category === c.key) foundCat = true;
+            catOptions += `<option value="${{c.key}}" ${{sel}}>${{c.label}}</option>`;
+        }});
+        if (!foundCat && dev.category) {{
+            catOptions += `<option value="${{dev.category}}" selected>Current: ${{dev.category_title || dev.category}}</option>`;
+        }}
+
+        let categorySelectorBox = `
+            <div style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:6px 10px; margin-top:8px;">
+                <label style="font-size:11px; font-weight:600; color:var(--muted); display:block; margin-bottom:4px;">Change Device Category</label>
+                <div style="display:flex; gap:6px; align-items:center;">
+                    <select id="insp-change-cat" class="form-control" style="font-size:11px; padding:4px 6px; flex:1;">
+                        ${{catOptions}}
+                    </select>
+                    <button type="button" class="btn btn-sm btn-primary" style="font-size:11px; padding:4px 10px;" onclick="updateDeviceCategory('${{dev.doc_key}}', '${{dev.device_id}}')">Update</button>
+                </div>
+                <span id="cat-status" style="font-size:11px; margin-top:2px; display:block;"></span>
+            </div>
+        `;
+
+        // Hardware Product Profile (compact, omitted for routers to prevent clutter)
         let productCard = '';
-        if (dev.product) {{
+        if (dev.product && dev.product.category !== 'router' && dev.category !== 'router') {{
             const p = dev.product;
             let matterBadge = '';
             if (p.matter_device_type) {{
-                matterBadge = `<span class="badge" style="background:#059669; color:#fff; font-size:11px; margin-top:4px;">✨ Matter: ${{escapeHtml(p.matter_device_type)}}</span> `;
+                matterBadge = `<span class="badge" style="background:#059669; color:#fff; font-size:10px; margin-top:2px;">✨ Matter: ${{escapeHtml(p.matter_device_type)}}</span> `;
             }}
             let vendorLink = escapeHtml(p.vendor_name);
             if (p.vendor_website) {{
@@ -1712,21 +1814,15 @@ fn render_devices_page(
             }}
             let docBtn = '';
             if (p.documentation_url) {{
-                docBtn = `<div style="margin-top:6px;"><a href="${{p.documentation_url}}" target="_blank" class="btn btn-sm" style="background:var(--badge-bg); color:var(--text); font-size:11px; text-decoration:none;">📖 Official Product Manual / Specs ↗</a></div>`;
+                docBtn = `<div style="margin-top:4px;"><a href="${{p.documentation_url}}" target="_blank" class="btn btn-sm" style="background:var(--badge-bg); color:var(--text); font-size:11px; text-decoration:none;">📖 Product Manual ↗</a></div>`;
             }}
-            let specsText = p.specs ? `<p style="font-size:12px; color:var(--muted); margin-top:4px;">${{escapeHtml(p.specs)}}</p>` : '';
             let modelText = p.model_number ? `<span style="font-size:11px; color:var(--muted);">&bull; Model: <code>${{escapeHtml(p.model_number)}}</code></span>` : '';
 
             productCard = `
-                <div class="inspector-sec" style="background:var(--primary-bg); border:1px solid rgba(37,99,235,0.2); border-radius:8px; padding:12px; margin-top:12px;">
-                    <div class="inspector-title" style="margin-bottom:4px;">
-                        <span style="color:var(--primary);">🏷️ Hardware Product Profile</span>
-                        <span class="badge badge-kind" style="font-size:10px;">${{p.category}}</span>
-                    </div>
-                    <div style="font-size:14px; font-weight:700;">${{escapeHtml(p.name)}} ${{modelText}}</div>
-                    <div style="font-size:12px; margin-top:2px;">${{vendorLink}}</div>
+                <div class="inspector-sec" style="background:var(--primary-bg); border:1px solid rgba(37,99,235,0.2); border-radius:8px; padding:10px; margin-top:10px;">
+                    <div style="font-size:13px; font-weight:700;">🏷️ ${{escapeHtml(p.name)}} ${{modelText}}</div>
+                    <div style="font-size:11px; margin-top:2px;">${{vendorLink}}</div>
                     ${{matterBadge}}
-                    ${{specsText}}
                     ${{docBtn}}
                 </div>
             `;
@@ -1796,6 +1892,7 @@ fn render_devices_page(
                         <span class="badge badge-kind">${{dev.category_title}}</span>
                     </div>
                 </div>
+                ${{categorySelectorBox}}
                 ${{webBtn}}
                 ${{productCard}}
                 ${{assignBox}}
@@ -1846,6 +1943,45 @@ fn render_devices_page(
 
     function escapeAttr(text) {{
         return (text || '').replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }}
+
+    async function updateDeviceCategory(docKey, deviceId) {{
+        const sel = document.getElementById('insp-change-cat');
+        if (!sel) return;
+        const newCat = sel.value;
+        const statusEl = document.getElementById('cat-status');
+        if (statusEl) {{
+            statusEl.innerText = 'Updating category...';
+            statusEl.style.color = 'var(--muted)';
+        }}
+
+        try {{
+            const key = docKey || deviceId;
+            const res = await fetch('/api/devices/' + encodeURIComponent(key) + '/category', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ category: newCat }})
+            }});
+            if (res.ok) {{
+                if (statusEl) {{
+                    statusEl.innerText = 'Category updated! Reloading...';
+                    statusEl.style.color = 'var(--status-green)';
+                }}
+                setTimeout(() => {{
+                    window.location.reload();
+                }}, 400);
+            }} else {{
+                if (statusEl) {{
+                    statusEl.innerText = 'Failed to update category';
+                    statusEl.style.color = 'var(--status-red)';
+                }}
+            }}
+        }} catch (e) {{
+            if (statusEl) {{
+                statusEl.innerText = 'Network error: ' + e;
+                statusEl.style.color = 'var(--status-red)';
+            }}
+        }}
     }}
 
     async function saveInspectorNotes(docKey) {{

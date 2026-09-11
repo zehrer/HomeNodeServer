@@ -126,9 +126,19 @@
       "website": "https://www.wizconnected.com",
       "support_url": "https://faq.wizconnected.com",
       "icon": "💡",
-      "oui_prefixes": ["a8:03:2a"],
+      "oui_prefixes": ["a8:03:2a", "cc:40:85", "d0:c9:07"],
       "protocols": ["wifi", "ble", "matter", "udp-local"],
       "description": "Direct Wi-Fi smart bulbs, downlights, and smart plugs with native Matter and local UDP control."
+    },
+    {
+      "id": "espressif",
+      "name": "Espressif Systems",
+      "website": "https://www.espressif.com",
+      "support_url": "https://www.espressif.com/en/support",
+      "icon": "⚡",
+      "oui_prefixes": ["0c:4e:a0", "24:0a:c4", "30:ae:a4", "84:cc:a8", "a4:cf:12", "dc:4f:22", "a8:46:74"],
+      "protocols": ["wifi", "ble", "matter", "esphome"],
+      "description": "Leading semiconductor company creating Wi-Fi and Bluetooth microcontrollers (ESP32, ESP8266) powering smart home devices."
     },
     {
       "id": "meshtastic",
