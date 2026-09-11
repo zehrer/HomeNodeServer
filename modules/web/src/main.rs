@@ -260,6 +260,7 @@ struct DeviceAnalysisResponse {
     hostname: Option<String>,
     vendor: Option<String>,
     open_ports: Vec<AnalysisPortResult>,
+    total_ports_scanned: usize,
     http_title: Option<String>,
     http_server: Option<String>,
     suggested_category: String,
@@ -312,13 +313,17 @@ async fn analyze_device_handler(
         }
     };
 
-    // Probe common IoT, web, and server ports
-    let probe_ports = [21, 22, 23, 53, 80, 443, 554, 1883, 5000, 5001, 5060, 8080, 8443, 8883, 9000];
+    // Comprehensive port scan across standard IoT, web, management, and smart home services
+    let probe_ports = [
+        21, 22, 23, 53, 80, 81, 443, 554, 1883, 1900, 5000, 5001, 5060, 6053, 8080, 8081, 8443,
+        8883, 9000,
+    ];
+    let total_ports_scanned = probe_ports.len();
     let mut join_set = tokio::task::JoinSet::new();
     for port in probe_ports {
         join_set.spawn(async move {
             let addr = SocketAddr::new(IpAddr::V4(ip), port);
-            let open = tokio::time::timeout(Duration::from_millis(180), TcpStream::connect(addr))
+            let open = tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr))
                 .await
                 .is_ok_and(|r| r.is_ok());
             (port, open)
@@ -397,6 +402,7 @@ async fn analyze_device_handler(
         hostname,
         vendor,
         open_ports: port_results,
+        total_ports_scanned,
         http_title,
         http_server,
         suggested_category: suggested_cat,
@@ -456,17 +462,21 @@ async fn probe_http_banner(ip: Ipv4Addr, port: u16) -> Option<(Option<String>, O
 fn port_description(port: u16) -> &'static str {
     match port {
         21 => "FTP File Transfer",
-        22 => "SSH Terminal",
-        23 => "Telnet",
+        22 => "SSH Terminal Access",
+        23 => "Telnet Console",
         53 => "DNS Server",
-        80 => "HTTP Web Interface",
+        80 => "HTTP Web Interface (HMI)",
+        81 => "HTTP Alternate (Admin)",
         443 => "HTTPS Web Interface",
         554 => "RTSP Video Stream",
-        1883 => "MQTT Broker/Client",
-        5000 => "Synology DSM Web UI",
+        1883 => "MQTT Broker / Client",
+        1900 => "SSDP / UPnP Discovery",
+        5000 => "Synology DSM Web UI / UPnP",
         5001 => "Synology DSM HTTPS",
         5060 => "SIP VoIP Telephony",
+        6053 => "ESPHome Native API",
         8080 => "HTTP Alt Web Interface",
+        8081 => "HTTP Alt Admin",
         8443 => "HTTPS Alt Web Interface",
         8883 => "Secure MQTT",
         9000 => "Web Admin / Portainer",
@@ -486,6 +496,18 @@ fn deduce_analyzer_category(
     let lower_vendor = vendor.unwrap_or_default().to_lowercase();
     let lower_title = http_title.unwrap_or_default().to_lowercase();
 
+    if lower_name.contains("ecoflow") || lower_host.contains("ecoflow") || lower_vendor.contains("ecoflow") {
+        return ("energy".to_string(), "Solar & Energy Systems", "☀️");
+    }
+    if lower_name.contains("3em") || lower_host.contains("3em") {
+        return ("energy".to_string(), "Solar & Energy Systems", "☀️");
+    }
+    if lower_name.contains("hue") || lower_host.contains("hue") || lower_vendor.contains("philips") {
+        return ("hub".to_string(), "Smart Home Hubs", "🎛️");
+    }
+    if lower_name.contains("netatmo") || lower_host.contains("netatmo") || lower_vendor.contains("netatmo") {
+        return ("sensor".to_string(), "Sensors & Detectors", "🌡️");
+    }
     if lower_name.contains("synology") || lower_host.contains("synology") || open_ports.contains(&5000) {
         return ("nas".to_string(), "Network Storage & NAS", "🗄️");
     }
@@ -1179,23 +1201,7 @@ fn render_devices_page(
                     .unwrap_or_else(|| "-".to_string());
                 let mac = device.metadata.get("mac").cloned().unwrap_or_default();
                 let vendor = device.metadata.get("vendor").cloned().unwrap_or_default();
-                let web_url = device.metadata.get("web_url").cloned().or_else(|| {
-                    let cat = device.metadata.get("category").map(|s| s.as_str()).unwrap_or("");
-                    if cat == "nas" {
-                        Some(format!("http://{ip}:5000"))
-                    } else if cat == "router"
-                        || cat == "smart-plug"
-                        || cat == "display"
-                        || cat == "radio"
-                        || cat == "energy"
-                        || cat == "appliance"
-                        || cat == "sensor"
-                    {
-                        Some(format!("http://{ip}"))
-                    } else {
-                        None
-                    }
-                });
+                let web_url = device.metadata.get("web_url").cloned();
 
                 let doc_key = if !mac.is_empty() {
                     mac.clone()
@@ -1245,9 +1251,10 @@ fn render_devices_page(
                 ));
 
                 format!(
-                    "<tr><td><strong>{}</strong><br><small style=\"color:var(--muted)\">{}</small></td><td><span class=\"badge badge-kind\">{}</span></td><td>{}</td><td>{}</td><td><div class=\"action-cell\">{}</div></td></tr>",
+                    "<tr><td><strong>{}</strong><br><small style=\"color:var(--muted)\">{} &bull; {}</small></td><td><span class=\"badge badge-kind\">{}</span></td><td>{}</td><td>{}</td><td><div class=\"action-cell\">{}</div></td></tr>",
                     device.display_name,
                     device.device_id,
+                    device.module_id,
                     device.kind,
                     network_info,
                     if caps.is_empty() { String::from("-") } else { caps },
@@ -1411,14 +1418,14 @@ fn render_devices_page(
 
             let portsHtml = '';
             if (data.open_ports && data.open_ports.length > 0) {
-                portsHtml = data.open_ports.map(p => '<span class="badge" style="margin-right:4px;">Port ' + p.port + ' (' + p.service + ')</span>').join('');
+                portsHtml = data.open_ports.map(p => '<span class="badge" style="background:#dcfce7; color:#166534; font-weight:600; padding:4px 8px; margin:2px 4px 2px 0; display:inline-block;">✓ Port ' + p.port + ': ' + p.service + '</span>').join('');
             } else {
-                portsHtml = '<em>No standard TCP ports open</em>';
+                portsHtml = '<span style="color:var(--muted); font-size:13px;">No open TCP ports detected across standard IoT management ports.</span>';
             }
 
             let httpInfo = '';
             if (data.http_title || data.http_server) {
-                httpInfo = '<div style="margin-top:10px; font-size:13px;">' +
+                httpInfo = '<div style="margin-top:10px; padding-top:8px; border-top:1px dashed var(--border); font-size:13px;">' +
                     (data.http_title ? '<strong>Page Title:</strong> ' + data.http_title + '<br>' : '') +
                     (data.http_server ? '<strong>HTTP Server:</strong> ' + data.http_server + '<br>' : '') +
                     '</div>';
@@ -1433,9 +1440,15 @@ fn render_devices_page(
                 <div style="margin-bottom:14px;">
                     <strong>Host:</strong> <code>${data.ip}</code> ${data.hostname ? '(' + data.hostname + ')' : ''}<br>
                     <strong>Hardware / Vendor:</strong> ${data.vendor || 'Unknown'} ${data.mac ? '<code>' + data.mac + '</code>' : ''}<br>
-                    <strong>Open Services:</strong> <div style="margin-top:6px;">${portsHtml}</div>
-                    ${httpInfo}
-                    <div style="margin-top:10px;">
+                    <div style="background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:12px; margin:12px 0;">
+                        <div style="font-weight:600; font-size:13px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
+                            <span>🔌 Port Scan Results</span>
+                            <span class="badge" style="font-weight:normal;">${data.open_ports ? data.open_ports.length : 0} open of ${data.total_ports_scanned || 19} scanned</span>
+                        </div>
+                        <div>${portsHtml}</div>
+                        ${httpInfo}
+                    </div>
+                    <div>
                         <strong>Suggested Category:</strong> ${data.suggested_icon} ${data.suggested_title} (<code>${data.suggested_category}</code>)
                     </div>
                 </div>

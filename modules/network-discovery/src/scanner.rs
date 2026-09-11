@@ -618,7 +618,19 @@ fn classify_device(name: &str, ip: &str, mac: Option<&str>) -> String {
     if lower.contains("snom") || lower.contains("voip") || lower.contains("sip") {
         return "phone".to_string();
     }
-    if vendor.contains("espressif") || vendor.contains("raspberry") || lower.contains("shelly") || lower.contains("sonoff") || lower.contains("esp32") || lower.contains("esp8266") || lower.contains("netatmo") || lower.contains("ecoflow") {
+    if lower.contains("ecoflow") || vendor.contains("ecoflow") {
+        return "energy".to_string();
+    }
+    if (lower.contains("shelly") || vendor.contains("shelly")) && (lower.contains("3em") || lower.contains("em3")) {
+        return "energy".to_string();
+    }
+    if lower.contains("hue") || (vendor.contains("philips") && lower.contains("gateway")) {
+        return "hub".to_string();
+    }
+    if lower.contains("netatmo") || vendor.contains("netatmo") {
+        return "sensor".to_string();
+    }
+    if vendor.contains("espressif") || vendor.contains("raspberry") || lower.contains("shelly") || lower.contains("sonoff") || lower.contains("esp32") || lower.contains("esp8266") {
         return "iot".to_string();
     }
     if lower == "fritz.box" || lower.starts_with("fritz.box") || lower.contains("fritz!box") || lower.contains("router") || lower.contains("gateway") || ip.ends_with(".1") {
@@ -644,7 +656,9 @@ fn guess_vendor(mac: &str) -> Option<&'static str> {
         "d0:c9:07" | "ec:2c:e2" => Some("Govee / Intellirocks"),
         "18:8b:0e" => Some("SwitchBot / Woan Tech"),
         "10:20:ba" => Some("Meshtastic / Heltec"),
-        "cc:40:85" | "a0:85:e3" | "be:39:d4" | "90:dd:5d" => Some("Apple Inc."),
+        "a0:85:e3" => Some("EcoFlow Inc."),
+        "70:ee:50" => Some("Netatmo"),
+        "cc:40:85" | "be:39:d4" | "90:dd:5d" => Some("Apple Inc."),
         _ => None,
     }
 }
@@ -839,6 +853,10 @@ mod tests {
             ("miele.fritz.box", "appliance", "Home Appliances", "🧺"),
             ("led-govee-sophie.fritz.box", "lighting", "Smart Lighting", "💡"),
             ("led-wiz-ug.fritz.box", "lighting", "Smart Lighting", "💡"),
+            ("netatmo.fritz.box", "sensor", "Sensors & Detectors", "🌡️"),
+            ("ecoflow2.fritz.box", "energy", "Solar & Energy Systems", "☀️"),
+            ("shellypro3em.fritz.box", "energy", "Solar & Energy Systems", "☀️"),
+            ("hue-gateway.fritz.box", "hub", "Smart Home Hubs", "🎛️"),
         ];
 
         for (host, expected_cat, expected_title, expected_icon) in cases {
