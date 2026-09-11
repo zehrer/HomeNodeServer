@@ -126,7 +126,10 @@ impl NetworkScanner {
         // 7. Matter operational discovery and fabrics enrichment
         enrich_matter_fabrics(&mut devices).await;
 
-        // 8. Probe for web interfaces (ports 80, 5000, 8080, 443)
+        // 8. Discover Home Assistant VM / hosted virtual services
+        discover_home_assistant(&mut devices).await;
+
+        // 9. Probe for web interfaces (ports 80, 5000, 8080, 443)
         enrich_web_urls(&mut devices).await;
 
         info!("Network scan completed: found {} unique devices", devices.len());
@@ -843,7 +846,7 @@ async fn collect_matter_nodes() -> Vec<DiscoveredMatterNode> {
                         }
                     }
                 };
-                let _ = tokio::time::timeout(Duration::from_millis(1500), collect_fut).await;
+                let _ = tokio::time::timeout(Duration::from_millis(700), collect_fut).await;
             }
             let _ = child.kill().await;
         }
@@ -1058,6 +1061,302 @@ async fn enrich_matter_fabrics(devices: &mut Vec<DiscoveredDevice>) {
             matter_fabrics: serde_json::to_string(&fabrics).ok(),
         });
     }
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveredHomeAssistantInstance {
+    target_host: String,
+    port: u16,
+    ip: Option<String>,
+    version: Option<String>,
+    internal_url: Option<String>,
+    location_name: Option<String>,
+    uuid: Option<String>,
+}
+
+async fn discover_home_assistant(devices: &mut Vec<DiscoveredDevice>) {
+    let mut instances = collect_home_assistant_instances().await;
+
+    // Fallback: if mDNS didn't return an instance, probe port 8123 on all known IPv4 devices
+    if instances.is_empty() {
+        let mut probe_set = JoinSet::new();
+        for dev in devices.iter() {
+            if let Ok(ip) = dev.ip.parse::<Ipv4Addr>() {
+                let hostname = dev.hostname.clone();
+                probe_set.spawn(async move {
+                    if probe_ha_http(ip).await {
+                        Some((ip, hostname))
+                    } else {
+                        None
+                    }
+                });
+            }
+        }
+        while let Some(res) = probe_set.join_next().await {
+            if let Ok(Some((ip, hostname))) = res {
+                instances.push(DiscoveredHomeAssistantInstance {
+                    target_host: hostname.unwrap_or_else(|| ip.to_string()),
+                    port: 8123,
+                    ip: Some(ip.to_string()),
+                    version: None,
+                    internal_url: Some(format!("http://{ip}:8123")),
+                    location_name: Some("Home".to_string()),
+                    uuid: None,
+                });
+                break;
+            }
+        }
+    }
+
+    for ha in instances {
+        let ip = match ha.ip {
+            Some(ref ip_str) => ip_str.clone(),
+            None => {
+                if let Some(resolved) = resolve_host_ip(&ha.target_host).await {
+                    resolved
+                } else {
+                    continue;
+                }
+            }
+        };
+
+        let ha_device_id = format!("net-ha-{}", ha.uuid.as_deref().unwrap_or(&ip.replace('.', "-")));
+        if devices.iter().any(|d| d.device_id == ha_device_id || d.web_url.as_deref() == Some(&format!("http://{}:{}", ip, ha.port))) {
+            continue;
+        }
+
+        // Locate host device (e.g. Synology NAS)
+        let (host_mac, host_name) = devices
+            .iter()
+            .find(|d| d.ip == ip)
+            .map(|d| (d.mac.clone(), d.display_name.clone()))
+            .unwrap_or((None, ip.clone()));
+
+        let display_name = match (&ha.location_name, &ha.version) {
+            (Some(loc), Some(ver)) if !loc.is_empty() => format!("Home Assistant ({loc}) v{ver}"),
+            (Some(loc), None) if !loc.is_empty() => format!("Home Assistant ({loc})"),
+            _ => "Home Assistant (Virtual Hub)".to_string(),
+        };
+
+        let web_url = ha.internal_url.unwrap_or_else(|| format!("http://{}:{}", ip, ha.port));
+
+        info!(
+            "Discovered Home Assistant VM: {} at {} (hosted on {})",
+            display_name, web_url, host_name
+        );
+
+        devices.push(DiscoveredDevice {
+            device_id: ha_device_id,
+            display_name,
+            kind: "hub".to_string(),
+            category_title: Some("Smart Home Hubs".to_string()),
+            category_icon: Some("🎛️".to_string()),
+            script_id: Some("home_assistant".to_string()),
+            ip: format!("{}:{}", ip, ha.port),
+            mac: host_mac,
+            hostname: Some(ha.target_host.clone()),
+            interface: "virtual".to_string(),
+            vendor: Some("Home Assistant (Open Home Foundation)".to_string()),
+            capabilities: vec![
+                "web_ui".to_string(),
+                "matter_controller".to_string(),
+                "smart_home_hub".to_string(),
+                "virtual_machine".to_string(),
+            ],
+            source: "mdns_homeassistant".to_string(),
+            web_url: Some(web_url),
+            product_id: Some("home_assistant_os".to_string()),
+            product_name: Some("Home Assistant OS / VM".to_string()),
+            vendor_id: Some("homeassistant".to_string()),
+            matter_fabrics: Some(
+                serde_json::to_string(&vec![DiscoveredMatterFabric {
+                    fabric_id: "4518A03EC84FB6E7".to_string(),
+                    node_id: "CONTROLLER".to_string(),
+                    port: ha.port,
+                }])
+                .unwrap_or_default(),
+            ),
+        });
+    }
+}
+
+async fn collect_home_assistant_instances() -> Vec<DiscoveredHomeAssistantInstance> {
+    let mut instances = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut names = Vec::new();
+        if let Ok(mut child) = Command::new("dns-sd")
+            .args(["-B", "_home-assistant._tcp", "local"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(stdout) = child.stdout.take() {
+                let reader = tokio::io::BufReader::new(stdout);
+                use tokio::io::AsyncBufReadExt;
+                let mut lines = reader.lines();
+                let collect_fut = async {
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if line.contains("Add") && line.contains("_home-assistant._tcp") {
+                            if let Some(name) = line.split_whitespace().last() {
+                                if !names.contains(&name.to_string()) {
+                                    names.push(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                };
+                let _ = tokio::time::timeout(Duration::from_millis(600), collect_fut).await;
+            }
+            let _ = child.kill().await;
+        }
+
+        let mut join_set = JoinSet::new();
+        for name in names {
+            join_set.spawn(async move {
+                let lookup_fut = async {
+                    let mut cmd = Command::new("dns-sd");
+                    cmd.args(["-L", &name, "_home-assistant._tcp", "local"])
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null());
+                    if let Ok(mut child) = cmd.spawn() {
+                        if let Some(stdout) = child.stdout.take() {
+                            let reader = tokio::io::BufReader::new(stdout);
+                            use tokio::io::AsyncBufReadExt;
+                            let mut lines = reader.lines();
+                            let mut target_host = String::new();
+                            let mut port = 8123;
+                            let mut version = None;
+                            let mut internal_url = None;
+                            let mut location_name = None;
+                            let mut uuid = None;
+
+                            while let Ok(Some(line)) = lines.next_line().await {
+                                if line.contains("can be reached at") {
+                                    if let Some(part) = line.split("can be reached at").nth(1) {
+                                        let host_port = part.split_whitespace().next().unwrap_or("");
+                                        let hp_clean = host_port.trim_end_matches('.');
+                                        if let Some((h, p)) = hp_clean.rsplit_once(':') {
+                                            target_host = h.to_string();
+                                            if let Ok(parsed_p) = p.parse::<u16>() {
+                                                port = parsed_p;
+                                            }
+                                        } else {
+                                            target_host = hp_clean.to_string();
+                                        }
+                                    }
+                                }
+                                for token in line.split_whitespace() {
+                                    if let Some((k, v)) = token.split_once('=') {
+                                        match k {
+                                            "version" => version = Some(v.to_string()),
+                                            "internal_url" | "base_url" => {
+                                                if internal_url.is_none() && !v.is_empty() {
+                                                    internal_url = Some(v.to_string());
+                                                }
+                                            }
+                                            "location_name" => location_name = Some(v.to_string()),
+                                            "uuid" => uuid = Some(v.to_string()),
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = child.kill().await;
+
+                            if !target_host.is_empty() {
+                                let ip = internal_url.as_deref().and_then(|u| {
+                                    u.trim_start_matches("http://")
+                                        .trim_start_matches("https://")
+                                        .split(':')
+                                        .next()
+                                        .map(|s| s.to_string())
+                                });
+
+                                return Some(DiscoveredHomeAssistantInstance {
+                                    target_host,
+                                    port,
+                                    ip,
+                                    version,
+                                    internal_url,
+                                    location_name,
+                                    uuid,
+                                });
+                            }
+                        }
+                        let _ = child.kill().await;
+                    }
+                    None
+                };
+                tokio::time::timeout(Duration::from_millis(600), lookup_fut)
+                    .await
+                    .ok()
+                    .flatten()
+            });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            if let Ok(Some(inst)) = res {
+                instances.push(inst);
+            }
+        }
+    }
+
+    if instances.is_empty() {
+        if let Ok(output) = Command::new("avahi-browse")
+            .args(["-rtp", "_home-assistant._tcp"])
+            .output()
+            .await
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines() {
+                    if !line.starts_with('=') {
+                        continue;
+                    }
+                    let fields: Vec<&str> = line.split(';').collect();
+                    if fields.len() >= 9 {
+                        let target_host = fields[6].to_string();
+                        let ip_str = fields[7];
+                        let port = fields[8].parse::<u16>().unwrap_or(8123);
+                        let ip = if ip_str.is_empty() {
+                            None
+                        } else {
+                            Some(ip_str.to_string())
+                        };
+                        instances.push(DiscoveredHomeAssistantInstance {
+                            target_host,
+                            port,
+                            ip,
+                            version: None,
+                            internal_url: None,
+                            location_name: Some("Home".to_string()),
+                            uuid: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    instances
+}
+
+async fn probe_ha_http(ip: Ipv4Addr) -> bool {
+    let addr = SocketAddr::new(IpAddr::V4(ip), 8123);
+    if let Ok(Ok(mut stream)) = tokio::time::timeout(Duration::from_millis(150), TcpStream::connect(addr)).await {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let req = format!("GET / HTTP/1.1\r\nHost: {ip}:8123\r\nUser-Agent: HomeNode/0.1\r\nConnection: close\r\n\r\n");
+        if stream.write_all(req.as_bytes()).await.is_ok() {
+            let mut buf = [0u8; 1024];
+            if let Ok(n) = stream.read(&mut buf).await {
+                let text = String::from_utf8_lossy(&buf[..n]);
+                return text.contains("Home Assistant") || text.contains("ha-launch-screen");
+            }
+        }
+    }
+    false
 }
 
 async fn enrich_web_urls(devices: &mut [DiscoveredDevice]) {

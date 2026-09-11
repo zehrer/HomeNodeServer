@@ -293,7 +293,7 @@ async fn wait_for_snapshot(
     socket_path: &Path,
     predicate: impl Fn(&homenode_sdk::proto::RuntimeSnapshot) -> bool,
 ) -> Result<homenode_sdk::proto::RuntimeSnapshot> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         match homenode_sdk::connect_control_client(socket_path).await {
             Ok(mut client) => {

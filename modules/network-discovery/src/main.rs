@@ -72,6 +72,17 @@ async fn main() -> Result<()> {
         })
         .await?;
 
+    if !config.demo_devices.is_empty() {
+        let mut initial_demo = Vec::new();
+        append_demo_devices(&env.module_id, &mut initial_demo, &config.demo_devices);
+        let _ = client
+            .upsert_devices(UpsertDevicesRequest {
+                module_id: env.module_id.clone(),
+                devices: initial_demo,
+            })
+            .await;
+    }
+
     let scanner_config = ScannerConfig {
         max_active_targets: config.max_active_targets,
         enable_active_icmp: config.enable_active_icmp,

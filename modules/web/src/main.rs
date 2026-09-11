@@ -145,9 +145,9 @@ async fn main() -> Result<()> {
         initial_fabrics.insert(
             "4518A03EC84FB6E7".to_string(),
             MatterFabricMeta {
-                name: "Secondary Fabric".to_string(),
-                icon: "⚡".to_string(),
-                description: "Multi-admin fabric shared across bridges and lights".to_string(),
+                name: "Home Assistant".to_string(),
+                icon: "🏡".to_string(),
+                description: "Home Assistant Matter Server ecosystem fabric".to_string(),
             },
         );
         modified_fabrics = true;
@@ -195,6 +195,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(devices_handler))
+        .route("/matter", get(matter_handler))
         .route("/catalog", get(catalog_handler))
         .route("/status", get(status_handler))
         .route("/scan", post(scan_trigger_form_handler))
@@ -304,6 +305,23 @@ async fn devices_handler(State(state): State<WebState>) -> Html<String> {
             &matter_fabrics,
         ),
         Err(error) => render_error(&state.status_title, "devices", &error.to_string()),
+    };
+    Html(body)
+}
+
+async fn matter_handler(State(state): State<WebState>) -> Html<String> {
+    let docs = state.docs_store.read().await.clone();
+    let links = state.links_store.read().await.clone();
+    let matter_fabrics = state.matter_fabrics_store.read().await.clone();
+    let body = match load_snapshot(&state.socket_path).await {
+        Ok(snapshot) => render_matter_page(
+            &state.status_title,
+            &snapshot,
+            &docs,
+            &links,
+            &matter_fabrics,
+        ),
+        Err(error) => render_error(&state.status_title, "matter", &error.to_string()),
     };
     Html(body)
 }
@@ -1110,6 +1128,7 @@ fn build_unified_devices(
 
 fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
     let devices_active = if current_tab == "devices" { "class=\"active\"" } else { "" };
+    let matter_active = if current_tab == "matter" { "class=\"active\"" } else { "" };
     let catalog_active = if current_tab == "catalog" { "class=\"active\"" } else { "" };
     let status_active = if current_tab == "status" { "class=\"active\"" } else { "" };
     format!(
@@ -1162,36 +1181,33 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            flex-wrap: wrap;
-            gap: 16px;
-            margin-bottom: 20px;
-            padding-bottom: 14px;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
             border-bottom: 1px solid var(--border);
+            flex-wrap: wrap;
+            gap: 12px;
         }}
-        h1 {{ font-size: 22px; font-weight: 700; }}
+        h1 {{ font-size: 20px; font-weight: 700; }}
         nav {{ display: flex; gap: 8px; }}
         nav a {{
-            text-decoration: none;
             padding: 6px 14px;
             border-radius: 6px;
-            font-size: 14px;
-            font-weight: 500;
+            text-decoration: none;
             color: var(--muted);
+            font-size: 13px;
+            font-weight: 500;
+            transition: all 0.15s;
         }}
-        nav a.active {{
-            background: var(--primary);
-            color: #ffffff;
-        }}
-        nav a:hover:not(.active) {{
-            background: var(--badge-bg);
-            color: var(--text);
-        }}
+        nav a:hover {{ color: var(--text); background: var(--border); }}
+        nav a.active {{ color: var(--primary); background: var(--primary-bg); font-weight: 600; }}
+        
         .card {{
             background: var(--surface);
             border: 1px solid var(--border);
-            border-radius: 8px;
+            border-radius: 10px;
             padding: 16px 20px;
-            margin-bottom: 16px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
         }}
         h2 {{ font-size: 16px; font-weight: 600; margin-bottom: 14px; }}
         h3 {{ font-size: 15px; font-weight: 600; }}
@@ -1299,134 +1315,133 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
             gap: 12px;
             margin-bottom: 14px;
         }}
+        .toolbar h2 {{ font-size: 16px; font-weight: 600; }}
         .btn {{
             display: inline-flex;
             align-items: center;
             gap: 6px;
-            padding: 6px 14px;
-            font-size: 13px;
-            font-weight: 500;
+            padding: 7px 14px;
             border-radius: 6px;
-            border: 1px solid transparent;
+            border: 1px solid var(--border);
+            background: var(--surface);
+            color: var(--text);
+            font-size: 13px;
             cursor: pointer;
-            text-decoration: none;
-            transition: all 0.15s ease;
+            transition: all 0.15s;
         }}
+        .btn:hover {{ background: var(--badge-bg); }}
         .btn-primary {{
             background: var(--primary);
-            color: #ffffff;
+            color: #fff;
+            border-color: var(--primary);
         }}
-        .btn-primary:hover {{ filter: brightness(1.1); }}
+        .btn-primary:hover {{ opacity: 0.9; background: var(--primary); }}
         .btn-sm {{
             padding: 3px 8px;
             font-size: 11px;
             border-radius: 4px;
-            border: 1px solid var(--border);
-            background: var(--surface);
-            color: var(--text);
             cursor: pointer;
+        }}
+        .btn-web {{
+            background: #dbeafe;
+            color: #1d4ed8;
+            border: 1px solid #bfdbfe;
+            font-weight: 600;
             text-decoration: none;
             display: inline-flex;
             align-items: center;
             gap: 4px;
         }}
-        .btn-sm:hover {{ border-color: var(--primary); color: var(--primary); }}
-        .btn-web {{
-            background: #dbeafe;
-            color: #1d4ed8;
-            border-color: #bfdbfe;
+        .btn-web:hover {{
+            background: #bfdbfe;
         }}
-        .btn-web:hover {{ background: #bfdbfe; color: #1e40af; }}
         @media (prefers-color-scheme: dark) {{
-            .btn-web {{ background: #1e3a8a; color: #bfdbfe; border-color: #1e40af; }}
+            .btn-web {{
+                background: #1e3a8a;
+                color: #bfdbfe;
+                border-color: #2563eb;
+            }}
+            .btn-web:hover {{
+                background: #1d4ed8;
+            }}
+        }}
+        
+        .pills {{
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 16px;
+        }}
+        .pill {{
+            padding: 5px 12px;
+            border-radius: 9999px;
+            border: 1px solid var(--border);
+            background: var(--surface);
+            font-size: 12px;
+            cursor: pointer;
+            color: var(--muted);
+            transition: all 0.15s;
+        }}
+        .pill:hover {{ color: var(--text); border-color: var(--text); }}
+        .pill.active {{
+            background: var(--primary);
+            border-color: var(--primary);
+            color: #fff;
+            font-weight: 600;
         }}
         
         .search-input {{
             padding: 6px 12px;
-            font-size: 13px;
             border-radius: 6px;
             border: 1px solid var(--border);
             background: var(--surface);
             color: var(--text);
-            width: 240px;
+            font-size: 13px;
+            min-width: 240px;
         }}
-        .search-input:focus {{ outline: none; border-color: var(--primary); }}
-        
-        .pills {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 5px;
-            margin-bottom: 16px;
-        }}
-        .pill {{
-            display: inline-flex;
-            align-items: center;
-            gap: 5px;
-            padding: 4px 10px;
-            font-size: 12px;
-            border-radius: 9999px;
-            border: 1px solid var(--border);
-            background: var(--surface);
-            color: var(--muted);
-            cursor: pointer;
-            transition: all 0.15s ease;
-        }}
-        .pill:hover {{ border-color: var(--primary); color: var(--text); }}
-        .pill.active {{
-            background: var(--primary);
-            border-color: var(--primary);
-            color: #ffffff;
-            font-weight: 500;
+        .search-input:focus {{
+            outline: 2px solid var(--primary);
+            border-color: transparent;
         }}
         
         .group-header {{
             display: flex;
             align-items: center;
             justify-content: space-between;
-            margin-bottom: 8px;
+            margin-bottom: 10px;
+            padding-bottom: 6px;
+            border-bottom: 2px solid var(--border);
         }}
         .group-header h3 {{
             font-size: 14px;
+            font-weight: 600;
             display: flex;
             align-items: center;
             gap: 6px;
         }}
         
-        /* Inspector Styles */
-        .inspector-sec {{
-            margin-top: 14px;
-            padding-top: 12px;
-            border-top: 1px solid var(--border);
+        .empty-state {{
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--muted);
         }}
+        .empty-state p {{ font-size: 13px; margin-top: 6px; }}
+        
         .inspector-title {{
             font-size: 12px;
-            font-weight: 600;
-            color: var(--muted);
+            font-weight: 700;
             text-transform: uppercase;
-            margin-bottom: 8px;
+            letter-spacing: 0.5px;
+            color: var(--muted);
+            margin-bottom: 12px;
             display: flex;
             align-items: center;
             justify-content: space-between;
         }}
-        .iface-card {{
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 8px 10px;
-            margin-bottom: 6px;
-            font-size: 12px;
-        }}
-        .merge-box {{
-            background: #fefce8;
-            border: 1px solid #fef08a;
-            color: #854d0e;
-            border-radius: 6px;
-            padding: 10px;
-            margin-top: 8px;
-            font-size: 12px;
-        }}
-        @media (prefers-color-scheme: dark) {{
-            .merge-box {{ background: #422006; border-color: #854d0e; color: #fef08a; }}
+        .inspector-sec {{
+            margin-top: 20px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border);
         }}
         .form-control {{
             width: 100%;
@@ -1435,15 +1450,34 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
             border: 1px solid var(--border);
             background: var(--bg);
             color: var(--text);
+            font-size: 12px;
             font-family: inherit;
-            font-size: 13px;
         }}
-        textarea.form-control {{ min-height: 80px; resize: vertical; }}
+        textarea.form-control {{
+            min-height: 80px;
+            resize: vertical;
+        }}
+        .iface-card {{
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 10px;
+            margin-bottom: 8px;
+            font-size: 12px;
+        }}
+        .merge-box {{
+            background: var(--primary-bg);
+            border: 1px dashed var(--primary);
+            border-radius: 6px;
+            padding: 10px;
+            margin-top: 10px;
+            font-size: 12px;
+        }}
         .code-box {{
             background: var(--code-bg);
             border: 1px solid var(--border);
             border-radius: 6px;
-            padding: 10px;
+            padding: 8px;
             font-family: monospace;
             font-size: 11px;
             overflow-x: auto;
@@ -1458,6 +1492,7 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
         <h1>{title}</h1>
         <nav>
             <a href="/" {devices_active}>Detected Devices</a>
+            <a href="/matter" {matter_active}>✨ Matter Fabrics</a>
             <a href="/catalog" {catalog_active}>Hardware Catalog</a>
             <a href="/status" {status_active}>System Status</a>
         </nav>
@@ -2486,6 +2521,279 @@ fn render_status_page(title: &str, snapshot: &RuntimeSnapshot) -> String {
     );
 
     page_layout(title, "status", &content)
+}
+
+fn render_matter_page(
+    title: &str,
+    snapshot: &RuntimeSnapshot,
+    _docs: &HashMap<String, DeviceDocumentation>,
+    links: &HashMap<String, Vec<String>>,
+    fabric_metas: &HashMap<String, MatterFabricMeta>,
+) -> String {
+    let unified_devices = build_unified_devices(&snapshot.devices, links);
+
+    struct MatterDeviceEntry {
+        display_name: String,
+        ip: String,
+        mac: String,
+        vendor: String,
+        web_url: Option<String>,
+        fabrics: Vec<ClientMatterFabric>,
+    }
+
+    let mut matter_devices = Vec::new();
+    let mut fabric_members: HashMap<String, Vec<(String, String, u16, String)>> = HashMap::new();
+
+    for udev in &unified_devices {
+        let dev = &udev.primary;
+        let fabrics = extract_device_matter_fabrics(dev, &udev.secondary_interfaces, fabric_metas);
+        if !fabrics.is_empty() {
+            let ip = dev.metadata.get("ip").cloned().unwrap_or_else(|| "-".to_string());
+            let mac = dev.metadata.get("mac").cloned().unwrap_or_default();
+            let vendor = dev.metadata.get("vendor").cloned().unwrap_or_default();
+            let web_url = dev.metadata.get("web_url").cloned();
+
+            for fab in &fabrics {
+                fabric_members.entry(fab.fabric_id.clone()).or_default().push((
+                    dev.display_name.clone(),
+                    fab.node_id.clone(),
+                    fab.port,
+                    fab.interface.clone(),
+                ));
+            }
+
+            matter_devices.push(MatterDeviceEntry {
+                display_name: dev.display_name.clone(),
+                ip,
+                mac,
+                vendor,
+                web_url,
+                fabrics,
+            });
+        }
+    }
+
+    matter_devices.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+
+    let mut fabric_keys: Vec<String> = fabric_metas.keys().cloned().collect();
+    for fid in fabric_members.keys() {
+        if !fabric_keys.contains(fid) {
+            fabric_keys.push(fid.clone());
+        }
+    }
+    fabric_keys.sort_by_key(|k| match k.as_str() {
+        "6ABEDCB982EC2223" => 1,
+        "4518A03EC84FB6E7" => 2,
+        "A38D674BFAAFF432" => 3,
+        _ => 10,
+    });
+
+    let total_nodes: usize = fabric_members.values().map(|v| v.len()).sum();
+    let multi_admin_count = matter_devices.iter().filter(|d| d.fabrics.len() > 1).count();
+
+    let summary_cards = format!(
+        r#"<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:16px; margin-bottom:20px;">
+            <div class="card" style="margin:0;">
+                <div style="font-size:12px; font-weight:600; color:var(--muted); text-transform:uppercase;">Operational Fabrics</div>
+                <div style="font-size:28px; font-weight:700; color:var(--primary); margin:4px 0;">{}</div>
+                <div style="font-size:12px; color:var(--muted);">Multi-ecosystem Matter fabrics active</div>
+            </div>
+            <div class="card" style="margin:0;">
+                <div style="font-size:12px; font-weight:600; color:var(--muted); text-transform:uppercase;">Matter Endpoints</div>
+                <div style="font-size:28px; font-weight:700; color:var(--status-green); margin:4px 0;">{} Nodes / {} Devices</div>
+                <div style="font-size:12px; color:var(--muted);">Active operational node announcements</div>
+            </div>
+            <div class="card" style="margin:0;">
+                <div style="font-size:12px; font-weight:600; color:var(--muted); text-transform:uppercase;">Multi-Admin Coverage</div>
+                <div style="font-size:28px; font-weight:700; color:#8b5cf6; margin:4px 0;">{} Devices ({:.0}%)</div>
+                <div style="font-size:12px; color:var(--muted);">Co-managed across Apple Home &amp; Home Assistant</div>
+            </div>
+        </div>"#,
+        fabric_keys.len(),
+        total_nodes,
+        matter_devices.len(),
+        multi_admin_count,
+        if matter_devices.is_empty() { 0.0 } else { (multi_admin_count as f64 / matter_devices.len() as f64) * 100.0 }
+    );
+
+    let mut fabric_cards = String::new();
+    for fid in &fabric_keys {
+        let meta = fabric_metas.get(fid);
+        let name = meta.map(|m| m.name.as_str()).unwrap_or("Unknown Fabric");
+        let icon = meta.map(|m| m.icon.as_str()).unwrap_or("✨");
+        let desc = meta.map(|m| m.description.as_str()).unwrap_or("Operational Matter fabric membership.");
+
+        let members = fabric_members.get(fid).cloned().unwrap_or_default();
+        let mut member_chips = String::new();
+        for (m_name, node_id, port, iface) in &members {
+            let iface_icon = if iface == "thread" { "🧵" } else { "📶" };
+            member_chips.push_str(&format!(
+                r#"<span class="badge" style="margin:3px 4px 3px 0; padding:4px 8px; font-size:11px; background:var(--bg); border:1px solid var(--border);">{} <strong>{}</strong> <code>Node: {}</code> (:{} {})</span>"#,
+                icon, m_name, node_id, port, iface_icon
+            ));
+        }
+        if member_chips.is_empty() {
+            member_chips = r#"<span style="color:var(--muted); font-size:12px;">No active members currently advertising.</span>"#.to_string();
+        }
+
+        fabric_cards.push_str(&format!(
+            r#"<div class="card" style="margin-bottom:16px;">
+                <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px;">
+                    <div>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <span style="font-size:24px;">{}</span>
+                            <div>
+                                <h3 style="margin:0; font-size:17px;">{}</h3>
+                                <div style="font-size:11px; color:var(--muted); font-family:monospace; margin-top:2px;">
+                                    Compressed Fabric ID: <strong>{}</strong> &bull; <span class="badge" style="background:#dcfce7; color:#166534; font-weight:600;">{} Commissioned Nodes</span>
+                                </div>
+                            </div>
+                        </div>
+                        <p style="font-size:12px; color:var(--muted); margin-top:6px;">{}</p>
+                    </div>
+                    <button type="button" class="btn btn-sm" onclick="renameMatterFabric('{}', '{}', '{}')">✏️ Rename Fabric</button>
+                </div>
+                <div style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border);">
+                    <div style="font-size:11px; font-weight:600; text-transform:uppercase; color:var(--muted); margin-bottom:6px;">Member Devices &amp; Node Assignments</div>
+                    <div style="display:flex; flex-wrap:wrap;">{}</div>
+                </div>
+            </div>"#,
+            icon, name, fid, members.len(), desc, fid, name.replace('\'', "\\'"), icon.replace('\'', "\\'"), member_chips
+        ));
+    }
+
+    let mut matrix_header = String::new();
+    matrix_header.push_str("<th>Matter Device</th><th>Network</th>");
+    for fid in &fabric_keys {
+        let meta = fabric_metas.get(fid);
+        let name = meta.map(|m| m.name.as_str()).unwrap_or("Fabric");
+        let icon = meta.map(|m| m.icon.as_str()).unwrap_or("✨");
+        matrix_header.push_str(&format!("<th style=\"text-align:center;\">{} {}</th>", icon, name));
+    }
+    matrix_header.push_str("<th style=\"text-align:right;\">Quick Action</th>");
+
+    let mut matrix_rows = String::new();
+    for dev in &matter_devices {
+        let mut cols = String::new();
+        for fid in &fabric_keys {
+            if let Some(entry) = dev.fabrics.iter().find(|f| &f.fabric_id == fid) {
+                let iface_icon = if entry.interface == "thread" { "🧵 Thread" } else { "📶 Wi-Fi" };
+                cols.push_str(&format!(
+                    r#"<td style="text-align:center;"><span class="badge" style="background:#dcfce7; color:#166534; font-weight:600; padding:3px 7px;">✓ <code>0x{}</code></span><br><small style="color:var(--muted); font-size:10px;">:{} &bull; {}</small></td>"#,
+                    entry.node_id, entry.port, iface_icon
+                ));
+            } else {
+                cols.push_str(r#"<td style="text-align:center; color:var(--muted); opacity:0.35;">—</td>"#);
+            }
+        }
+
+        let web_btn = if let Some(ref url) = dev.web_url {
+            format!(r#"<a href="{url}" target="_blank" class="btn-sm btn-web" style="text-decoration:none;">🌐 Web UI</a>"#)
+        } else {
+            String::new()
+        };
+
+        let net_info = if dev.mac.is_empty() {
+            format!("<code>{}</code>", dev.ip)
+        } else {
+            format!("<code>{}</code><br><small style=\"color:var(--muted);\">{}</small>", dev.ip, dev.mac)
+        };
+
+        matrix_rows.push_str(&format!(
+            r#"<tr>
+                <td><strong>{}</strong><br><small style="color:var(--muted);">{}</small></td>
+                <td>{}</td>
+                {cols}
+                <td style="text-align:right;">{}</td>
+            </tr>"#,
+            dev.display_name, dev.vendor, net_info, web_btn
+        ));
+    }
+
+    let script = r#"
+    <script>
+    async function renameMatterFabric(fabricId, currentName, currentIcon) {
+        const newName = prompt(`Enter friendly label for Matter Fabric (${fabricId}):`, currentName);
+        if (!newName || !newName.trim()) return;
+        const newIcon = prompt(`Enter emoji/icon for ${newName}:`, currentIcon || '✨') || '✨';
+
+        try {
+            const res = await fetch('/api/matter/fabrics/' + encodeURIComponent(fabricId), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: newName.trim(), icon: newIcon.trim() })
+            });
+            if (res.ok) {
+                window.location.reload();
+            } else {
+                alert('Failed to update Matter fabric label.');
+            }
+        } catch (e) {
+            alert('Network error: ' + e);
+        }
+    }
+    </script>
+    "#;
+
+    let content = format!(
+        r#"
+        <div class="toolbar">
+            <div>
+                <h2>✨ Matter Fabrics &amp; Ecosystems</h2>
+                <p style="font-size:12px; color:var(--muted); margin-top:2px;">
+                    Multi-Admin operational fabrics, node credentials, and cross-ecosystem synchronization discovered via mDNS (<code>_matter._tcp</code>).
+                </p>
+            </div>
+            <form action="/scan" method="POST" style="margin:0;">
+                <button type="submit" class="btn btn-primary">
+                    <span>🔄</span> <span>Scan Matter Fabrics Now</span>
+                </button>
+            </form>
+        </div>
+
+        {}
+
+        <div style="margin-bottom:24px;">
+            <h3 style="font-size:15px; margin-bottom:12px;">Active Operational Fabrics ({})</h3>
+            {}
+        </div>
+
+        <div class="card" style="margin-bottom:24px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                <div>
+                    <h3 style="font-size:15px;">Multi-Admin Cross-Ecosystem Matrix</h3>
+                    <p style="font-size:12px; color:var(--muted); margin-top:2px;">
+                        Status of all Matter devices co-commissioned across Apple Home, Home Assistant, and vendor fabrics.
+                    </p>
+                </div>
+                <span class="badge" style="font-size:11px;">{} Matter Devices</span>
+            </div>
+            <div style="overflow-x:auto;">
+                <table>
+                    <thead><tr>{}</tr></thead>
+                    <tbody>{}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="card" style="background:var(--bg); border:1px dashed var(--border);">
+            <div style="font-size:13px; font-weight:700; color:var(--text); margin-bottom:4px;">🧵 Thread Mesh &amp; Border Router Intelligence</div>
+            <p style="font-size:12px; color:var(--muted);">
+                Matter-over-Thread devices on your network communicate across the Thread mesh network coordinated by your Apple TV / HomePod Thread Border Router. They advertise IPv6 link-local addresses without requiring standard IPv4 DHCP leases and are automatically correlated by HomeNode.
+            </p>
+        </div>
+        {}
+        "#,
+        summary_cards,
+        fabric_keys.len(),
+        fabric_cards,
+        matter_devices.len(),
+        matrix_header,
+        matrix_rows,
+        script
+    );
+
+    page_layout(title, "matter", &content)
 }
 
 fn render_catalog_page(

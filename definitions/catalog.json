@@ -189,6 +189,16 @@
       "oui_prefixes": ["24:0a:c4", "84:0d:8e", "44:17:93", "e0:98:06", "c8:2e:18", "88:57:21", "4c:a9:19"],
       "protocols": ["wifi", "ble", "matter", "thread", "zigbee"],
       "description": "Semiconductor manufacturer of the popular ESP32 and ESP8266 microcontrollers powering countless smart home devices."
+    },
+    {
+      "id": "homeassistant",
+      "name": "Home Assistant (Open Home Foundation)",
+      "website": "https://www.home-assistant.io",
+      "support_url": "https://www.home-assistant.io/help/",
+      "icon": "🏡",
+      "oui_prefixes": [],
+      "protocols": ["wifi", "lan", "matter", "thread", "zigbee", "zwave", "bluetooth", "mqtt", "http"],
+      "description": "Open source home automation platform focused on local control, privacy, and extensive multi-protocol device integration."
     }
   ],
   "products": [
@@ -536,6 +546,21 @@
       "documentation_url": "https://tasmota.github.io/docs/",
       "specs": "Open-source smart plug firmware for local control with HTTP web console, MQTT telemetries, and power meters.",
       "rhai_script_ref": "tasmota_plug.rhai"
+    },
+    {
+      "id": "home_assistant_os",
+      "vendor_id": "homeassistant",
+      "name": "Home Assistant OS / VM",
+      "model_number": "Virtual Machine / Container",
+      "category": "hub",
+      "category_icon": "🎛️",
+      "connectivity": ["lan", "wifi", "matter", "thread"],
+      "matter_device_type": "Matter Controller & Multi-Admin Hub",
+      "default_ports": [8123, 5580, 5683],
+      "hostname_patterns": ["homeassistant", "hassio"],
+      "documentation_url": "https://www.home-assistant.io/docs/",
+      "specs": "Dedicated open-source home automation hub running Home Assistant OS/Supervised with web frontend, Matter Server, and local integrations.",
+      "rhai_script_ref": "home_assistant.rhai"
     }
   ]
 }
