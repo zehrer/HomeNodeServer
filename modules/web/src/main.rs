@@ -16,7 +16,7 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use homenode_sdk::proto::{Empty, HealthState, ModuleRegistration, RuntimeSnapshot};
+use homenode_sdk::proto::{DeviceRecord, Empty, HealthState, ModuleRegistration, RuntimeSnapshot};
 use homenode_sdk::{connect_control_client, module_health, module_manifest, ModuleEnvironment};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,8 +50,10 @@ struct WebState {
     socket_path: PathBuf,
     status_title: String,
     docs_path: PathBuf,
+    links_path: PathBuf,
     definitions_dir: PathBuf,
     docs_store: Arc<RwLock<HashMap<String, DeviceDocumentation>>>,
+    links_store: Arc<RwLock<HashMap<String, Vec<String>>>>,
 }
 
 #[tokio::main]
@@ -87,10 +89,13 @@ async fn main() -> Result<()> {
     let data_dir = workspace_root.join("data");
     let _ = std::fs::create_dir_all(&data_dir);
     let docs_path = data_dir.join("device_documentation.json");
+    let links_path = data_dir.join("device_links.json");
     let definitions_dir = workspace_root.join("definitions").join("devices");
 
-    let initial_docs = load_documentation(&docs_path);
+    let initial_docs = load_json_map(&docs_path);
+    let initial_links = load_json_map(&links_path);
     let docs_store = Arc::new(RwLock::new(initial_docs));
+    let links_store = Arc::new(RwLock::new(initial_links));
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     client
@@ -111,38 +116,42 @@ async fn main() -> Result<()> {
             get(get_device_doc_handler).post(save_device_doc_handler),
         )
         .route("/api/devices/:id/analyze", post(analyze_device_handler))
+        .route("/api/devices/link", post(link_devices_handler))
+        .route("/api/devices/unlink", post(unlink_devices_handler))
         .route("/api/definitions/save", post(save_definition_handler))
         .with_state(WebState {
             socket_path: env.socket_path,
             status_title: config.status_title,
             docs_path,
+            links_path,
             definitions_dir,
             docs_store,
+            links_store,
         });
 
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-fn load_documentation(path: &Path) -> HashMap<String, DeviceDocumentation> {
+fn load_json_map<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> HashMap<String, T> {
     if !path.exists() {
         return HashMap::new();
     }
     match std::fs::read_to_string(path) {
         Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
         Err(err) => {
-            warn!("Failed to read device documentation from {}: {err}", path.display());
+            warn!("Failed to read JSON from {}: {err}", path.display());
             HashMap::new()
         }
     }
 }
 
-fn persist_documentation(path: &Path, docs: &HashMap<String, DeviceDocumentation>) -> Result<()> {
+fn persist_json<T: Serialize>(path: &Path, data: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_string_pretty(docs)?;
-    std::fs::write(path, data)?;
+    let content = serde_json::to_string_pretty(data)?;
+    std::fs::write(path, content)?;
     Ok(())
 }
 
@@ -178,8 +187,9 @@ async fn trigger_network_scan(socket_path: &Path) -> Result<()> {
 
 async fn devices_handler(State(state): State<WebState>) -> Html<String> {
     let docs = state.docs_store.read().await.clone();
+    let links = state.links_store.read().await.clone();
     let body = match load_snapshot(&state.socket_path).await {
-        Ok(snapshot) => render_devices_page(&state.status_title, &snapshot, &docs),
+        Ok(snapshot) => render_devices_page(&state.status_title, &snapshot, &docs, &links),
         Err(error) => render_error(&state.status_title, "devices", &error.to_string()),
     };
     Html(body)
@@ -200,7 +210,7 @@ async fn load_snapshot(socket_path: &Path) -> Result<RuntimeSnapshot> {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Documentation API handlers
+// Documentation & Link API Handlers
 // ------------------------------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -231,7 +241,7 @@ async fn save_device_doc_handler(
         updated_at: now,
     };
     store.insert(device_id, entry);
-    if let Err(err) = persist_documentation(&state.docs_path, &store) {
+    if let Err(err) = persist_json(&state.docs_path, &*store) {
         error!("Failed to persist device documentation: {err}");
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -240,6 +250,51 @@ async fn save_device_doc_handler(
             .into_response();
     }
     Json(serde_json::json!({"status": "saved"})).into_response()
+}
+
+#[derive(Deserialize)]
+struct LinkRequest {
+    primary_id: String,
+    linked_id: String,
+}
+
+async fn link_devices_handler(
+    State(state): State<WebState>,
+    Json(payload): Json<LinkRequest>,
+) -> Response {
+    let mut links = state.links_store.write().await;
+    let list = links.entry(payload.primary_id.clone()).or_default();
+    if !list.contains(&payload.linked_id) {
+        list.push(payload.linked_id);
+    }
+    if let Err(err) = persist_json(&state.links_path, &*links) {
+        error!("Failed to persist device links: {err}");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({"status": "linked"})).into_response()
+}
+
+async fn unlink_devices_handler(
+    State(state): State<WebState>,
+    Json(payload): Json<LinkRequest>,
+) -> Response {
+    let mut links = state.links_store.write().await;
+    if let Some(list) = links.get_mut(&payload.primary_id) {
+        list.retain(|id| id != &payload.linked_id);
+    }
+    if let Err(err) = persist_json(&state.links_path, &*links) {
+        error!("Failed to persist device links: {err}");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({"status": "unlinked"})).into_response()
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -313,7 +368,6 @@ async fn analyze_device_handler(
         }
     };
 
-    // Comprehensive port scan across standard IoT, web, management, and smart home services
     let probe_ports = [
         21, 22, 23, 53, 80, 81, 443, 554, 1883, 1900, 5000, 5001, 5060, 6053, 8080, 8081, 8443,
         8883, 9000,
@@ -338,7 +392,6 @@ async fn analyze_device_handler(
     }
     open_ports.sort_unstable();
 
-    // Inspect HTTP banners on open web ports
     let mut http_server = None;
     let mut http_title = None;
     for web_port in [80, 5000, 8080, 443] {
@@ -359,7 +412,6 @@ async fn analyze_device_handler(
     let hostname = device.metadata.get("hostname").cloned();
     let vendor = device.metadata.get("vendor").cloned();
 
-    // Suggest category and generate Rhai script
     let (suggested_cat, suggested_title, suggested_icon) = deduce_analyzer_category(
         &device.display_name,
         hostname.as_deref(),
@@ -657,7 +709,129 @@ async fn save_definition_handler(
 }
 
 // ------------------------------------------------------------------------------------------------
-// HTML Rendering
+// Dual-Homed Correlation & Unified Device Model
+// ------------------------------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct UnifiedDevice {
+    primary: DeviceRecord,
+    secondary_interfaces: Vec<DeviceRecord>,
+    merge_candidate: Option<DeviceRecord>,
+}
+
+fn detect_merge_candidate(
+    dev: &DeviceRecord,
+    all_devices: &[DeviceRecord],
+    links: &HashMap<String, Vec<String>>,
+) -> Option<DeviceRecord> {
+    let name = dev.display_name.to_lowercase();
+    let host = dev.metadata.get("hostname").cloned().unwrap_or_default().to_lowercase();
+    let ip = dev.metadata.get("ip").cloned().unwrap_or_default();
+    let mac = dev.metadata.get("mac").cloned().unwrap_or_default();
+
+    // Skip if already linked
+    if links.values().any(|v| v.contains(&dev.device_id) || (!mac.is_empty() && v.contains(&mac))) {
+        return None;
+    }
+    if let Some(secondaries) = links.get(&dev.device_id).or_else(|| links.get(&mac)) {
+        if !secondaries.is_empty() {
+            return None;
+        }
+    }
+
+    for other in all_devices {
+        if other.device_id == dev.device_id {
+            continue;
+        }
+        let other_name = other.display_name.to_lowercase();
+        let other_host = other.metadata.get("hostname").cloned().unwrap_or_default().to_lowercase();
+        let other_ip = other.metadata.get("ip").cloned().unwrap_or_default();
+
+        if other_ip == ip {
+            continue;
+        }
+
+        // Heuristic 1: MacBook Pro abbreviation match (e.g. macbookprom2 vs mbp-m2-2)
+        let is_mbp_match = (name.contains("macbook") || host.contains("macbook"))
+            && (other_name.contains("mbp") || other_host.contains("mbp"));
+
+        // Heuristic 2: Suffix match (e.g. host and host-2 or host-wlan)
+        let clean_name1 = name.replace("-2", "").replace(".fritz.box", "");
+        let clean_name2 = other_name.replace("-2", "").replace(".fritz.box", "");
+        let is_suffix_match = clean_name1 == clean_name2 && (name.contains("-2") || other_name.contains("-2"));
+
+        if is_mbp_match || is_suffix_match {
+            return Some(other.clone());
+        }
+    }
+
+    None
+}
+
+fn build_unified_devices(
+    devices: &[DeviceRecord],
+    links: &HashMap<String, Vec<String>>,
+) -> Vec<UnifiedDevice> {
+    let mut dev_map: HashMap<String, DeviceRecord> = HashMap::new();
+    let mut mac_map: HashMap<String, String> = HashMap::new();
+
+    for d in devices {
+        dev_map.insert(d.device_id.clone(), d.clone());
+        if let Some(mac) = d.metadata.get("mac") {
+            mac_map.insert(mac.clone(), d.device_id.clone());
+        }
+    }
+
+    // Collect all IDs that are secondary
+    let mut secondary_ids = std::collections::HashSet::new();
+    for (_, sec_list) in links {
+        for sec in sec_list {
+            secondary_ids.insert(sec.clone());
+            if let Some(mapped) = mac_map.get(sec) {
+                secondary_ids.insert(mapped.clone());
+            }
+        }
+    }
+
+    let mut unified = Vec::new();
+    for d in devices {
+        if secondary_ids.contains(&d.device_id) {
+            continue;
+        }
+        let mac = d.metadata.get("mac").cloned().unwrap_or_default();
+        if !mac.is_empty() && secondary_ids.contains(&mac) {
+            continue;
+        }
+
+        let mut secondaries = Vec::new();
+        let configured_secs = links.get(&d.device_id).or_else(|| links.get(&mac));
+        if let Some(list) = configured_secs {
+            for sec_id in list {
+                let actual_id = mac_map.get(sec_id).unwrap_or(sec_id);
+                if let Some(sec_dev) = dev_map.get(actual_id) {
+                    secondaries.push(sec_dev.clone());
+                }
+            }
+        }
+
+        let candidate = if secondaries.is_empty() {
+            detect_merge_candidate(d, devices, links)
+        } else {
+            None
+        };
+
+        unified.push(UnifiedDevice {
+            primary: d.clone(),
+            secondary_interfaces: secondaries,
+            merge_candidate: candidate,
+        });
+    }
+
+    unified
+}
+
+// ------------------------------------------------------------------------------------------------
+// HTML Rendering: Master-Detail Layout
 // ------------------------------------------------------------------------------------------------
 
 fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
@@ -678,6 +852,7 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
             --text: #0f172a;
             --muted: #64748b;
             --primary: #2563eb;
+            --primary-bg: #eff6ff;
             --badge-bg: #f1f5f9;
             --badge-text: #334155;
             --status-green: #10b981;
@@ -693,6 +868,7 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
                 --text: #f8fafc;
                 --muted: #94a3b8;
                 --primary: #3b82f6;
+                --primary-bg: #1e3a8a33;
                 --badge-bg: #334155;
                 --badge-text: #e2e8f0;
                 --code-bg: #0b132b;
@@ -704,17 +880,17 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
             background: var(--bg);
             color: var(--text);
             line-height: 1.5;
-            padding: 24px;
+            padding: 20px 24px;
         }}
-        .container {{ max-width: 1040px; margin: 0 auto; }}
+        .container {{ max-width: 1440px; margin: 0 auto; }}
         header {{
             display: flex;
             align-items: center;
             justify-content: space-between;
             flex-wrap: wrap;
             gap: 16px;
-            margin-bottom: 24px;
-            padding-bottom: 16px;
+            margin-bottom: 20px;
+            padding-bottom: 14px;
             border-bottom: 1px solid var(--border);
         }}
         h1 {{ font-size: 22px; font-weight: 700; }}
@@ -739,42 +915,95 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
             background: var(--surface);
             border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 20px;
-            margin-bottom: 20px;
+            padding: 16px 20px;
+            margin-bottom: 16px;
         }}
-        h2 {{ font-size: 16px; font-weight: 600; margin-bottom: 16px; }}
+        h2 {{ font-size: 16px; font-weight: 600; margin-bottom: 14px; }}
+        h3 {{ font-size: 15px; font-weight: 600; }}
+        
+        /* Master-Detail Split Layout */
+        .workspace-grid {{
+            display: grid;
+            grid-template-columns: 420px 1fr;
+            gap: 20px;
+            align-items: start;
+        }}
+        @media (max-width: 980px) {{
+            .workspace-grid {{ grid-template-columns: 1fr; }}
+        }}
+        
+        .inspector-panel {{
+            position: sticky;
+            top: 20px;
+            max-height: calc(100vh - 40px);
+            overflow-y: auto;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+        }}
+        
+        .inspector-empty {{
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--muted);
+        }}
+        
+        .device-item {{
+            cursor: pointer;
+            transition: all 0.15s ease;
+            border-left: 3px solid transparent;
+        }}
+        .device-item:hover {{
+            background-color: var(--badge-bg);
+        }}
+        .device-item.active-device {{
+            background-color: var(--primary-bg);
+            border-left: 3px solid var(--primary);
+        }}
+        
         table {{
             width: 100%;
             border-collapse: collapse;
-            font-size: 14px;
+            font-size: 13px;
             text-align: left;
         }}
         th, td {{
-            padding: 10px 12px;
+            padding: 8px 10px;
             border-bottom: 1px solid var(--border);
             vertical-align: middle;
         }}
         th {{
-            font-size: 12px;
+            font-size: 11px;
             font-weight: 600;
             color: var(--muted);
             text-transform: uppercase;
         }}
         tr:last-child td {{ border-bottom: none; }}
+        
         .badge {{
             display: inline-block;
-            padding: 2px 8px;
-            font-size: 12px;
+            padding: 2px 7px;
+            font-size: 11px;
             border-radius: 9999px;
             background: var(--badge-bg);
             color: var(--badge-text);
+            white-space: nowrap;
         }}
         .badge-kind {{
             background: #e0e7ff;
             color: #3730a3;
         }}
+        .badge-dual {{
+            background: #e0f2fe;
+            color: #0369a1;
+            font-weight: 600;
+            border: 1px solid #bae6fd;
+        }}
         @media (prefers-color-scheme: dark) {{
             .badge-kind {{ background: #312e81; color: #c7d2fe; }}
+            .badge-dual {{ background: #0c4a6e; color: #bae6fd; border-color: #0284c7; }}
         }}
         .status-dot {{
             display: inline-block;
@@ -786,106 +1015,80 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
         .status-ready {{ background-color: var(--status-green); }}
         .status-starting {{ background-color: var(--status-yellow); }}
         .status-error {{ background-color: var(--status-red); }}
-        .empty-state {{
-            text-align: center;
-            padding: 40px 16px;
-            color: var(--muted);
-        }}
+        
         .toolbar {{
             display: flex;
             align-items: center;
             justify-content: space-between;
             flex-wrap: wrap;
             gap: 12px;
-            margin-bottom: 16px;
+            margin-bottom: 14px;
         }}
         .btn {{
             display: inline-flex;
             align-items: center;
             gap: 6px;
-            padding: 8px 16px;
-            font-size: 14px;
+            padding: 6px 14px;
+            font-size: 13px;
             font-weight: 500;
             border-radius: 6px;
             border: 1px solid transparent;
             cursor: pointer;
             text-decoration: none;
-            transition: background-color 0.15s ease, opacity 0.15s ease;
+            transition: all 0.15s ease;
         }}
         .btn-primary {{
             background: var(--primary);
             color: #ffffff;
         }}
-        .btn-primary:hover {{
-            filter: brightness(1.1);
-        }}
+        .btn-primary:hover {{ filter: brightness(1.1); }}
         .btn-sm {{
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-            padding: 4px 8px;
-            font-size: 12px;
-            font-weight: 500;
+            padding: 3px 8px;
+            font-size: 11px;
             border-radius: 4px;
             border: 1px solid var(--border);
             background: var(--surface);
             color: var(--text);
             cursor: pointer;
             text-decoration: none;
-            transition: all 0.15s ease;
-            white-space: nowrap;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
         }}
-        .btn-sm:hover {{
-            border-color: var(--primary);
-            color: var(--primary);
-        }}
+        .btn-sm:hover {{ border-color: var(--primary); color: var(--primary); }}
         .btn-web {{
             background: #dbeafe;
             color: #1d4ed8;
             border-color: #bfdbfe;
         }}
-        .btn-web:hover {{
-            background: #bfdbfe;
-            color: #1e40af;
-        }}
+        .btn-web:hover {{ background: #bfdbfe; color: #1e40af; }}
         @media (prefers-color-scheme: dark) {{
-            .btn-web {{
-                background: #1e3a8a;
-                color: #bfdbfe;
-                border-color: #1e40af;
-            }}
+            .btn-web {{ background: #1e3a8a; color: #bfdbfe; border-color: #1e40af; }}
         }}
-        .btn-doc-active {{
-            border-color: var(--status-green);
-            color: var(--status-green);
-            font-weight: 600;
-        }}
+        
         .search-input {{
-            padding: 8px 14px;
-            font-size: 14px;
+            padding: 6px 12px;
+            font-size: 13px;
             border-radius: 6px;
             border: 1px solid var(--border);
             background: var(--surface);
             color: var(--text);
-            width: 260px;
-            max-width: 100%;
+            width: 240px;
         }}
-        .search-input:focus {{
-            outline: none;
-            border-color: var(--primary);
-        }}
+        .search-input:focus {{ outline: none; border-color: var(--primary); }}
+        
         .pills {{
             display: flex;
             flex-wrap: wrap;
-            gap: 6px;
-            margin-bottom: 20px;
+            gap: 5px;
+            margin-bottom: 16px;
         }}
         .pill {{
             display: inline-flex;
             align-items: center;
-            gap: 6px;
-            padding: 6px 12px;
-            font-size: 13px;
+            gap: 5px;
+            padding: 4px 10px;
+            font-size: 12px;
             border-radius: 9999px;
             border: 1px solid var(--border);
             background: var(--surface);
@@ -893,108 +1096,84 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
             cursor: pointer;
             transition: all 0.15s ease;
         }}
-        .pill:hover {{
-            border-color: var(--primary);
-            color: var(--text);
-        }}
+        .pill:hover {{ border-color: var(--primary); color: var(--text); }}
         .pill.active {{
             background: var(--primary);
             border-color: var(--primary);
             color: #ffffff;
             font-weight: 500;
         }}
+        
         .group-header {{
             display: flex;
             align-items: center;
             justify-content: space-between;
-            margin-bottom: 12px;
+            margin-bottom: 8px;
         }}
         .group-header h3 {{
-            font-size: 15px;
-            font-weight: 600;
+            font-size: 14px;
             display: flex;
             align-items: center;
-            gap: 8px;
-        }}
-        .action-cell {{
-            display: flex;
             gap: 6px;
-            align-items: center;
-            flex-wrap: wrap;
         }}
-        /* Modal Styles */
-        .modal-overlay {{
-            position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0,0,0,0.5);
-            display: none;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-            padding: 16px;
+        
+        /* Inspector Styles */
+        .inspector-sec {{
+            margin-top: 14px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border);
         }}
-        .modal-overlay.active {{ display: flex; }}
-        .modal {{
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            width: 600px;
-            max-width: 100%;
-            max-height: 90vh;
-            overflow-y: auto;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
-            padding: 24px;
-        }}
-        .modal-header {{
+        .inspector-title {{
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--muted);
+            text-transform: uppercase;
+            margin-bottom: 8px;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            margin-bottom: 16px;
-            border-bottom: 1px solid var(--border);
-            padding-bottom: 12px;
         }}
-        .modal-close {{
-            background: none;
-            border: none;
-            font-size: 20px;
-            cursor: pointer;
-            color: var(--muted);
-        }}
-        .form-group {{
-            margin-bottom: 14px;
-        }}
-        .form-group label {{
-            display: block;
-            font-size: 13px;
-            font-weight: 600;
-            color: var(--muted);
+        .iface-card {{
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 10px;
             margin-bottom: 6px;
+            font-size: 12px;
+        }}
+        .merge-box {{
+            background: #fefce8;
+            border: 1px solid #fef08a;
+            color: #854d0e;
+            border-radius: 6px;
+            padding: 10px;
+            margin-top: 8px;
+            font-size: 12px;
+        }}
+        @media (prefers-color-scheme: dark) {{
+            .merge-box {{ background: #422006; border-color: #854d0e; color: #fef08a; }}
         }}
         .form-control {{
             width: 100%;
-            padding: 8px 12px;
+            padding: 6px 10px;
             border-radius: 6px;
             border: 1px solid var(--border);
             background: var(--bg);
             color: var(--text);
             font-family: inherit;
-            font-size: 14px;
+            font-size: 13px;
         }}
-        textarea.form-control {{
-            min-height: 120px;
-            resize: vertical;
-        }}
+        textarea.form-control {{ min-height: 80px; resize: vertical; }}
         .code-box {{
             background: var(--code-bg);
             border: 1px solid var(--border);
             border-radius: 6px;
-            padding: 12px;
+            padding: 10px;
             font-family: monospace;
-            font-size: 12px;
+            font-size: 11px;
             overflow-x: auto;
             white-space: pre;
-            margin-top: 10px;
-            max-height: 260px;
+            max-height: 220px;
         }}
     </style>
 </head>
@@ -1009,50 +1188,6 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
     </header>
     {content}
 </div>
-
-<!-- Documentation Modal -->
-<div id="docs-modal" class="modal-overlay">
-    <div class="modal">
-        <div class="modal-header">
-            <h3 id="docs-modal-title">Device Documentation</h3>
-            <button class="modal-close" onclick="closeModal('docs-modal')">&times;</button>
-        </div>
-        <form id="docs-form" onsubmit="saveDeviceDocs(event)">
-            <input type="hidden" id="docs-device-id" />
-            <div class="form-group">
-                <label for="docs-notes">Notes & Documentation (Markdown supported)</label>
-                <textarea id="docs-notes" class="form-control" placeholder="Installation location, credentials hint, firmware version, serial number..."></textarea>
-            </div>
-            <div class="form-group">
-                <label for="docs-manual-url">Manual or Web Documentation URL</label>
-                <input type="url" id="docs-manual-url" class="form-control" placeholder="https://..." />
-            </div>
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-top:16px;">
-                <span id="docs-status" style="font-size:13px; color:var(--status-green);"></span>
-                <div style="display:flex; gap:8px;">
-                    <button type="button" class="btn btn-sm" onclick="closeModal('docs-modal')">Cancel</button>
-                    <button type="submit" class="btn btn-primary">Save Notes</button>
-                </div>
-            </div>
-        </form>
-    </div>
-</div>
-
-<!-- Device Analyzer Modal -->
-<div id="analyze-modal" class="modal-overlay">
-    <div class="modal">
-        <div class="modal-header">
-            <h3 id="analyze-modal-title">Device Analyzer</h3>
-            <button class="modal-close" onclick="closeModal('analyze-modal')">&times;</button>
-        </div>
-        <div id="analyze-body">
-            <div style="text-align:center; padding:30px 0;">
-                <p>🔍 Probing ports, HTTP banners, and device fingerprints...</p>
-            </div>
-        </div>
-    </div>
-</div>
-
 </body>
 </html>"#
     )
@@ -1116,13 +1251,14 @@ struct DynamicCategory {
     key: String,
     title: String,
     icon: String,
-    devices: Vec<homenode_sdk::proto::DeviceRecord>,
+    devices: Vec<UnifiedDevice>,
 }
 
 fn render_devices_page(
     title: &str,
     snapshot: &RuntimeSnapshot,
     docs: &HashMap<String, DeviceDocumentation>,
+    links: &HashMap<String, Vec<String>>,
 ) -> String {
     if snapshot.devices.is_empty() {
         let content = r#"
@@ -1138,22 +1274,24 @@ fn render_devices_page(
         return page_layout(title, "devices", content);
     }
 
-    let mut category_map: HashMap<String, DynamicCategory> = HashMap::new();
+    let unified_devices = build_unified_devices(&snapshot.devices, links);
 
-    for device in &snapshot.devices {
-        let cat_key = device
+    let mut category_map: HashMap<String, DynamicCategory> = HashMap::new();
+    for udev in &unified_devices {
+        let dev = &udev.primary;
+        let cat_key = dev
             .metadata
             .get("category")
             .cloned()
-            .unwrap_or_else(|| device.kind.clone());
+            .unwrap_or_else(|| dev.kind.clone());
 
         let (fallback_title, fallback_icon) = default_category_presentation(&cat_key);
-        let title = device
+        let title = dev
             .metadata
             .get("category_title")
             .cloned()
             .unwrap_or_else(|| fallback_title.to_string());
-        let icon = device
+        let icon = dev
             .metadata
             .get("category_icon")
             .cloned()
@@ -1168,7 +1306,7 @@ fn render_devices_page(
                 devices: Vec::new(),
             });
 
-        entry.devices.push(device.clone());
+        entry.devices.push(udev.clone());
     }
 
     let mut categories: Vec<_> = category_map.into_values().collect();
@@ -1177,7 +1315,7 @@ fn render_devices_page(
     // Filter pills
     let mut pills_html = format!(
         r#"<button type="button" class="pill active" onclick="selectCategory('all', this)">All ({})</button>"#,
-        snapshot.devices.len()
+        unified_devices.len()
     );
 
     for cat in &categories {
@@ -1187,78 +1325,124 @@ fn render_devices_page(
         ));
     }
 
-    // Group cards
+    // Devices JSON payload for live client-side Inspector
+    let client_devices: Vec<serde_json::Value> = unified_devices
+        .iter()
+        .map(|udev| {
+            let p = &udev.primary;
+            let ip = p.metadata.get("ip").cloned().unwrap_or_default();
+            let mac = p.metadata.get("mac").cloned().unwrap_or_default();
+            let vendor = p.metadata.get("vendor").cloned().unwrap_or_default();
+            let hostname = p.metadata.get("hostname").cloned().unwrap_or_default();
+            let web_url = p.metadata.get("web_url").cloned();
+            let category = p.metadata.get("category").cloned().unwrap_or_else(|| p.kind.clone());
+            let (fallback_title, fallback_icon) = default_category_presentation(&category);
+            let category_title = p.metadata.get("category_title").cloned().unwrap_or_else(|| fallback_title.to_string());
+            let category_icon = p.metadata.get("category_icon").cloned().unwrap_or_else(|| fallback_icon.to_string());
+
+            let doc_key = if !mac.is_empty() { mac.clone() } else { p.device_id.clone() };
+            let doc = docs.get(&doc_key).cloned().unwrap_or_default();
+
+            let secondaries_json: Vec<serde_json::Value> = udev.secondary_interfaces.iter().map(|s| {
+                serde_json::json!({
+                    "device_id": s.device_id,
+                    "name": s.display_name,
+                    "ip": s.metadata.get("ip").cloned().unwrap_or_default(),
+                    "mac": s.metadata.get("mac").cloned().unwrap_or_default(),
+                    "vendor": s.metadata.get("vendor").cloned().unwrap_or_default(),
+                    "hostname": s.metadata.get("hostname").cloned().unwrap_or_default(),
+                })
+            }).collect();
+
+            let candidate_json = udev.merge_candidate.as_ref().map(|c| {
+                serde_json::json!({
+                    "device_id": c.device_id,
+                    "name": c.display_name,
+                    "ip": c.metadata.get("ip").cloned().unwrap_or_default(),
+                    "mac": c.metadata.get("mac").cloned().unwrap_or_default(),
+                    "hostname": c.metadata.get("hostname").cloned().unwrap_or_default(),
+                })
+            });
+
+            serde_json::json!({
+                "device_id": p.device_id,
+                "display_name": p.display_name,
+                "category": category,
+                "category_title": category_title,
+                "category_icon": category_icon,
+                "ip": ip,
+                "mac": mac,
+                "vendor": vendor,
+                "hostname": hostname,
+                "web_url": web_url,
+                "doc_key": doc_key,
+                "notes": doc.notes,
+                "manual_url": doc.manual_url.unwrap_or_default(),
+                "updated_at": doc.updated_at,
+                "secondaries": secondaries_json,
+                "candidate": candidate_json,
+            })
+        })
+        .collect();
+
+    let client_devices_json = serde_json::to_string(&client_devices).unwrap_or_else(|_| "[]".to_string());
+
+    // Right side device list groups
     let mut group_cards_html = String::new();
     for cat in &categories {
         let rows = cat
             .devices
             .iter()
-            .map(|device| {
-                let ip = device
-                    .metadata
-                    .get("ip")
-                    .cloned()
-                    .unwrap_or_else(|| "-".to_string());
+            .map(|udev| {
+                let device = &udev.primary;
+                let ip = device.metadata.get("ip").cloned().unwrap_or_else(|| "-".to_string());
                 let mac = device.metadata.get("mac").cloned().unwrap_or_default();
                 let vendor = device.metadata.get("vendor").cloned().unwrap_or_default();
                 let web_url = device.metadata.get("web_url").cloned();
 
-                let doc_key = if !mac.is_empty() {
-                    mac.clone()
-                } else {
-                    device.device_id.clone()
-                };
+                let doc_key = if !mac.is_empty() { mac.clone() } else { device.device_id.clone() };
                 let has_docs = docs.get(&doc_key).is_some_and(|d| !d.notes.trim().is_empty());
 
-                let caps = device
-                    .capabilities
-                    .iter()
-                    .map(|c| format!("<span class=\"badge\">{c}</span>"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-
-                let network_info = if mac.is_empty() {
-                    format!("<code>{ip}</code>")
-                } else if vendor.is_empty() {
-                    format!("<code>{ip}</code><br><small style=\"color:var(--muted)\">{mac}</small>")
-                } else {
-                    format!("<code>{ip}</code><br><small style=\"color:var(--muted)\">{mac} &bull; {vendor}</small>")
-                };
-
-                let escaped_name = device.display_name.replace('\'', "\\'");
-                let mut actions_html = String::new();
-
-                if let Some(url) = web_url {
-                    actions_html.push_str(&format!(
-                        r#"<a href="{url}" target="_blank" class="btn-sm btn-web" title="Open Web Interface">🌐 Web UI</a> "#
+                let mut iface_badges = String::new();
+                if !udev.secondary_interfaces.is_empty() {
+                    iface_badges.push_str(&format!(
+                        r#" <span class="badge badge-dual" title="Multi-interface device ({} interfaces)">LAN + WLAN ({})</span>"#,
+                        udev.secondary_interfaces.len() + 1,
+                        udev.secondary_interfaces.len() + 1
                     ));
                 }
 
-                let doc_btn_class = if has_docs {
-                    "btn-sm btn-doc-active"
+                let network_info = if mac.is_empty() {
+                    format!("<code>{ip}</code>{iface_badges}")
+                } else if vendor.is_empty() {
+                    format!("<code>{ip}</code>{iface_badges}<br><small style=\"color:var(--muted)\">{mac}</small>")
                 } else {
-                    "btn-sm"
+                    format!("<code>{ip}</code>{iface_badges}<br><small style=\"color:var(--muted)\">{mac} &bull; {vendor}</small>")
                 };
-                let doc_label = if has_docs { "📝 Docs ✓" } else { "📝 Docs" };
 
-                actions_html.push_str(&format!(
-                    r#"<button type="button" class="{doc_btn_class}" onclick="openDocsModal('{doc_key}', '{escaped_name}')">{doc_label}</button> "#
-                ));
+                let web_button = if let Some(url) = web_url {
+                    format!(r#"<a href="{url}" target="_blank" class="btn-sm btn-web" onclick="event.stopPropagation()" title="Open Web Interface">🌐 Web UI</a>"#)
+                } else {
+                    String::new()
+                };
 
-                actions_html.push_str(&format!(
-                    r#"<button type="button" class="btn-sm" onclick="analyzeDevice('{}', '{}')">🔍 Analyze</button>"#,
-                    device.device_id, escaped_name
-                ));
+                let doc_icon = if has_docs { r#" <span style="color:var(--status-green); font-size:11px;" title="Documentation saved">📝✓</span>"# } else { "" };
 
                 format!(
-                    "<tr><td><strong>{}</strong><br><small style=\"color:var(--muted)\">{} &bull; {}</small></td><td><span class=\"badge badge-kind\">{}</span></td><td>{}</td><td>{}</td><td><div class=\"action-cell\">{}</div></td></tr>",
+                    r#"<tr class="device-item" data-id="{}" onclick="selectDevice('{}')">
+                        <td><strong>{}</strong>{doc_icon}<br><small style="color:var(--muted)">{} &bull; {}</small></td>
+                        <td><span class="badge badge-kind">{}</span></td>
+                        <td>{}</td>
+                        <td style="text-align:right;">{}</td>
+                    </tr>"#,
+                    device.device_id,
+                    device.device_id,
                     device.display_name,
                     device.device_id,
                     device.module_id,
                     device.kind,
                     network_info,
-                    if caps.is_empty() { String::from("-") } else { caps },
-                    actions_html,
+                    web_button,
                 )
             })
             .collect::<Vec<_>>()
@@ -1276,8 +1460,7 @@ fn render_devices_page(
                                 <th>Device</th>
                                 <th>Category</th>
                                 <th>Network (IP / MAC)</th>
-                                <th>Capabilities</th>
-                                <th>Actions</th>
+                                <th style="text-align:right;">Quick Action</th>
                             </tr>
                         </thead>
                         <tbody>{}</tbody>
@@ -1292,218 +1475,332 @@ fn render_devices_page(
         ));
     }
 
-    let script = r#"
+    let script = format!(
+        r#"
     <script>
+    const allDevices = {};
     let currentCategory = 'all';
+    let selectedDeviceId = null;
 
-    function selectCategory(cat, el) {
+    function selectCategory(cat, el) {{
         currentCategory = cat;
         document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
         el.classList.add('active');
         filterDevices();
-    }
+    }}
 
-    function filterDevices() {
+    function filterDevices() {{
         const q = (document.getElementById('device-search').value || '').toLowerCase();
         const groups = document.querySelectorAll('.device-group');
 
-        groups.forEach(group => {
+        groups.forEach(group => {{
             const cat = group.getAttribute('data-category');
             const matchesCat = (currentCategory === 'all' || currentCategory === cat);
 
             let visibleRows = 0;
             const rows = group.querySelectorAll('tbody tr');
-            rows.forEach(row => {
+            rows.forEach(row => {{
                 const text = row.innerText.toLowerCase();
                 const matchesSearch = !q || text.includes(q);
-                if (matchesSearch) {
+                if (matchesSearch) {{
                     row.style.display = '';
                     visibleRows++;
-                } else {
+                }} else {{
                     row.style.display = 'none';
-                }
-            });
+                }}
+            }});
 
-            if (matchesCat && visibleRows > 0) {
+            if (matchesCat && visibleRows > 0) {{
                 group.style.display = '';
-            } else {
+            }} else {{
                 group.style.display = 'none';
-            }
-        });
-    }
+            }}
+        }});
+    }}
 
-    const scanForm = document.getElementById('scan-form');
-    if (scanForm) {
-        scanForm.onsubmit = function() {
-            const btn = document.getElementById('scan-btn');
-            const label = document.getElementById('scan-label');
-            if (btn && label) {
-                btn.disabled = true;
-                label.innerText = 'Scanning Network...';
-                btn.style.opacity = '0.7';
-            }
-        };
-    }
+    function selectDevice(deviceId) {{
+        selectedDeviceId = deviceId;
+        window.location.hash = deviceId;
 
-    function openModal(id) {
-        document.getElementById(id).classList.add('active');
-    }
+        document.querySelectorAll('.device-item').forEach(el => {{
+            if (el.getAttribute('data-id') === deviceId) {{
+                el.classList.add('active-device');
+            }} else {{
+                el.classList.remove('active-device');
+            }}
+        }});
 
-    function closeModal(id) {
-        document.getElementById(id).classList.remove('active');
-    }
+        const dev = allDevices.find(d => d.device_id === deviceId);
+        if (!dev) return;
 
-    async function openDocsModal(deviceId, deviceName) {
-        document.getElementById('docs-modal-title').innerText = 'Documentation: ' + deviceName;
-        document.getElementById('docs-device-id').value = deviceId;
-        document.getElementById('docs-notes').value = '';
-        document.getElementById('docs-manual-url').value = '';
-        document.getElementById('docs-status').innerText = 'Loading...';
-        openModal('docs-modal');
+        renderInspector(dev);
+    }}
 
-        try {
-            const res = await fetch('/api/devices/' + encodeURIComponent(deviceId) + '/documentation');
-            if (res.ok) {
-                const data = await res.json();
-                document.getElementById('docs-notes').value = data.notes || '';
-                document.getElementById('docs-manual-url').value = data.manual_url || '';
-                document.getElementById('docs-status').innerText = data.updated_at ? 'Last updated: ' + new Date(data.updated_at).toLocaleString() : '';
-            } else {
-                document.getElementById('docs-status').innerText = '';
-            }
-        } catch (e) {
-            document.getElementById('docs-status').innerText = '';
-        }
-    }
+    function renderInspector(dev) {{
+        const panel = document.getElementById('inspector-content');
 
-    async function saveDeviceDocs(event) {
-        event.preventDefault();
-        const deviceId = document.getElementById('docs-device-id').value;
-        const notes = document.getElementById('docs-notes').value;
-        const manualUrl = document.getElementById('docs-manual-url').value;
-        const statusEl = document.getElementById('docs-status');
+        let webBtn = '';
+        if (dev.web_url) {{
+            webBtn = `<div style="margin-top:10px;"><a href="${{dev.web_url}}" target="_blank" class="btn btn-primary btn-sm" style="font-size:12px; width:100%; justify-content:center;">🌐 Open Web Interface</a></div>`;
+        }}
+
+        // Secondary / Linked Interfaces
+        let ifacesHtml = `
+            <div class="iface-card">
+                <strong>Primary Interface (LAN/Main)</strong><br>
+                <code>${{dev.ip}}</code> ${{dev.mac ? '&bull; <small>' + dev.mac + '</small>' : ''}}<br>
+                <small style="color:var(--muted)">${{dev.vendor || 'Unknown Vendor'}} ${{dev.hostname ? '&bull; ' + dev.hostname : ''}}</small>
+            </div>
+        `;
+
+        if (dev.secondaries && dev.secondaries.length > 0) {{
+            dev.secondaries.forEach(sec => {{
+                ifacesHtml += `
+                    <div class="iface-card">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <strong>Linked Interface (WLAN/Secondary)</strong>
+                            <button class="btn-sm" style="color:var(--status-red); border:none; padding:2px;" onclick="unlinkInterface('${{dev.device_id}}', '${{sec.device_id}}')">Unlink</button>
+                        </div>
+                        <code>${{sec.ip}}</code> ${{sec.mac ? '&bull; <small>' + sec.mac + '</small>' : ''}}<br>
+                        <small style="color:var(--muted)">${{sec.vendor || 'Unknown Vendor'}} ${{sec.hostname ? '&bull; ' + sec.hostname : ''}}</small>
+                    </div>
+                `;
+            }});
+        }}
+
+        // Candidate merge box
+        let candidateBox = '';
+        if (dev.candidate) {{
+            candidateBox = `
+                <div class="merge-box">
+                    <strong>💡 Dual-Homed Candidate:</strong><br>
+                    <span>${{dev.candidate.name}} (<code>${{dev.candidate.ip}}</code>)</span><br>
+                    <button class="btn btn-sm btn-primary" style="margin-top:6px;" onclick="linkInterface('${{dev.device_id}}', '${{dev.candidate.device_id}}')">
+                        🔗 Merge Interfaces (LAN + WLAN)
+                    </button>
+                </div>
+            `;
+        }}
+
+        panel.innerHTML = `
+            <div>
+                <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+                    <span style="font-size:24px;">${{dev.category_icon}}</span>
+                    <div>
+                        <h3 style="font-size:16px;">${{dev.display_name}}</h3>
+                        <span class="badge badge-kind">${{dev.category_title}}</span>
+                    </div>
+                </div>
+                ${{webBtn}}
+            </div>
+
+            <!-- Network Interfaces -->
+            <div class="inspector-sec">
+                <div class="inspector-title">
+                    <span>Network Interfaces (${{(dev.secondaries ? dev.secondaries.length : 0) + 1}})</span>
+                </div>
+                ${{ifacesHtml}}
+                ${{candidateBox}}
+            </div>
+
+            <!-- Documentation & Notes -->
+            <div class="inspector-sec">
+                <div class="inspector-title">
+                    <span>Documentation & Notes</span>
+                    <span id="doc-status" style="color:var(--status-green); font-size:11px;"></span>
+                </div>
+                <div style="margin-bottom:8px;">
+                    <label style="font-size:11px; color:var(--muted); font-weight:600;">Manual / Documentation URL</label>
+                    <input type="url" id="insp-manual-url" class="form-control" value="${{escapeAttr(dev.manual_url)}}" placeholder="https://..." />
+                </div>
+                <div style="margin-bottom:8px;">
+                    <label style="font-size:11px; color:var(--muted); font-weight:600;">Device Notes (Markdown)</label>
+                    <textarea id="insp-notes" class="form-control" placeholder="Installation location, credentials hint, firmware version...">${{escapeHtml(dev.notes)}}</textarea>
+                </div>
+                <button type="button" class="btn btn-sm btn-primary" onclick="saveInspectorNotes('${{dev.doc_key}}')">💾 Save Notes</button>
+            </div>
+
+            <!-- Analyzer & Port Scan -->
+            <div class="inspector-sec">
+                <div class="inspector-title">
+                    <span>Device Analyzer & Port Scan</span>
+                </div>
+                <button type="button" class="btn btn-sm" id="btn-run-analyzer" onclick="runInspectorAnalyzer('${{dev.device_id}}', '${{escapeAttr(dev.display_name)}}')">
+                    🔍 Scan 19 Ports & Analyze
+                </button>
+                <div id="inspector-analysis-results" style="margin-top:10px;"></div>
+            </div>
+        `;
+    }}
+
+    function escapeHtml(text) {{
+        return (text || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }}
+
+    function escapeAttr(text) {{
+        return (text || '').replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }}
+
+    async function saveInspectorNotes(docKey) {{
+        const notes = document.getElementById('insp-notes').value;
+        const manualUrl = document.getElementById('insp-manual-url').value;
+        const statusEl = document.getElementById('doc-status');
 
         statusEl.innerText = 'Saving...';
-        try {
-            const res = await fetch('/api/devices/' + encodeURIComponent(deviceId) + '/documentation', {
+        try {{
+            const res = await fetch('/api/devices/' + encodeURIComponent(docKey) + '/documentation', {{
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ notes: notes, manual_url: manualUrl })
-            });
-            if (res.ok) {
-                statusEl.innerText = 'Saved successfully! Reload page to update badge.';
-                setTimeout(() => closeModal('docs-modal'), 1200);
-            } else {
-                statusEl.innerText = 'Error saving documentation';
-            }
-        } catch (e) {
-            statusEl.innerText = 'Network error while saving';
-        }
-    }
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ notes: notes, manual_url: manualUrl }})
+            }});
+            if (res.ok) {{
+                statusEl.innerText = 'Saved!';
+                const dev = allDevices.find(d => d.doc_key === docKey);
+                if (dev) {{
+                    dev.notes = notes;
+                    dev.manual_url = manualUrl;
+                }}
+                setTimeout(() => {{ statusEl.innerText = ''; }}, 2000);
+            }} else {{
+                statusEl.innerText = 'Error saving';
+            }}
+        }} catch (e) {{
+            statusEl.innerText = 'Network error';
+        }}
+    }}
 
-    async function analyzeDevice(deviceId, deviceName) {
-        document.getElementById('analyze-modal-title').innerText = 'Device Analyzer: ' + deviceName;
-        const bodyEl = document.getElementById('analyze-body');
-        bodyEl.innerHTML = '<div style="text-align:center; padding:30px 0;"><p>🔍 Probing open ports, service banners, and generating Rhai definition for <strong>' + deviceName + '</strong>...</p></div>';
-        openModal('analyze-modal');
+    async function linkInterface(primaryId, linkedId) {{
+        try {{
+            const res = await fetch('/api/devices/link', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ primary_id: primaryId, linked_id: linkedId }})
+            }});
+            if (res.ok) {{
+                window.location.reload();
+            }}
+        }} catch (e) {{
+            alert('Failed to link interfaces: ' + e);
+        }}
+    }}
 
-        try {
-            const res = await fetch('/api/devices/' + encodeURIComponent(deviceId) + '/analyze', { method: 'POST' });
-            if (!res.ok) {
-                const err = await res.json();
-                bodyEl.innerHTML = '<div class="card"><p style="color:var(--status-red)">Analysis failed: ' + (err.error || 'Server error') + '</p></div>';
+    async function unlinkInterface(primaryId, linkedId) {{
+        try {{
+            const res = await fetch('/api/devices/unlink', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ primary_id: primaryId, linked_id: linkedId }})
+            }});
+            if (res.ok) {{
+                window.location.reload();
+            }}
+        }} catch (e) {{
+            alert('Failed to unlink interfaces: ' + e);
+        }}
+    }}
+
+    async function runInspectorAnalyzer(deviceId, deviceName) {{
+        const btn = document.getElementById('btn-run-analyzer');
+        const resultsEl = document.getElementById('inspector-analysis-results');
+        btn.disabled = true;
+        resultsEl.innerHTML = '<div style="font-size:12px; color:var(--muted);"><span class="status-dot status-starting"></span>Probing 19 ports & service banners...</div>';
+
+        try {{
+            const res = await fetch('/api/devices/' + encodeURIComponent(deviceId) + '/analyze', {{ method: 'POST' }});
+            if (!res.ok) {{
+                resultsEl.innerHTML = '<div style="color:var(--status-red); font-size:12px;">Analysis failed.</div>';
+                btn.disabled = false;
                 return;
-            }
+            }}
             const data = await res.json();
 
             let portsHtml = '';
-            if (data.open_ports && data.open_ports.length > 0) {
-                portsHtml = data.open_ports.map(p => '<span class="badge" style="background:#dcfce7; color:#166534; font-weight:600; padding:4px 8px; margin:2px 4px 2px 0; display:inline-block;">✓ Port ' + p.port + ': ' + p.service + '</span>').join('');
-            } else {
-                portsHtml = '<span style="color:var(--muted); font-size:13px;">No open TCP ports detected across standard IoT management ports.</span>';
-            }
+            if (data.open_ports && data.open_ports.length > 0) {{
+                portsHtml = data.open_ports.map(p => '<span class="badge" style="background:#dcfce7; color:#166534; font-weight:600; padding:2px 6px; margin:2px 3px 2px 0; font-size:10px;">✓ Port ' + p.port + ': ' + p.service + '</span>').join('');
+            }} else {{
+                portsHtml = '<span style="color:var(--muted); font-size:11px;">No open ports found.</span>';
+            }}
 
             let httpInfo = '';
-            if (data.http_title || data.http_server) {
-                httpInfo = '<div style="margin-top:10px; padding-top:8px; border-top:1px dashed var(--border); font-size:13px;">' +
-                    (data.http_title ? '<strong>Page Title:</strong> ' + data.http_title + '<br>' : '') +
-                    (data.http_server ? '<strong>HTTP Server:</strong> ' + data.http_server + '<br>' : '') +
+            if (data.http_title || data.http_server) {{
+                httpInfo = '<div style="margin-top:6px; font-size:11px; color:var(--muted);">' +
+                    (data.http_title ? '<strong>Title:</strong> ' + data.http_title + '<br>' : '') +
+                    (data.http_server ? '<strong>Server:</strong> ' + data.http_server : '') +
                     '</div>';
-            }
+            }}
 
-            window._currentAnalyzedScript = {
+            window._currentAnalyzedScript = {{
                 filename: data.suggested_filename,
                 content: data.suggested_rhai_script
-            };
+            }};
 
-            bodyEl.innerHTML = `
-                <div style="margin-bottom:14px;">
-                    <strong>Host:</strong> <code>${data.ip}</code> ${data.hostname ? '(' + data.hostname + ')' : ''}<br>
-                    <strong>Hardware / Vendor:</strong> ${data.vendor || 'Unknown'} ${data.mac ? '<code>' + data.mac + '</code>' : ''}<br>
-                    <div style="background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:12px; margin:12px 0;">
-                        <div style="font-weight:600; font-size:13px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
-                            <span>🔌 Port Scan Results</span>
-                            <span class="badge" style="font-weight:normal;">${data.open_ports ? data.open_ports.length : 0} open of ${data.total_ports_scanned || 19} scanned</span>
-                        </div>
-                        <div>${portsHtml}</div>
-                        ${httpInfo}
+            resultsEl.innerHTML = `
+                <div style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:8px; font-size:12px;">
+                    <div style="font-weight:600; font-size:11px; margin-bottom:4px; display:flex; justify-content:space-between;">
+                        <span>🔌 Port Scan Results</span>
+                        <span class="badge" style="font-size:10px;">${{data.open_ports ? data.open_ports.length : 0}} / ${{data.total_ports_scanned || 19}} Open</span>
                     </div>
+                    <div>${{portsHtml}}</div>
+                    ${{httpInfo}}
+                </div>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px;">
+                    <span style="font-size:11px; font-weight:600;">Draft Script (${{data.suggested_filename}}):</span>
                     <div>
-                        <strong>Suggested Category:</strong> ${data.suggested_icon} ${data.suggested_title} (<code>${data.suggested_category}</code>)
+                        <button class="btn-sm" style="font-size:10px;" onclick="copyRhaiScript()">📋 Copy</button>
+                        <button class="btn-sm btn-web" style="font-size:10px;" onclick="saveAnalyzedDefinition()">💾 Save</button>
                     </div>
                 </div>
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-top:14px;">
-                    <strong>Draft Rhai Definition Script (${data.suggested_filename}):</strong>
-                    <div>
-                        <button class="btn-sm" onclick="copyRhaiScript()">📋 Copy</button>
-                        <button class="btn-sm btn-web" id="save-def-btn" onclick="saveAnalyzedDefinition()">💾 Save Definition</button>
-                    </div>
-                </div>
-                <pre class="code-box"><code id="rhai-code-preview">${escapeHtml(data.suggested_rhai_script)}</code></pre>
-                <div id="save-def-status" style="font-size:12px; margin-top:6px; color:var(--status-green);"></div>
+                <pre class="code-box" style="margin-top:4px;"><code id="rhai-code-preview">${{escapeHtml(data.suggested_rhai_script)}}</code></pre>
+                <div id="save-def-status" style="font-size:11px; margin-top:4px; color:var(--status-green);"></div>
             `;
-        } catch (e) {
-            bodyEl.innerHTML = '<div class="card"><p style="color:var(--status-red)">Network error while analyzing device.</p></div>';
-        }
-    }
+            btn.disabled = false;
+        }} catch (e) {{
+            resultsEl.innerHTML = '<div style="color:var(--status-red); font-size:12px;">Analysis error: ' + e + '</div>';
+            btn.disabled = false;
+        }}
+    }}
 
-    function escapeHtml(text) {
-        return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    }
-
-    function copyRhaiScript() {
-        if (window._currentAnalyzedScript) {
+    function copyRhaiScript() {{
+        if (window._currentAnalyzedScript) {{
             navigator.clipboard.writeText(window._currentAnalyzedScript.content);
             alert('Rhai script copied to clipboard!');
-        }
-    }
+        }}
+    }}
 
-    async function saveAnalyzedDefinition() {
+    async function saveAnalyzedDefinition() {{
         if (!window._currentAnalyzedScript) return;
-        const btn = document.getElementById('save-def-btn');
         const status = document.getElementById('save-def-status');
-        btn.disabled = true;
         status.innerText = 'Saving definition script...';
 
-        try {
-            const res = await fetch('/api/definitions/save', {
+        try {{
+            const res = await fetch('/api/definitions/save', {{
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {{ 'Content-Type': 'application/json' }},
                 body: JSON.stringify(window._currentAnalyzedScript)
-            });
-            if (res.ok) {
-                status.innerText = 'Definition saved to definitions/devices/' + window._currentAnalyzedScript.filename + '! Click "Scan Network Now" to apply.';
-            } else {
+            }});
+            if (res.ok) {{
+                status.innerText = 'Saved to definitions/devices/' + window._currentAnalyzedScript.filename + '! Click "Scan Network Now" to apply.';
+            }} else {{
                 status.innerText = 'Failed to save definition file.';
-                btn.disabled = false;
-            }
-        } catch (e) {
-            status.innerText = 'Error saving definition script.';
-            btn.disabled = false;
-        }
-    }
+            }}
+        }} catch (e) {{
+            status.innerText = 'Error saving script: ' + e;
+        }}
+    }}
+
+    // Initial load: select device from hash or first available device
+    window.addEventListener('DOMContentLoaded', () => {{
+        const hash = (window.location.hash || '').replace('#', '');
+        if (hash && allDevices.some(d => d.device_id === hash)) {{
+            selectDevice(hash);
+        }} else if (allDevices.length > 0) {{
+            selectDevice(allDevices[0].device_id);
+        }}
+    }});
     </script>
-    "#;
+    "#,
+        client_devices_json
+    );
 
     let content = format!(
         r#"
@@ -1519,9 +1816,27 @@ fn render_devices_page(
             </div>
         </div>
         <div class="pills">{}</div>
-        {}
+        
+        <div class="workspace-grid">
+            <!-- Left Inspector Panel -->
+            <div class="inspector-panel" id="inspector-panel">
+                <div id="inspector-content">
+                    <div class="inspector-empty">
+                        <span style="font-size:32px;">👈</span>
+                        <h4 style="margin-top:10px;">Select a Device</h4>
+                        <p style="font-size:12px; margin-top:6px;">Click on any device in the list to inspect its network interfaces, edit documentation, scan open ports, or link dual-homed connections.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Device List -->
+            <div id="device-list-container">
+                {}
+            </div>
+        </div>
+
         {}"#,
-        snapshot.devices.len(),
+        unified_devices.len(),
         pills_html,
         group_cards_html,
         script

@@ -47,6 +47,7 @@ impl RhaiDeviceEngine {
         engine.set_max_string_size(4_096);
         engine.set_max_array_size(256);
         engine.set_max_map_size(256);
+        engine.set_max_expr_depths(64, 64);
 
         Self {
             engine: Arc::new(engine),
@@ -74,7 +75,7 @@ impl RhaiDeviceEngine {
                         loaded += 1;
                     }
                     Err(err) => {
-                        warn!("Failed to load device script {}: {err}", file_path.display());
+                        warn!("Failed to load device script {}: {err:#}", file_path.display());
                     }
                 }
             }
@@ -263,5 +264,14 @@ mod tests {
         };
 
         assert!(engine.identify(&iphone_obs).is_none());
+    }
+
+    #[test]
+    fn loads_computer_rhai_script() {
+        let path = std::path::Path::new("../../definitions/devices/computer.rhai");
+        if path.exists() {
+            let mut engine = RhaiDeviceEngine::new();
+            engine.load_script_file(path).expect("failed to load computer.rhai");
+        }
     }
 }

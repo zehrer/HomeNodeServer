@@ -11,5 +11,22 @@ fn meta() {
 
 fn identify(obs) {
     let name = obs.name.to_lower();
-    name.contains("macbook") || name.contains("imac") || name.contains("macmini") || name.contains("desktop") || name.contains("laptop") || name.contains("pc")
+    let host = obs.hostname.to_lower();
+
+    if name.contains("macbook") || name.contains("imac") || name.contains("macmini") {
+        return true;
+    }
+    if name.contains("desktop") || name.contains("laptop") || name.contains("pc") {
+        return true;
+    }
+    if name.contains("mbp") || name.contains("mba") {
+        return true;
+    }
+    if host.contains("macbook") || host.contains("imac") || host.contains("macmini") {
+        return true;
+    }
+    if host.contains("mbp") || host.contains("mba") {
+        return true;
+    }
+    false
 }
