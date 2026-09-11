@@ -1,8 +1,12 @@
 # HomeNode Server
 
-HomeNode Server is the new modular runtime for HomeNode. The repository now
-focuses on a Rust supervisor that starts integration modules as separate
-processes and aggregates their status over a local gRPC control plane.
+**HomeNode Server** is the local home automation hub for the [HomeNode](https://github.com/zehrer/HomeNode) ecosystem. It manages smart devices across your home network independent of how they are connected or which protocol they speak, with built-in **Matter bridge** and **Matter controller** capabilities.
+
+- **Local & Cloud-Free**: Runs entirely on your own hardware inside your home network. Nothing leaves your home.
+- **Protocol Independent**: Bridges non-Matter devices (Zigbee, Shelly, MQTT, BLE, etc.) into the Matter fabric while also controlling Matter-native devices.
+- **Modular Runtime**: A robust Rust supervisor that manages device integration modules as isolated child processes over a fast local control plane.
+
+For the full architectural vision and ecosystem overview, visit the [HomeNode Server Wiki](https://github.com/zehrer/HomeNode/wiki/HomeNode-Server) and the [HomeNode Project Wiki](https://github.com/zehrer/HomeNode/wiki).
 
 ## Repository layout
 
