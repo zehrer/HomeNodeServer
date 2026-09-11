@@ -5,29 +5,25 @@ log_filter = "info"
 [modules.web]
 enabled = true
 module_id = "web"
-program = "cargo"
-args = ["run", "-p", "homenode-module-web", "--"]
+program = "homenode-module-web"
 config = "modules/web.example.toml"
 
 [modules.matter_controller]
 enabled = true
 module_id = "matter-controller"
-program = "cargo"
-args = ["run", "-p", "homenode-module-matter-controller", "--"]
+program = "homenode-module-matter-controller"
 config = "modules/matter-controller.example.toml"
 
 [modules.matter_bridge]
 enabled = true
 module_id = "matter-bridge"
-program = "cargo"
-args = ["run", "-p", "homenode-module-matter-bridge", "--"]
+program = "homenode-module-matter-bridge"
 config = "modules/matter-bridge.example.toml"
 
 [modules.network_discovery]
 enabled = true
 module_id = "network-discovery"
-program = "cargo"
-args = ["run", "-p", "homenode-module-network-discovery", "--"]
+program = "homenode-module-network-discovery"
 config = "modules/network-discovery.example.toml"
 
 [modules.shelly]
