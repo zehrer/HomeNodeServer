@@ -229,6 +229,16 @@
       "oui_prefixes": ["2c:dd:0c"],
       "protocols": ["lan", "tls"],
       "description": "German smart metering operator and hardware manufacturer of intelligent electricity meters and EDGY communication gateways."
+    },
+    {
+      "id": "wireguard",
+      "name": "WireGuard / FRITZ!Box VPN",
+      "website": "https://www.wireguard.com",
+      "support_url": "https://avm.de/service/vpn/",
+      "icon": "🛡️",
+      "oui_prefixes": [],
+      "protocols": ["vpn", "wireguard", "ipsec"],
+      "description": "Virtual Private Network tunnels connecting remote mobile devices, laptops, and off-site endpoints to the home network."
     }
   ],
   "products": [
@@ -696,6 +706,21 @@
       "documentation_url": "https://discovergy.com",
       "specs": "Dedicated smart meter communication gateway transmitting encrypted real-time electricity generation and consumption data.",
       "rhai_script_ref": "discovergy_meter.rhai"
+    },
+    {
+      "id": "wireguard_vpn_peer",
+      "vendor_id": "wireguard",
+      "name": "WireGuard VPN Virtual Peer",
+      "model_number": "VPN Remote Tunnel",
+      "category": "vpn",
+      "category_icon": "🛡️",
+      "connectivity": ["vpn"],
+      "matter_device_type": null,
+      "default_ports": [],
+      "hostname_patterns": ["iphonestephan", "wireguard", "vpn"],
+      "documentation_url": "https://avm.de/service/vpn/",
+      "specs": "Encrypted remote access tunnel endpoint configured on FRITZ!Box for secure off-site communication.",
+      "rhai_script_ref": "vpn_connection.rhai"
     }
   ]
 }

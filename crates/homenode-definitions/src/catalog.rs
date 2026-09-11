@@ -191,21 +191,44 @@ impl CatalogDatabase {
         }
 
         // 1. High confidence: hostname pattern matching
+        let mut best_match: Option<(&Product, usize, bool)> = None;
+
         for product in &self.products {
+            let vendor_matches = !vendor_lower.is_empty()
+                && (product.vendor_id.eq_ignore_ascii_case(&vendor_lower)
+                    || vendor_lower.contains(&product.vendor_id));
+
             for pattern in &product.hostname_patterns {
                 let pat = pattern.to_lowercase();
                 if pat.is_empty() {
                     continue;
                 }
-                // If pattern contains a dot (e.g. "fritz.box"), match only when raw_host is exactly that domain
-                if pat.contains('.') {
-                    if raw_host == pat || raw_host == format!("{pat}.") {
-                        return Some(product);
+                let is_match = if pat.contains('.') {
+                    raw_host == pat || raw_host == format!("{pat}.")
+                } else {
+                    host_clean.contains(&pat)
+                };
+
+                if is_match {
+                    let score = pat.len();
+                    match best_match {
+                        None => {
+                            best_match = Some((product, score, vendor_matches));
+                        }
+                        Some((_, prev_score, prev_vendor_match)) => {
+                            if (vendor_matches && !prev_vendor_match)
+                                || (vendor_matches == prev_vendor_match && score > prev_score)
+                            {
+                                best_match = Some((product, score, vendor_matches));
+                            }
+                        }
                     }
-                } else if host_clean.contains(&pat) {
-                    return Some(product);
                 }
             }
+        }
+
+        if let Some((prod, _, _)) = best_match {
+            return Some(prod);
         }
 
         // 2. Medium confidence: vendor match + port/service cues
@@ -348,6 +371,11 @@ mod tests {
             let disc_gateway = catalog.match_product("edgy0020071074.fritz.box", Some("Discovergy GmbH"), &[]);
             assert!(disc_gateway.is_some());
             assert_eq!(disc_gateway.unwrap().id, "discovergy_edgy_gateway");
+
+            // Test WireGuard VPN peer match
+            let vpn_peer = catalog.match_product("iphonestephan.fritz.box", Some("WireGuard / FRITZ!Box VPN"), &[]);
+            assert!(vpn_peer.is_some());
+            assert_eq!(vpn_peer.unwrap().id, "wireguard_vpn_peer");
         }
     }
 }

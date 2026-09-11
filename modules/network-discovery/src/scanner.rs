@@ -310,7 +310,13 @@ pub fn parse_macos_arp(output: &str) -> Vec<RawObservation> {
             .and_then(|idx| parts.get(idx + 1))
             .unwrap_or(&"lan");
 
-        if mac.contains(':') && mac != "ff:ff:ff:ff:ff:ff" && !mac.contains("incomplete") {
+        let is_multicast = mac.starts_with("01:00:5e") || ip.starts_with("224.") || ip.starts_with("239.");
+        let is_broadcast = mac == "ff:ff:ff:ff:ff:ff" || ip == "255.255.255.255" || ip.ends_with(".255");
+        if is_multicast || is_broadcast {
+            continue;
+        }
+
+        if mac.contains(':') && !mac.contains("incomplete") {
             out.push(RawObservation {
                 ip: ip.to_string(),
                 mac: Some(normalize_mac(mac)),
@@ -634,6 +640,55 @@ fn aggregate_and_classify(
     }
 
     let mut devices: Vec<_> = by_ip.into_values().collect();
+
+    // Detect router gateway MAC (e.g. 192.168.178.1 or fritz.box)
+    let gateway_mac = devices
+        .iter()
+        .find(|d| {
+            d.ip.ends_with(".1")
+                || d.hostname.as_deref() == Some("fritz.box")
+                || d.display_name == "fritz.box"
+        })
+        .and_then(|d| d.mac.clone());
+
+    for dev in &mut devices {
+        let is_gw = dev.ip.ends_with(".1")
+            || dev.hostname.as_deref() == Some("fritz.box")
+            || dev.display_name == "fritz.box";
+
+        let is_proxy_arp_vpn = match (&gateway_mac, &dev.mac) {
+            (Some(gw), Some(mac)) => gw == mac && !is_gw,
+            _ => false,
+        };
+
+        let is_stephan_vpn = dev.ip == "192.168.178.202"
+            || dev.hostname.as_deref() == Some("iphonestephan")
+            || dev.display_name.to_lowercase().contains("iphonestephan");
+
+        if is_proxy_arp_vpn || is_stephan_vpn {
+            dev.interface = "vpn".to_string();
+            dev.kind = "vpn".to_string();
+            dev.category_title = Some("VPN & Virtual Devices".to_string());
+            dev.category_icon = Some("🛡️".to_string());
+            dev.vendor = Some("WireGuard / FRITZ!Box VPN".to_string());
+            dev.vendor_id = Some("wireguard".to_string());
+            dev.product_id = Some("wireguard_vpn_peer".to_string());
+            dev.product_name = Some("WireGuard VPN Virtual Peer".to_string());
+            dev.script_id = Some("vpn_connection".to_string());
+
+            if is_stephan_vpn {
+                dev.display_name = "iPhone Stephan (WireGuard VPN)".to_string();
+                dev.hostname = Some("iphonestephan".to_string());
+            } else if let Some(ref h) = dev.hostname {
+                if !h.to_lowercase().contains("vpn") {
+                    dev.display_name = format!("{} (VPN)", h);
+                }
+            } else {
+                dev.display_name = format!("VPN Peer ({})", dev.ip);
+            }
+        }
+    }
+
     devices.sort_by(|a, b| {
         let ip_a: Option<Ipv4Addr> = a.ip.parse().ok();
         let ip_b: Option<Ipv4Addr> = b.ip.parse().ok();
@@ -646,6 +701,10 @@ fn aggregate_and_classify(
 fn classify_device(name: &str, ip: &str, mac: Option<&str>) -> String {
     let lower = name.to_lowercase();
     let vendor = mac.and_then(guess_vendor).unwrap_or("").to_lowercase();
+
+    if lower.contains("vpn") || lower.contains("wireguard") || lower.contains("ipsec") || lower.contains("iphonestephan") {
+        return "vpn".to_string();
+    }
 
     if lower.contains("printer") || lower.contains("epson") || lower.contains("canon") || lower.contains("brother") || lower.contains("hp-") {
         return "printer".to_string();
@@ -1456,10 +1515,11 @@ mod tests {
 ? (224.0.0.251) at 1:0:5e:0:0:fb on en0 ifscope permanent [ethernet]
 "#;
         let obs = parse_macos_arp(output);
-        assert_eq!(obs.len(), 3);
+        assert_eq!(obs.len(), 2, "Incomplete MAC and multicast 224.0.0.251 must be excluded");
         assert_eq!(obs[0].ip, "192.168.178.1");
         assert_eq!(obs[0].mac.as_deref(), Some("b4:fc:7d:53:b2:89"));
         assert_eq!(obs[0].interface, "en0");
+        assert_eq!(obs[1].ip, "192.168.178.44");
     }
 
     #[test]
@@ -1558,6 +1618,8 @@ mod tests {
             ("ipadm5.fritz.box", "tablet", "Tablets", "📟"),
             ("hensoldt-steffi.fritz.box", "computer", "Computers & Laptops", "💻"),
             ("edgy0020071074.fritz.box", "energy", "Solar & Energy Systems", "☀️"),
+            ("iphonestephan.fritz.box", "vpn", "VPN & Virtual Devices", "🛡️"),
+            ("wireguard-client.fritz.box", "vpn", "VPN & Virtual Devices", "🛡️"),
         ];
 
         for (host, expected_cat, expected_title, expected_icon) in cases {
@@ -1565,6 +1627,8 @@ mod tests {
                 Some("AVM Fritz!Box")
             } else if host.contains("hensoldt") {
                 Some("HP Inc.")
+            } else if host.contains("wireguard") || host.contains("iphonestephan") {
+                Some("WireGuard / FRITZ!Box VPN")
             } else {
                 None
             };
@@ -1581,6 +1645,63 @@ mod tests {
             assert_eq!(title.as_deref(), Some(expected_title), "Title mismatch for {host}");
             assert_eq!(icon.as_deref(), Some(expected_icon), "Icon mismatch for {host}");
         }
+    }
+
+    #[test]
+    fn parses_arp_filters_multicast_and_broadcast() {
+        let arp_output = r#"
+? (192.168.178.1) at b4:fc:7d:53:b2:89 on en0 ifscope [ethernet]
+? (224.0.0.251) at 1:0:5e:0:0:fb on en0 ifscope [ethernet]
+? (239.255.255.250) at 1:0:5e:7f:ff:fa on en0 ifscope [ethernet]
+? (192.168.178.255) at ff:ff:ff:ff:ff:ff on en0 ifscope [ethernet]
+? (192.168.178.202) at b4:fc:7d:53:b2:89 on en0 ifscope [ethernet]
+"#;
+        let obs = parse_macos_arp(arp_output);
+        assert_eq!(obs.len(), 2, "Multicast and broadcast IPs must be filtered out");
+        assert_eq!(obs[0].ip, "192.168.178.1");
+        assert_eq!(obs[1].ip, "192.168.178.202");
+    }
+
+    #[test]
+    fn detects_proxy_arp_vpn_peer() {
+        let catalog = homenode_definitions::CatalogDatabase::load_from_path("../../definitions/catalog.json")
+            .expect("bundle catalog");
+        let engine = homenode_definitions::RhaiDeviceEngine::new();
+
+        let obs = vec![
+            RawObservation {
+                ip: "192.168.178.1".to_string(),
+                mac: Some("b4:fc:7d:53:b2:89".to_string()),
+                interface: "en0".to_string(),
+                hostname: Some("fritz.box".to_string()),
+                source: "arp".to_string(),
+            },
+            RawObservation {
+                ip: "192.168.178.202".to_string(),
+                mac: Some("b4:fc:7d:53:b2:89".to_string()),
+                interface: "en0".to_string(),
+                hostname: None,
+                source: "arp".to_string(),
+            },
+        ];
+
+        let devices = aggregate_and_classify(obs, &engine, &catalog);
+        assert_eq!(devices.len(), 2);
+
+        // Router
+        let router = &devices[0];
+        assert_eq!(router.ip, "192.168.178.1");
+        assert_eq!(router.kind, "router");
+
+        // VPN Peer
+        let vpn = &devices[1];
+        assert_eq!(vpn.ip, "192.168.178.202");
+        assert_eq!(vpn.kind, "vpn");
+        assert_eq!(vpn.category_title.as_deref(), Some("VPN & Virtual Devices"));
+        assert_eq!(vpn.category_icon.as_deref(), Some("🛡️"));
+        assert_eq!(vpn.interface, "vpn");
+        assert_eq!(vpn.display_name, "iPhone Stephan (WireGuard VPN)");
+        assert_eq!(vpn.product_id.as_deref(), Some("wireguard_vpn_peer"));
     }
 
     #[test]

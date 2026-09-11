@@ -840,6 +840,9 @@ fn deduce_analyzer_category(
     let lower_vendor = vendor.unwrap_or_default().to_lowercase();
     let lower_title = http_title.unwrap_or_default().to_lowercase();
 
+    if lower_name.contains("vpn") || lower_host.contains("vpn") || lower_host.contains("wireguard") || lower_name.contains("wireguard") || lower_host.contains("iphonestephan") {
+        return ("vpn".to_string(), "VPN & Virtual Devices", "🛡️");
+    }
     if lower_name.contains("ecoflow") || lower_host.contains("ecoflow") || lower_vendor.contains("ecoflow") {
         return ("energy".to_string(), "Solar & Energy Systems", "☀️");
     }
@@ -1526,6 +1529,7 @@ fn default_category_presentation(key: &str) -> (&'static str, &'static str) {
         "audio" => ("Audio & Speakers", "🔊"),
         "printer" => ("Printers", "🖨️"),
         "streaming" => ("TV & Streaming", "📺"),
+        "vpn" => ("VPN & Virtual Devices", "🛡️"),
         _ => ("Network & Other Devices", "🔌"),
     }
 }
@@ -1552,6 +1556,7 @@ fn category_sort_order(key: &str) -> u32 {
         "audio" => 18,
         "printer" => 19,
         "streaming" => 20,
+        "vpn" => 21,
         "network-device" => 99,
         _ => 50,
     }
@@ -2003,6 +2008,7 @@ fn render_devices_page(
             {{ key: 'audio', label: '🔊 Audio & Speakers' }},
             {{ key: 'streaming', label: '📺 TV & Streaming' }},
             {{ key: 'printer', label: '🖨️ Printers' }},
+            {{ key: 'vpn', label: '🛡️ VPN & Virtual Devices' }},
             {{ key: 'iot', label: '💡 Smart Home & IoT' }},
             {{ key: 'network-device', label: '🔌 Network & Other Devices' }}
         ];
@@ -3055,6 +3061,7 @@ fn render_catalog_page(
                                 <option value="computer">Computers & Laptops (computer)</option>
                                 <option value="appliance">Home Appliances (appliance)</option>
                                 <option value="audio">Audio & Speakers (audio)</option>
+                                <option value="vpn">VPN & Virtual Devices (vpn)</option>
                                 <option value="network-device">Network & Other Devices</option>
                             </select>
                         </div>
