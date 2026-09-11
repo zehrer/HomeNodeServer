@@ -112,7 +112,14 @@ fn normalize_paths(config: &mut HomeNodeConfig, base_dir: &Path) {
     for module in config.modules.values_mut() {
         if let Some(path) = &module.config {
             if path.is_relative() {
-                module.config = Some(base_dir.join(path));
+                let candidate = base_dir.join(path);
+                if candidate.exists() {
+                    module.config = Some(candidate);
+                } else if path.exists() {
+                    module.config = Some(path.clone());
+                } else {
+                    module.config = Some(candidate);
+                }
             }
         }
     }

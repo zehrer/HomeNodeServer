@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
@@ -75,11 +75,12 @@ async fn wait_for_client(
 }
 
 fn load_config(path: &Path) -> Result<MatterBridgeConfig> {
-    let raw = std::fs::read_to_string(path)?;
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config at {}", path.display()))?;
     if raw.trim().is_empty() {
         return Ok(MatterBridgeConfig::default());
     }
-    Ok(toml::from_str(&raw)?)
+    toml::from_str(&raw).with_context(|| format!("failed to parse TOML config at {}", path.display()))
 }
 
 fn init_tracing() {

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::response::Html;
 use axum::routing::get;
@@ -152,11 +152,12 @@ async fn wait_for_client(
 }
 
 fn load_config(path: &Path) -> Result<WebConfig> {
-    let raw = std::fs::read_to_string(path)?;
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config at {}", path.display()))?;
     if raw.trim().is_empty() {
         return Ok(WebConfig::default());
     }
-    Ok(toml::from_str(&raw)?)
+    toml::from_str(&raw).with_context(|| format!("failed to parse TOML config at {}", path.display()))
 }
 
 fn init_tracing() {
