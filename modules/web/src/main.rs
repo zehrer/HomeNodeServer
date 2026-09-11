@@ -1,3 +1,5 @@
+mod energy;
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -195,6 +197,8 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(devices_handler))
+        .route("/energy", get(energy_handler))
+        .route("/api/energy/live", get(energy_live_api_handler))
         .route("/matter", get(matter_handler))
         .route("/catalog", get(catalog_handler))
         .route("/status", get(status_handler))
@@ -338,6 +342,62 @@ async fn status_handler(State(state): State<WebState>) -> Html<String> {
         Err(error) => render_error(&state.status_title, "status", &error.to_string()),
     };
     Html(body)
+}
+
+async fn energy_handler(State(state): State<WebState>) -> Html<String> {
+    let body = render_energy_page(&state.status_title);
+    Html(body)
+}
+
+async fn energy_live_api_handler(State(state): State<WebState>) -> Json<energy::EnergyLiveSnapshot> {
+    let mut fronius_host = "fronius.fritz.box".to_string();
+    let mut shelly_host = "shellypro3em.fritz.box".to_string();
+    let mut batteries = Vec::new();
+
+    if let Ok(snapshot) = load_snapshot(&state.socket_path).await {
+        for dev in &snapshot.devices {
+            let host = dev.metadata.get("hostname").map(|s| s.as_str()).unwrap_or("");
+            let name = dev.display_name.to_lowercase();
+            let ip = dev.metadata.get("ip").map(|s| s.as_str()).unwrap_or("");
+
+            if (host.contains("fronius") || name.contains("fronius")) && !ip.is_empty() {
+                fronius_host = ip.to_string();
+            } else if (host.contains("shellypro3em") || name.contains("shelly pro 3em") || name.contains("shellypro3em")) && !ip.is_empty() {
+                shelly_host = ip.to_string();
+            } else if host.contains("ecoflow") || name.contains("ecoflow") {
+                batteries.push(energy::BatteryInfo {
+                    name: dev.display_name.clone(),
+                    hostname: host.to_string(),
+                    ip: ip.to_string(),
+                    soc_pct: None,
+                    power_w: None,
+                    status: "Connected to LAN".to_string(),
+                });
+            }
+        }
+    }
+
+    if batteries.is_empty() {
+        batteries.push(energy::BatteryInfo {
+            name: "EcoFlow PowerStream (Balcony 1)".to_string(),
+            hostname: "ecoflow1.fritz.box".to_string(),
+            ip: "192.168.178.96".to_string(),
+            soc_pct: None,
+            power_w: None,
+            status: "Connected to LAN".to_string(),
+        });
+        batteries.push(energy::BatteryInfo {
+            name: "EcoFlow PowerStream (Balcony 2)".to_string(),
+            hostname: "ecoflow2.fritz.box".to_string(),
+            ip: "192.168.178.105".to_string(),
+            soc_pct: None,
+            power_w: None,
+            status: "Connected to LAN".to_string(),
+        });
+    }
+
+    let snapshot = energy::collect_energy_snapshot(&fronius_host, &shelly_host, batteries).await;
+    Json(snapshot)
 }
 
 async fn load_snapshot(socket_path: &Path) -> Result<RuntimeSnapshot> {
@@ -1131,6 +1191,7 @@ fn build_unified_devices(
 
 fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
     let devices_active = if current_tab == "devices" { "class=\"active\"" } else { "" };
+    let energy_active = if current_tab == "energy" { "class=\"active\"" } else { "" };
     let matter_active = if current_tab == "matter" { "class=\"active\"" } else { "" };
     let catalog_active = if current_tab == "catalog" { "class=\"active\"" } else { "" };
     let status_active = if current_tab == "status" { "class=\"active\"" } else { "" };
@@ -1495,6 +1556,7 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
         <h1>{title}</h1>
         <nav>
             <a href="/" {devices_active}>Detected Devices</a>
+            <a href="/energy" {energy_active}>⚡ Energy</a>
             <a href="/matter" {matter_active}>✨ Matter Fabrics</a>
             <a href="/catalog" {catalog_active}>Hardware Catalog</a>
             <a href="/status" {status_active}>System Status</a>
@@ -2492,6 +2554,323 @@ fn render_devices_page(
     );
 
     page_layout(title, "devices", &content)
+}
+
+fn render_energy_page(title: &str) -> String {
+    let content = r#"
+    <div style="margin-bottom:20px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+        <div>
+            <h2 style="font-size:20px; font-weight:700; display:flex; align-items:center; gap:8px;">
+                <span>⚡ Real-Time Energy Dashboard</span>
+                <span id="energy-live-pulse" class="badge" style="background:#dcfce7; color:#166534; font-size:11px; font-weight:600; padding:3px 8px; border-radius:12px;">
+                    <span class="status-dot status-ready" style="width:8px; height:8px; margin-right:4px;"></span>Live Polling
+                </span>
+            </h2>
+            <div style="font-size:12px; color:var(--muted); margin-top:3px;">
+                Monitoring Fronius Solar Inverter, Shelly Pro 3EM 3-Phase Grid Meter, and EcoFlow Storage
+            </div>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+            <span id="energy-last-updated" style="font-size:11px; color:var(--muted);">Connecting...</span>
+            <button class="btn btn-sm btn-primary" onclick="fetchLiveEnergy()">🔄 Refresh</button>
+        </div>
+    </div>
+
+    <!-- Top KPI Overview Grid -->
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:16px; margin-bottom:20px;">
+        <!-- ☀️ Solar Inverter (Fronius) -->
+        <div class="card" style="margin-bottom:0; border-top: 4px solid #f59e0b;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                <div style="display:flex; align-items:center; gap:6px; font-weight:600; font-size:13px; color:var(--muted);">
+                    <span>☀️ SOLAR GENERATION</span>
+                </div>
+                <span id="solar-badge" class="badge" style="font-size:10px;">Fronius Inverter</span>
+            </div>
+            <div style="display:flex; align-items:baseline; gap:6px; margin-bottom:12px;">
+                <span id="solar-power-val" style="font-size:32px; font-weight:800; color:#d97706; font-family:monospace;">--</span>
+                <span style="font-size:16px; font-weight:600; color:var(--muted);">W</span>
+            </div>
+            <div style="border-top:1px solid var(--border); padding-top:10px; display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; font-size:11px;">
+                <div>
+                    <span style="color:var(--muted); display:block;">Today</span>
+                    <strong id="solar-day-val">-- kWh</strong>
+                </div>
+                <div>
+                    <span style="color:var(--muted); display:block;">Year</span>
+                    <strong id="solar-year-val">-- kWh</strong>
+                </div>
+                <div>
+                    <span style="color:var(--muted); display:block;">Lifetime</span>
+                    <strong id="solar-total-val">-- MWh</strong>
+                </div>
+            </div>
+        </div>
+
+        <!-- 🌐 Grid Net Flow (Shelly Pro 3EM) -->
+        <div class="card" style="margin-bottom:0; border-top: 4px solid #2563eb;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                <div style="display:flex; align-items:center; gap:6px; font-weight:600; font-size:13px; color:var(--muted);">
+                    <span>🌐 GRID NET FLOW</span>
+                </div>
+                <span id="grid-badge" class="badge" style="font-size:10px;">Shelly Pro 3EM</span>
+            </div>
+            <div style="display:flex; align-items:baseline; gap:6px; margin-bottom:12px;">
+                <span id="grid-power-val" style="font-size:32px; font-weight:800; font-family:monospace;">--</span>
+                <span style="font-size:16px; font-weight:600; color:var(--muted);">W</span>
+                <span id="grid-dir-badge" class="badge" style="margin-left:auto; font-size:11px; font-weight:600;">--</span>
+            </div>
+            <div style="border-top:1px solid var(--border); padding-top:10px; display:grid; grid-template-columns:1fr 1fr; gap:8px; font-size:11px;">
+                <div>
+                    <span style="color:var(--muted); display:block;">Grid Import Total</span>
+                    <strong id="grid-import-val">-- kWh</strong>
+                </div>
+                <div>
+                    <span style="color:var(--muted); display:block;">Feed-in Export Total</span>
+                    <strong id="grid-export-val">-- kWh</strong>
+                </div>
+            </div>
+        </div>
+
+        <!-- 🏠 House Consumption -->
+        <div class="card" style="margin-bottom:0; border-top: 4px solid #10b981;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                <div style="display:flex; align-items:center; gap:6px; font-weight:600; font-size:13px; color:var(--muted);">
+                    <span>🏠 HOUSE CONSUMPTION</span>
+                </div>
+                <span class="badge" style="font-size:10px;">Calculated Load</span>
+            </div>
+            <div style="display:flex; align-items:baseline; gap:6px; margin-bottom:12px;">
+                <span id="house-power-val" style="font-size:32px; font-weight:800; color:#059669; font-family:monospace;">--</span>
+                <span style="font-size:16px; font-weight:600; color:var(--muted);">W</span>
+            </div>
+            <div style="border-top:1px solid var(--border); padding-top:10px; display:grid; grid-template-columns:1fr 1fr; gap:8px; font-size:11px;">
+                <div>
+                    <span style="color:var(--muted); display:block;">Autarky (Self-Sufficiency)</span>
+                    <strong id="autarky-val" style="color:var(--status-green);">-- %</strong>
+                </div>
+                <div>
+                    <span style="color:var(--muted); display:block;">Self-Consumption</span>
+                    <strong id="self-consumption-val">-- %</strong>
+                </div>
+            </div>
+        </div>
+
+        <!-- 🔋 Batteries & EcoFlow Systems -->
+        <div class="card" style="margin-bottom:0; border-top: 4px solid #8b5cf6;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                <div style="display:flex; align-items:center; gap:6px; font-weight:600; font-size:13px; color:var(--muted);">
+                    <span>🔋 BATTERY STORAGE</span>
+                </div>
+                <span class="badge" style="font-size:10px;">EcoFlow PowerStream</span>
+            </div>
+            <div style="margin-bottom:10px;">
+                <div style="font-size:13px; font-weight:600; margin-bottom:4px;" id="battery-summary-title">2 Balcony Inverters Detected</div>
+                <div style="font-size:11px; color:var(--muted);">ecoflow1 (.96) & ecoflow2 (.105)</div>
+            </div>
+            <div style="border-top:1px solid var(--border); padding-top:8px; font-size:11px; color:var(--muted);">
+                <span>Integrate via Home Assistant (`synologynas:8123`) or EcoFlow Developer API for live SOC % telemetry.</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Interactive Power Flow Diagram -->
+    <div class="card" style="padding:24px 20px; margin-bottom:20px;">
+        <h3 style="font-size:14px; font-weight:600; margin-bottom:16px;">Power Flow Diagram</h3>
+        <div style="display:flex; justify-content:space-around; align-items:center; flex-wrap:wrap; gap:20px;">
+            <!-- Node: Solar -->
+            <div style="text-align:center; min-width:140px; padding:16px; background:var(--bg); border:2px solid #f59e0b; border-radius:12px;">
+                <div style="font-size:32px;">☀️</div>
+                <div style="font-weight:700; font-size:13px; margin-top:4px;">Solar PV</div>
+                <div id="flow-solar-val" style="font-weight:700; font-size:16px; color:#d97706; margin-top:2px;">-- W</div>
+                <div style="font-size:10px; color:var(--muted);">Fronius Inverter</div>
+            </div>
+
+            <div id="flow-line-solar-house" style="display:flex; flex-direction:column; align-items:center; min-width:80px;">
+                <span style="font-size:20px;" id="arrow-solar-house">➡️</span>
+                <span id="flow-text-solar-house" style="font-size:10px; font-weight:600; color:var(--muted);">-- W</span>
+            </div>
+
+            <!-- Node: House -->
+            <div style="text-align:center; min-width:160px; padding:20px; background:var(--bg); border:2px solid #10b981; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.05);">
+                <div style="font-size:36px;">🏠</div>
+                <div style="font-weight:700; font-size:14px; margin-top:4px;">Home Load</div>
+                <div id="flow-house-val" style="font-weight:800; font-size:20px; color:#059669; margin-top:2px;">-- W</div>
+                <div style="font-size:10px; color:var(--muted);">Current Total Consumption</div>
+            </div>
+
+            <div id="flow-line-grid-house" style="display:flex; flex-direction:column; align-items:center; min-width:80px;">
+                <span style="font-size:20px;" id="arrow-grid-house">⬅️</span>
+                <span id="flow-text-grid-house" style="font-size:10px; font-weight:600; color:var(--muted);">-- W</span>
+            </div>
+
+            <!-- Node: Grid -->
+            <div style="text-align:center; min-width:140px; padding:16px; background:var(--bg); border:2px solid #2563eb; border-radius:12px;">
+                <div style="font-size:32px;">🌐</div>
+                <div style="font-weight:700; font-size:13px; margin-top:4px;">Public Grid</div>
+                <div id="flow-grid-val" style="font-weight:700; font-size:16px; color:#2563eb; margin-top:2px;">-- W</div>
+                <div id="flow-grid-state" style="font-size:10px; color:var(--muted);">Shelly Pro 3EM</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Shelly Pro 3EM 3-Phase Precision Table -->
+    <div class="card" style="margin-bottom:20px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:8px;">
+            <div>
+                <h3 style="font-size:15px; font-weight:600; display:flex; align-items:center; gap:6px;">
+                    <span>⚡ Shelly Pro 3EM (3-Phase Electrical Monitor)</span>
+                    <span id="shelly-conn-dot" class="status-dot status-ready"></span>
+                </h3>
+                <div style="font-size:12px; color:var(--muted);">Target host: <span id="shelly-host-label">shellypro3em.fritz.box</span></div>
+            </div>
+            <div style="display:flex; gap:8px; font-size:12px;">
+                <span class="badge" style="background:var(--bg); border:1px solid var(--border);">Grid Frequency: <strong>50.0 Hz</strong></span>
+                <span class="badge" style="background:var(--bg); border:1px solid var(--border);">Total Current: <strong id="shelly-total-curr">-- A</strong></span>
+                <span class="badge" style="background:var(--bg); border:1px solid var(--border);">Apparent Power: <strong id="shelly-total-aprt">-- VA</strong></span>
+            </div>
+        </div>
+
+        <div style="overflow-x:auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Phase</th>
+                        <th>Active Power (W)</th>
+                        <th>Voltage (V)</th>
+                        <th>Current (A)</th>
+                        <th>Apparent Power (VA)</th>
+                        <th>Power Factor (cos φ)</th>
+                        <th>Flow Direction</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Phase A (L1)</strong></td>
+                        <td id="phase-a-act" style="font-family:monospace; font-weight:700;">-- W</td>
+                        <td id="phase-a-volt">-- V</td>
+                        <td id="phase-a-curr">-- A</td>
+                        <td id="phase-a-aprt">-- VA</td>
+                        <td id="phase-a-pf">--</td>
+                        <td id="phase-a-dir">--</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Phase B (L2)</strong></td>
+                        <td id="phase-b-act" style="font-family:monospace; font-weight:700;">-- W</td>
+                        <td id="phase-b-volt">-- V</td>
+                        <td id="phase-b-curr">-- A</td>
+                        <td id="phase-b-aprt">-- VA</td>
+                        <td id="phase-b-pf">--</td>
+                        <td id="phase-b-dir">--</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Phase C (L3)</strong></td>
+                        <td id="phase-c-act" style="font-family:monospace; font-weight:700;">-- W</td>
+                        <td id="phase-c-volt">-- V</td>
+                        <td id="phase-c-curr">-- A</td>
+                        <td id="phase-c-aprt">-- VA</td>
+                        <td id="phase-c-pf">--</td>
+                        <td id="phase-c-dir">--</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- JavaScript for Live Telemetry Polling -->
+    <script>
+    async function fetchLiveEnergy() {
+        try {
+            const res = await fetch('/api/energy/live');
+            if (!res.ok) throw new Error('API returned ' + res.status);
+            const data = await res.json();
+
+            // Solar UI
+            document.getElementById('solar-power-val').innerText = Math.round(data.solar_power_w).toLocaleString();
+            document.getElementById('solar-day-val').innerText = (data.solar_day_kwh || 0).toFixed(2) + ' kWh';
+            document.getElementById('solar-year-val').innerText = Math.round(data.solar_year_kwh || 0).toLocaleString() + ' kWh';
+            document.getElementById('solar-total-val').innerText = ((data.solar_total_kwh || 0) / 1000).toFixed(2) + ' MWh';
+
+            // Grid UI
+            const gridVal = Math.round(data.grid_power_w);
+            const absGrid = Math.abs(gridVal);
+            document.getElementById('grid-power-val').innerText = absGrid.toLocaleString();
+            const gridDirBadge = document.getElementById('grid-dir-badge');
+            if (gridVal < -1) {
+                gridDirBadge.innerText = '🟢 FEED-IN EXPORT';
+                gridDirBadge.style.background = '#dcfce7';
+                gridDirBadge.style.color = '#166534';
+            } else {
+                gridDirBadge.innerText = '🟠 GRID DRAW';
+                gridDirBadge.style.background = '#ffedd5';
+                gridDirBadge.style.color = '#9a3412';
+            }
+            document.getElementById('grid-import-val').innerText = (data.grid_import_kwh || 0).toLocaleString() + ' kWh';
+            document.getElementById('grid-export-val').innerText = (data.grid_export_kwh || 0).toLocaleString() + ' kWh';
+
+            // House UI
+            document.getElementById('house-power-val').innerText = Math.round(data.house_consumption_w).toLocaleString();
+            document.getElementById('autarky-val').innerText = (data.autarky_pct || 0).toFixed(1) + ' %';
+            document.getElementById('self-consumption-val').innerText = (data.self_consumption_pct || 0).toFixed(1) + ' %';
+
+            // Flow Diagram
+            document.getElementById('flow-solar-val').innerText = Math.round(data.solar_power_w).toLocaleString() + ' W';
+            document.getElementById('flow-house-val').innerText = Math.round(data.house_consumption_w).toLocaleString() + ' W';
+            document.getElementById('flow-grid-val').innerText = absGrid.toLocaleString() + ' W';
+            document.getElementById('flow-grid-state').innerText = (gridVal < -1) ? 'Feeding Surplus to Grid' : 'Drawing from Grid';
+
+            if (gridVal < -1) {
+                document.getElementById('arrow-grid-house').innerText = '➡️';
+                document.getElementById('flow-text-grid-house').innerText = 'Exporting ' + absGrid + ' W';
+            } else {
+                document.getElementById('arrow-grid-house').innerText = '⬅️';
+                document.getElementById('flow-text-grid-house').innerText = 'Importing ' + absGrid + ' W';
+            }
+
+            document.getElementById('flow-text-solar-house').innerText = Math.round(data.solar_power_w) + ' W';
+
+            // 3-Phase Shelly details
+            if (data.shelly) {
+                document.getElementById('shelly-host-label').innerText = data.shelly_host;
+                document.getElementById('shelly-total-curr').innerText = data.shelly.total_current + ' A';
+                document.getElementById('shelly-total-aprt').innerText = Math.round(data.shelly.total_aprt_power) + ' VA';
+
+                const updatePhase = (prefix, p) => {
+                    if (!p) return;
+                    const elAct = document.getElementById(prefix + '-act');
+                    elAct.innerText = p.act_power.toFixed(1) + ' W';
+                    if (p.act_power < 0) {
+                        elAct.style.color = '#16a34a';
+                        document.getElementById(prefix + '-dir').innerHTML = '<span class="badge" style="background:#dcfce7; color:#166534; font-size:10px;">🟢 Feed-in</span>';
+                    } else {
+                        elAct.style.color = '#d97706';
+                        document.getElementById(prefix + '-dir').innerHTML = '<span class="badge" style="background:#ffedd5; color:#9a3412; font-size:10px;">🟠 Draw</span>';
+                    }
+                    document.getElementById(prefix + '-volt').innerText = p.voltage + ' V';
+                    document.getElementById(prefix + '-curr').innerText = p.current + ' A';
+                    document.getElementById(prefix + '-aprt').innerText = p.aprt_power + ' VA';
+                    document.getElementById(prefix + '-pf').innerText = p.pf;
+                };
+
+                updatePhase('phase-a', data.shelly.phase_a);
+                updatePhase('phase-b', data.shelly.phase_b);
+                updatePhase('phase-c', data.shelly.phase_c);
+            }
+
+            document.getElementById('energy-last-updated').innerText = 'Updated ' + data.timestamp;
+        } catch (e) {
+            document.getElementById('energy-last-updated').innerText = 'Polling error: ' + e.message;
+        }
+    }
+
+    // Initial fetch on page load + periodic polling every 2500ms
+    window.addEventListener('DOMContentLoaded', () => {
+        fetchLiveEnergy();
+        setInterval(fetchLiveEnergy, 2500);
+    });
+    </script>
+    "#;
+
+    page_layout(title, "energy", content)
 }
 
 fn render_status_page(title: &str, snapshot: &RuntimeSnapshot) -> String {
