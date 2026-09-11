@@ -1,14 +1,16 @@
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use homenode_sdk::is_known_module_id;
 use homenode_sdk::proto::home_node_control_server::HomeNodeControl;
 use homenode_sdk::proto::{
-    DeviceRecord, Empty, ModuleHealth, ModuleRegistration, ModuleRuntime, RuntimeSnapshot,
-    UpsertDevicesRequest,
+    CommandResponse, DeviceRecord, Empty, ModuleCommand, ModuleHealth, ModuleRegistration,
+    ModuleRuntime, RuntimeSnapshot, SubscribeCommandsRequest, UpsertDevicesRequest,
 };
 
 #[derive(Debug, Default)]
@@ -18,6 +20,12 @@ pub struct RuntimeState {
 }
 
 pub type SharedState = Arc<RwLock<RuntimeState>>;
+
+#[derive(Debug, Clone)]
+struct Subscriber {
+    module_id: String,
+    tx: tokio::sync::mpsc::Sender<Result<ModuleCommand, Status>>,
+}
 
 impl RuntimeState {
     pub fn register_module(&mut self, registration: ModuleRegistration) -> Result<(), Status> {
@@ -107,11 +115,15 @@ impl RuntimeState {
 #[derive(Debug, Clone)]
 pub struct ControlService {
     state: SharedState,
+    subscribers: Arc<Mutex<Vec<Subscriber>>>,
 }
 
 impl ControlService {
     pub fn new(state: SharedState) -> Self {
-        Self { state }
+        Self {
+            state,
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 }
 
@@ -153,5 +165,59 @@ impl HomeNodeControl for ControlService {
     ) -> Result<Response<RuntimeSnapshot>, Status> {
         let snapshot = self.state.read().await.snapshot();
         Ok(Response::new(snapshot))
+    }
+
+    async fn send_command(
+        &self,
+        request: Request<ModuleCommand>,
+    ) -> Result<Response<CommandResponse>, Status> {
+        let cmd = request.into_inner();
+        let mut subs = self.subscribers.lock().await;
+        let mut delivered = 0;
+        subs.retain(|sub| {
+            if sub.module_id.is_empty() || sub.module_id == cmd.target_module_id {
+                match sub.tx.try_send(Ok(cmd.clone())) {
+                    Ok(_) => {
+                        delivered += 1;
+                        true
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        delivered += 1;
+                        true
+                    }
+                }
+            } else {
+                true
+            }
+        });
+
+        Ok(Response::new(CommandResponse {
+            success: true,
+            message: format!("Command dispatched to {delivered} subscriber(s)"),
+        }))
+    }
+
+    type SubscribeCommandsStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ModuleCommand, Status>> + Send + 'static>>;
+
+    async fn subscribe_commands(
+        &self,
+        request: Request<SubscribeCommandsRequest>,
+    ) -> Result<Response<Self::SubscribeCommandsStream>, Status> {
+        let req = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let _ = tx.try_send(Ok(ModuleCommand {
+            target_module_id: req.module_id.clone(),
+            action: "ready".to_string(),
+            params: std::collections::HashMap::new(),
+        }));
+        let mut subs = self.subscribers.lock().await;
+        subs.push(Subscriber {
+            module_id: req.module_id,
+            tx,
+        });
+        let stream = ReceiverStream::new(rx);
+        Ok(Response::new(Box::pin(stream)))
     }
 }

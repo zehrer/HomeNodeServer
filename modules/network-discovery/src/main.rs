@@ -108,13 +108,60 @@ async fn main() -> Result<()> {
     let health_message = config.health_message.clone();
     let demo_devices = config.demo_devices.clone();
 
+    // Channel for triggering on-demand scans via control commands
+    let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // Command listener task
+    let cmd_socket_path = env.socket_path.clone();
+    let cmd_module_id = env.module_id.clone();
+    let trigger_sender = trigger_tx.clone();
+
+    tokio::spawn(async move {
+        loop {
+            match connect_control_client(&cmd_socket_path).await {
+                Ok(mut rpc) => {
+                    match rpc
+                        .subscribe_commands(homenode_sdk::proto::SubscribeCommandsRequest {
+                            module_id: cmd_module_id.clone(),
+                        })
+                        .await
+                    {
+                        Ok(response) => {
+                            let mut stream = response.into_inner();
+                            while let Ok(Some(cmd)) = stream.message().await {
+                                if cmd.action == "scan" {
+                                    info!("Received on-demand scan command from supervisor");
+                                    let _ = trigger_sender.try_send(());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to subscribe to supervisor commands: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to connect for command subscription: {e}");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    });
+
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(scan_interval);
         ticker.tick().await; // skip immediate first tick
 
         loop {
-            ticker.tick().await;
-            info!("Running periodic network discovery sweep...");
+            tokio::select! {
+                _ = ticker.tick() => {
+                    info!("Running periodic network discovery sweep...");
+                }
+                _ = trigger_rx.recv() => {
+                    info!("Running triggered on-demand network discovery sweep...");
+                }
+            }
+
             let mut updated = run_scan_and_convert(&scanner, &module_id).await;
             append_demo_devices(&module_id, &mut updated, &demo_devices);
             if updated.is_empty() {

@@ -136,3 +136,18 @@ pub async fn connect_control_client(
 
     Ok(proto::home_node_control_client::HomeNodeControlClient::new(channel))
 }
+
+pub fn module_command(
+    target_module_id: impl Into<String>,
+    action: impl Into<String>,
+    params: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+) -> proto::ModuleCommand {
+    proto::ModuleCommand {
+        target_module_id: target_module_id.into(),
+        action: action.into(),
+        params: params
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect::<HashMap<_, _>>(),
+    }
+}

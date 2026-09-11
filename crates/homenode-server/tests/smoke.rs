@@ -223,6 +223,72 @@ async fn fake_module_contract_works_over_sdk() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn command_pipeline_routes_commands_to_subscribers() -> Result<()> {
+    let temp = tempdir()?;
+    let socket_path = temp.path().join("supervisor.sock");
+    let config_path = temp.path().join("server.toml");
+
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server]\nsocket_path = \"{}\"\nlog_filter = \"info\"\n",
+            socket_path.display()
+        ),
+    )?;
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(homenode_server::run_with_shutdown(
+        config_path.clone(),
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    wait_for_snapshot(&socket_path, |_| true).await?;
+
+    let mut subscriber_client = homenode_sdk::connect_control_client(&socket_path).await?;
+    let mut stream = subscriber_client
+        .subscribe_commands(homenode_sdk::proto::SubscribeCommandsRequest {
+            module_id: "network-discovery".to_string(),
+        })
+        .await?
+        .into_inner();
+
+    let initial = tokio::time::timeout(Duration::from_secs(2), stream.message())
+        .await?
+        .expect("stream should deliver initial ready")
+        .expect("stream item should be Ok");
+    assert_eq!(initial.action, "ready");
+
+    let mut sender_client = homenode_sdk::connect_control_client(&socket_path).await?;
+    let response = sender_client
+        .send_command(homenode_sdk::proto::ModuleCommand {
+            target_module_id: "network-discovery".to_string(),
+            action: "scan".to_string(),
+            params: std::collections::HashMap::new(),
+        })
+        .await?
+        .into_inner();
+
+    assert!(response.success);
+
+    let received = tokio::time::timeout(Duration::from_secs(2), stream.message())
+        .await?
+        .expect("stream should deliver command")
+        .expect("stream item should be Ok");
+
+    assert_eq!(received.target_module_id, "network-discovery");
+    assert_eq!(received.action, "scan");
+
+    drop(stream);
+    drop(subscriber_client);
+    drop(sender_client);
+    let _ = shutdown_tx.send(());
+    handle.await??;
+    Ok(())
+}
+
 async fn wait_for_snapshot(
     socket_path: &Path,
     predicate: impl Fn(&homenode_sdk::proto::RuntimeSnapshot) -> bool,

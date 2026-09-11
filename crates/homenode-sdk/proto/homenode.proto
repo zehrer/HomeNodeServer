@@ -57,9 +57,26 @@ message RuntimeSnapshot {
   repeated DeviceRecord devices = 2;
 }
 
+message ModuleCommand {
+  string target_module_id = 1;
+  string action = 2;
+  map<string, string> params = 3;
+}
+
+message CommandResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message SubscribeCommandsRequest {
+  string module_id = 1;
+}
+
 service HomeNodeControl {
   rpc RegisterModule(ModuleRegistration) returns (Empty);
   rpc ReportHealth(ModuleHealth) returns (Empty);
   rpc UpsertDevices(UpsertDevicesRequest) returns (Empty);
   rpc GetRuntimeSnapshot(Empty) returns (RuntimeSnapshot);
+  rpc SendCommand(ModuleCommand) returns (CommandResponse);
+  rpc SubscribeCommands(SubscribeCommandsRequest) returns (stream ModuleCommand);
 }

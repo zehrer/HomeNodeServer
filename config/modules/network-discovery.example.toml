@@ -3,15 +3,5 @@ scan_interval_secs = 300
 max_active_targets = 256
 enable_active_icmp = true
 
-# Fallback demo devices when no physical network interfaces or devices are detected (e.g. CI environments)
-[[demo_devices]]
-device_id = "router-01"
-display_name = "Core Router"
-kind = "network-router"
-capabilities = ["icmp", "mdns"]
-
-[[demo_devices]]
-device_id = "printer-01"
-display_name = "Office Printer"
-kind = "network-printer"
-capabilities = ["ipp"]
+# Optional demo devices for test/isolated environments can be added with [[demo_devices]]
+demo_devices = []

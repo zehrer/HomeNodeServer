@@ -70,12 +70,44 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(devices_handler))
         .route("/status", get(status_handler))
+        .route("/scan", axum::routing::post(scan_trigger_form_handler))
+        .route("/api/scan", axum::routing::post(scan_trigger_api_handler))
         .with_state(WebState {
             socket_path: env.socket_path,
             status_title: config.status_title,
         });
 
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn scan_trigger_form_handler(State(state): State<WebState>) -> axum::response::Redirect {
+    let _ = trigger_network_scan(&state.socket_path).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    axum::response::Redirect::to("/")
+}
+
+async fn scan_trigger_api_handler(
+    State(state): State<WebState>,
+) -> (axum::http::StatusCode, &'static str) {
+    match trigger_network_scan(&state.socket_path).await {
+        Ok(_) => (axum::http::StatusCode::ACCEPTED, r#"{"status":"scan_started"}"#),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"failed_to_trigger_scan"}"#,
+        ),
+    }
+}
+
+async fn trigger_network_scan(socket_path: &Path) -> Result<()> {
+    let mut client = connect_control_client(socket_path).await?;
+    client
+        .send_command(homenode_sdk::proto::ModuleCommand {
+            target_module_id: "network-discovery".to_string(),
+            action: "scan".to_string(),
+            params: std::collections::HashMap::new(),
+        })
+        .await?;
     Ok(())
 }
 
@@ -229,6 +261,89 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
             padding: 40px 16px;
             color: var(--muted);
         }}
+        .toolbar {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-bottom: 16px;
+        }}
+        .btn {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 16px;
+            font-size: 14px;
+            font-weight: 500;
+            border-radius: 6px;
+            border: 1px solid transparent;
+            cursor: pointer;
+            transition: background-color 0.15s ease, opacity 0.15s ease;
+        }}
+        .btn-primary {{
+            background: var(--primary);
+            color: #ffffff;
+        }}
+        .btn-primary:hover {{
+            filter: brightness(1.1);
+        }}
+        .search-input {{
+            padding: 8px 14px;
+            font-size: 14px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--surface);
+            color: var(--text);
+            width: 260px;
+            max-width: 100%;
+        }}
+        .search-input:focus {{
+            outline: none;
+            border-color: var(--primary);
+        }}
+        .pills {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 20px;
+        }}
+        .pill {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            font-size: 13px;
+            border-radius: 9999px;
+            border: 1px solid var(--border);
+            background: var(--surface);
+            color: var(--muted);
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }}
+        .pill:hover {{
+            border-color: var(--primary);
+            color: var(--text);
+        }}
+        .pill.active {{
+            background: var(--primary);
+            border-color: var(--primary);
+            color: #ffffff;
+            font-weight: 500;
+        }}
+        .group-header {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }}
+        .group-header h3 {{
+            font-size: 15px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
     </style>
 </head>
 <body>
@@ -247,48 +362,226 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
     )
 }
 
+struct CategoryDef {
+    key: &'static str,
+    title: &'static str,
+    icon: &'static str,
+}
+
+const CATEGORIES: &[CategoryDef] = &[
+    CategoryDef { key: "phone", title: "Phones", icon: "☎️" },
+    CategoryDef { key: "camera", title: "Cameras", icon: "📷" },
+    CategoryDef { key: "computer", title: "Computers & Laptops", icon: "💻" },
+    CategoryDef { key: "mobile", title: "Mobile Devices", icon: "📱" },
+    CategoryDef { key: "wearable", title: "Wearables", icon: "⌚" },
+    CategoryDef { key: "audio", title: "Audio & Speakers", icon: "🔊" },
+    CategoryDef { key: "iot", title: "Smart Home & IoT", icon: "💡" },
+    CategoryDef { key: "printer", title: "Printers", icon: "🖨️" },
+    CategoryDef { key: "streaming", title: "TV & Streaming", icon: "📺" },
+    CategoryDef { key: "router", title: "Routers & Gateways", icon: "🌐" },
+    CategoryDef { key: "network-device", title: "Network Infrastructure & Other", icon: "🔌" },
+];
+
 fn render_devices_page(title: &str, snapshot: &RuntimeSnapshot) -> String {
-    let content = if snapshot.devices.is_empty() {
-        r#"<div class="card"><div class="empty-state"><h3>No devices detected yet</h3><p>Connected integration modules will automatically list discovered devices here.</p></div></div>"#.to_string()
-    } else {
-        let rows = snapshot.devices.iter().map(|device| {
-            let ip = device.metadata.get("ip").cloned().unwrap_or_else(|| "-".to_string());
-            let mac = device.metadata.get("mac").cloned().unwrap_or_default();
-            let vendor = device.metadata.get("vendor").cloned().unwrap_or_default();
-            let iface = device.metadata.get("interface").cloned().unwrap_or_default();
-            let caps = device.capabilities.iter().map(|c| format!("<span class=\"badge\">{c}</span>")).collect::<Vec<_>>().join(" ");
+    if snapshot.devices.is_empty() {
+        let content = r#"
+        <div class="toolbar">
+            <h2>Detected Devices (0)</h2>
+            <form action="/scan" method="POST" id="scan-form" style="margin:0;">
+                <button type="submit" id="scan-btn" class="btn btn-primary">
+                    <span>🔄</span> <span id="scan-label">Scan Network Now</span>
+                </button>
+            </form>
+        </div>
+        <div class="card"><div class="empty-state"><h3>No devices detected yet</h3><p>Click "Scan Network Now" or wait for background discovery.</p></div></div>"#;
+        return page_layout(title, "devices", content);
+    }
 
-            let network_info = if mac.is_empty() {
-                format!("<code>{ip}</code>")
-            } else if vendor.is_empty() {
-                format!("<code>{ip}</code><br><small style=\"color:var(--muted)\">{mac}</small>")
+    // Group devices by category
+    let mut groups: std::collections::HashMap<&'static str, Vec<&homenode_sdk::proto::DeviceRecord>> =
+        std::collections::HashMap::new();
+
+    for device in &snapshot.devices {
+        let cat_key = CATEGORIES
+            .iter()
+            .find(|c| c.key == device.kind)
+            .map(|c| c.key)
+            .unwrap_or("network-device");
+        groups.entry(cat_key).or_default().push(device);
+    }
+
+    // Render filter pills
+    let mut pills_html = format!(
+        r#"<button type="button" class="pill active" onclick="selectCategory('all', this)">All ({})</button>"#,
+        snapshot.devices.len()
+    );
+
+    for cat in CATEGORIES {
+        if let Some(list) = groups.get(cat.key) {
+            pills_html.push_str(&format!(
+                r#"<button type="button" class="pill" onclick="selectCategory('{}', this)">{} {} ({})</button>"#,
+                cat.key, cat.icon, cat.title, list.len()
+            ));
+        }
+    }
+
+    // Render group cards
+    let mut group_cards_html = String::new();
+    for cat in CATEGORIES {
+        if let Some(list) = groups.get(cat.key) {
+            let rows = list
+                .iter()
+                .map(|device| {
+                    let ip = device
+                        .metadata
+                        .get("ip")
+                        .cloned()
+                        .unwrap_or_else(|| "-".to_string());
+                    let mac = device.metadata.get("mac").cloned().unwrap_or_default();
+                    let vendor = device.metadata.get("vendor").cloned().unwrap_or_default();
+                    let iface = device.metadata.get("interface").cloned().unwrap_or_default();
+                    let caps = device
+                        .capabilities
+                        .iter()
+                        .map(|c| format!("<span class=\"badge\">{c}</span>"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+
+                    let network_info = if mac.is_empty() {
+                        format!("<code>{ip}</code>")
+                    } else if vendor.is_empty() {
+                        format!("<code>{ip}</code><br><small style=\"color:var(--muted)\">{mac}</small>")
+                    } else {
+                        format!("<code>{ip}</code><br><small style=\"color:var(--muted)\">{mac} &bull; {vendor}</small>")
+                    };
+
+                    let iface_badge = if iface.is_empty() {
+                        format!("<span class=\"badge\">{}</span>", device.module_id)
+                    } else {
+                        format!(
+                            "<span class=\"badge\">{}</span> <small style=\"color:var(--muted)\">({iface})</small>",
+                            device.module_id
+                        )
+                    };
+
+                    format!(
+                        "<tr><td><strong>{}</strong><br><small style=\"color:var(--muted)\">{}</small></td><td><span class=\"badge badge-kind\">{}</span></td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                        device.display_name,
+                        device.device_id,
+                        device.kind,
+                        network_info,
+                        iface_badge,
+                        if caps.is_empty() { String::from("-") } else { caps },
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("");
+
+            group_cards_html.push_str(&format!(
+                r#"<div class="card device-group" data-category="{}">
+                    <div class="group-header">
+                        <h3>{} {} <span class="badge">{}</span></h3>
+                    </div>
+                    <div style="overflow-x:auto">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Device</th>
+                                    <th>Kind</th>
+                                    <th>Network (IP / MAC)</th>
+                                    <th>Source</th>
+                                    <th>Capabilities</th>
+                                </tr>
+                            </thead>
+                            <tbody>{}</tbody>
+                        </table>
+                    </div>
+                </div>"#,
+                cat.key,
+                cat.icon,
+                cat.title,
+                list.len(),
+                rows
+            ));
+        }
+    }
+
+    let script = r#"
+    <script>
+    let currentCategory = 'all';
+
+    function selectCategory(cat, el) {
+        currentCategory = cat;
+        document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+        el.classList.add('active');
+        filterDevices();
+    }
+
+    function filterDevices() {
+        const q = (document.getElementById('device-search').value || '').toLowerCase();
+        const groups = document.querySelectorAll('.device-group');
+
+        groups.forEach(group => {
+            const cat = group.getAttribute('data-category');
+            const matchesCat = (currentCategory === 'all' || currentCategory === cat);
+
+            let visibleRows = 0;
+            const rows = group.querySelectorAll('tbody tr');
+            rows.forEach(row => {
+                const text = row.innerText.toLowerCase();
+                const matchesSearch = !q || text.includes(q);
+                if (matchesSearch) {
+                    row.style.display = '';
+                    visibleRows++;
+                } else {
+                    row.style.display = 'none';
+                }
+            });
+
+            if (matchesCat && visibleRows > 0) {
+                group.style.display = '';
             } else {
-                format!("<code>{ip}</code><br><small style=\"color:var(--muted)\">{mac} &bull; {vendor}</small>")
-            };
+                group.style.display = 'none';
+            }
+        });
+    }
 
-            let iface_badge = if iface.is_empty() {
-                format!("<span class=\"badge\">{}</span>", device.module_id)
-            } else {
-                format!("<span class=\"badge\">{}</span> <small style=\"color:var(--muted)\">({iface})</small>", device.module_id)
-            };
+    const scanForm = document.getElementById('scan-form');
+    if (scanForm) {
+        scanForm.onsubmit = function() {
+            const btn = document.getElementById('scan-btn');
+            const label = document.getElementById('scan-label');
+            if (btn && label) {
+                btn.disabled = true;
+                label.innerText = 'Scanning Network...';
+                btn.style.opacity = '0.7';
+            }
+        };
+    }
+    </script>
+    "#;
 
-            format!(
-                "<tr><td><strong>{}</strong><br><small style=\"color:var(--muted)\">{}</small></td><td><span class=\"badge badge-kind\">{}</span></td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                device.display_name,
-                device.device_id,
-                device.kind,
-                network_info,
-                iface_badge,
-                if caps.is_empty() { String::from("-") } else { caps },
-            )
-        }).collect::<Vec<_>>().join("");
-
-        format!(
-            r#"<div class="card"><h2>Detected Devices ({})</h2><div style="overflow-x:auto"><table><thead><tr><th>Device</th><th>Kind</th><th>Network (IP / MAC)</th><th>Source</th><th>Capabilities</th></tr></thead><tbody>{}</tbody></table></div></div>"#,
-            snapshot.devices.len(),
-            rows
-        )
-    };
+    let content = format!(
+        r#"
+        <div class="toolbar">
+            <h2>Detected Devices ({})</h2>
+            <div style="display:flex;gap:10px;align-items:center;">
+                <input type="text" id="device-search" placeholder="Search devices (name, IP, MAC)..." class="search-input" oninput="filterDevices()" />
+                <form action="/scan" method="POST" id="scan-form" style="margin:0;">
+                    <button type="submit" id="scan-btn" class="btn btn-primary">
+                        <span>🔄</span> <span id="scan-label">Scan Network Now</span>
+                    </button>
+                </form>
+            </div>
+        </div>
+        <div class="pills">{}</div>
+        {}
+        {}"#,
+        snapshot.devices.len(),
+        pills_html,
+        group_cards_html,
+        script
+    );
 
     page_layout(title, "devices", &content)
 }
