@@ -1553,10 +1553,20 @@ mod tests {
             ("ecoflow2.fritz.box", "energy", "Solar & Energy Systems", "☀️"),
             ("shellypro3em.fritz.box", "energy", "Solar & Energy Systems", "☀️"),
             ("hue-gateway.fritz.box", "hub", "Smart Home Hubs", "🎛️"),
+            ("ipad-air.fritz.box", "tablet", "Tablets", "📟"),
+            ("ipadm2.fritz.box", "tablet", "Tablets", "📟"),
+            ("ipadm5.fritz.box", "tablet", "Tablets", "📟"),
+            ("hensoldt-steffi.fritz.box", "computer", "Computers & Laptops", "💻"),
         ];
 
         for (host, expected_cat, expected_title, expected_icon) in cases {
-            let vendor = if host.contains("repeater") { Some("AVM Fritz!Box") } else { None };
+            let vendor = if host.contains("repeater") {
+                Some("AVM Fritz!Box")
+            } else if host.contains("hensoldt") {
+                Some("HP Inc.")
+            } else {
+                None
+            };
             let (cat, title, icon, _) = classify_with_engine(
                 &engine,
                 host,
@@ -1578,20 +1588,48 @@ mod tests {
             .expect("bundle catalog");
         let engine = homenode_definitions::RhaiDeviceEngine::new();
 
-        let obs = vec![RawObservation {
-            ip: "192.168.178.95".to_string(),
-            mac: Some("c4:5b:be:aa:bb:cc".to_string()),
-            interface: "en0".to_string(),
-            hostname: Some("shellypro3em.fritz.box".to_string()),
-            source: "arp".to_string(),
-        }];
+        let obs = vec![
+            RawObservation {
+                ip: "192.168.178.95".to_string(),
+                mac: Some("c4:5b:be:aa:bb:cc".to_string()),
+                interface: "en0".to_string(),
+                hostname: Some("shellypro3em.fritz.box".to_string()),
+                source: "arp".to_string(),
+            },
+            RawObservation {
+                ip: "192.168.178.153".to_string(),
+                mac: Some("4c:cf:7c:ca:69:be".to_string()),
+                interface: "en0".to_string(),
+                hostname: Some("hensoldt-steffi.fritz.box".to_string()),
+                source: "arp".to_string(),
+            },
+            RawObservation {
+                ip: "192.168.178.154".to_string(),
+                mac: Some("98:a4:4e:11:22:33".to_string()),
+                interface: "en0".to_string(),
+                hostname: Some("ipadair.fritz.box".to_string()),
+                source: "arp".to_string(),
+            },
+        ];
 
         let devices = aggregate_and_classify(obs, &engine, &catalog);
-        assert_eq!(devices.len(), 1);
-        let dev = &devices[0];
-        assert_eq!(dev.vendor_id.as_deref(), Some("shelly"));
-        assert!(dev.vendor.as_deref().unwrap().contains("Shelly"));
-        assert_eq!(dev.product_id.as_deref(), Some("shelly_pro_3em"));
-        assert_eq!(dev.product_name.as_deref(), Some("Shelly Pro 3EM"));
+        assert_eq!(devices.len(), 3);
+
+        let dev0 = &devices[0];
+        assert_eq!(dev0.vendor_id.as_deref(), Some("shelly"));
+        assert!(dev0.vendor.as_deref().unwrap().contains("Shelly"));
+        assert_eq!(dev0.product_id.as_deref(), Some("shelly_pro_3em"));
+        assert_eq!(dev0.product_name.as_deref(), Some("Shelly Pro 3EM"));
+
+        let dev1 = &devices[1];
+        assert_eq!(dev1.vendor_id.as_deref(), Some("hp"));
+        assert_eq!(dev1.vendor.as_deref(), Some("HP Inc."));
+        assert_eq!(dev1.product_id.as_deref(), Some("hp_business_laptop"));
+        assert_eq!(dev1.product_name.as_deref(), Some("HP EliteBook / ProBook Laptop"));
+
+        let dev2 = &devices[2];
+        assert_eq!(dev2.vendor_id.as_deref(), Some("apple"));
+        assert_eq!(dev2.product_id.as_deref(), Some("apple_ipad_air"));
+        assert_eq!(dev2.product_name.as_deref(), Some("Apple iPad Air"));
     }
 }

@@ -317,6 +317,28 @@ mod tests {
 
             let non_fritz = catalog.match_product("espressif2.fritz.box", None, &[]);
             assert!(non_fritz.is_none() || non_fritz.unwrap().id != "fritzbox_gateway");
+
+            // Test iPad models
+            let ipad_air = catalog.match_product("ipadair.fritz.box", Some("Apple Inc."), &[]);
+            assert!(ipad_air.is_some());
+            assert_eq!(ipad_air.unwrap().id, "apple_ipad_air");
+
+            let ipad_pro_m2 = catalog.match_product("ipadm2.fritz.box", Some("Apple Inc."), &[]);
+            assert!(ipad_pro_m2.is_some());
+            assert_eq!(ipad_pro_m2.unwrap().id, "apple_ipad_pro_m2");
+
+            let ipad_pro_m5 = catalog.match_product("ipadm5.fritz.box", Some("Apple Inc."), &[]);
+            assert!(ipad_pro_m5.is_some());
+            assert_eq!(ipad_pro_m5.unwrap().id, "apple_ipad_pro_m5");
+
+            // Test HP corporate laptop lookup & product match
+            let hp_vendor = catalog.find_vendor_by_mac("4c:cf:7c:ca:69:be");
+            assert!(hp_vendor.is_some());
+            assert_eq!(hp_vendor.unwrap().id, "hp");
+
+            let hp_laptop = catalog.match_product("hensoldt-steffi.fritz.box", Some("HP Inc."), &[]);
+            assert!(hp_laptop.is_some());
+            assert_eq!(hp_laptop.unwrap().id, "hp_business_laptop");
         }
     }
 }

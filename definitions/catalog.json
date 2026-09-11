@@ -156,7 +156,7 @@
       "website": "https://www.apple.com",
       "support_url": "https://support.apple.com",
       "icon": "🍎",
-      "oui_prefixes": ["cc:40:85", "be:39:d4", "90:dd:5d", "0e:e4:72", "98:a4:4e", "26:0d:d7", "1e:81:77", "66:ef:41", "f6:34:f0", "e2:f7:7e"],
+      "oui_prefixes": ["be:39:d4", "90:dd:5d", "0e:e4:72", "98:a4:4e", "26:0d:d7", "1e:81:77", "66:ef:41", "f6:34:f0", "e2:f7:7e"],
       "protocols": ["wifi", "lan", "ble", "thread", "matter", "airplay"],
       "description": "Computers, mobile devices, wearables, and HomePod / Apple TV smart home hubs."
     },
@@ -199,6 +199,26 @@
       "oui_prefixes": [],
       "protocols": ["wifi", "lan", "matter", "thread", "zigbee", "zwave", "bluetooth", "mqtt", "http"],
       "description": "Open source home automation platform focused on local control, privacy, and extensive multi-protocol device integration."
+    },
+    {
+      "id": "hp",
+      "name": "HP Inc.",
+      "website": "https://www.hp.com",
+      "support_url": "https://support.hp.com",
+      "icon": "💻",
+      "oui_prefixes": ["4c:cf:7c", "3c:52:82", "b4:b5:2f", "a0:d3:c1", "00:68:eb", "10:60:4b"],
+      "protocols": ["wifi", "lan", "bluetooth"],
+      "description": "Enterprise and consumer computers, laptops (EliteBook, ProBook, Spectre, Envy), and workstation hardware."
+    },
+    {
+      "id": "microsoft",
+      "name": "Microsoft Corporation",
+      "website": "https://www.microsoft.com",
+      "support_url": "https://support.microsoft.com",
+      "icon": "🪟",
+      "oui_prefixes": ["7c:1e:52", "00:15:5d", "dc:98:40"],
+      "protocols": ["wifi", "lan", "bluetooth"],
+      "description": "Windows computing hardware, Surface workstations, and enterprise operating system ecosystem."
     }
   ],
   "products": [
@@ -503,6 +523,66 @@
       "rhai_script_ref": "apple_iphone.rhai"
     },
     {
+      "id": "apple_ipad_pro_m5",
+      "vendor_id": "apple",
+      "name": "Apple iPad Pro M5",
+      "model_number": "iPad Pro (M5 / M4 Ultra Retina XDR)",
+      "category": "tablet",
+      "category_icon": "📟",
+      "connectivity": ["wifi", "bluetooth", "thread"],
+      "matter_device_type": "Matter Controller Client",
+      "default_ports": [],
+      "hostname_patterns": ["ipadm5", "ipad-m5", "ipadprom5", "ipadpro-m5", "ipad-pro-m5", "ipadprom4", "ipadpro-m4", "ipadm4"],
+      "documentation_url": "https://support.apple.com/ipad/pro",
+      "specs": "Flagship Ultra Retina XDR tablet powered by advanced Apple Silicon M-series processor, Wi-Fi 7 / 6E, and Apple Home ecosystem controls.",
+      "rhai_script_ref": "apple_ipad.rhai"
+    },
+    {
+      "id": "apple_ipad_pro_m2",
+      "vendor_id": "apple",
+      "name": "Apple iPad Pro M2",
+      "model_number": "iPad Pro 11\" / 12.9\" (6th Gen, M2)",
+      "category": "tablet",
+      "category_icon": "📟",
+      "connectivity": ["wifi", "bluetooth"],
+      "matter_device_type": "Matter Controller Client",
+      "default_ports": [],
+      "hostname_patterns": ["ipadm2", "ipad-m2", "ipadprom2", "ipadpro-m2", "ipad-pro-m2", "ipadpro"],
+      "documentation_url": "https://support.apple.com/ipad/pro",
+      "specs": "High-performance workstation tablet with Apple M2 chip, ProMotion Liquid Retina XDR display, and Wi-Fi 6E.",
+      "rhai_script_ref": "apple_ipad.rhai"
+    },
+    {
+      "id": "apple_ipad_air",
+      "vendor_id": "apple",
+      "name": "Apple iPad Air",
+      "model_number": "iPad Air (M2 / M1)",
+      "category": "tablet",
+      "category_icon": "📟",
+      "connectivity": ["wifi", "bluetooth"],
+      "matter_device_type": "Matter Controller Client",
+      "default_ports": [],
+      "hostname_patterns": ["ipadair", "ipad-air", "ipad_air"],
+      "documentation_url": "https://support.apple.com/ipad/air",
+      "specs": "Thin and lightweight tablet powered by Apple Silicon with Liquid Retina display, Touch ID, and Wi-Fi 6E.",
+      "rhai_script_ref": "apple_ipad.rhai"
+    },
+    {
+      "id": "apple_ipad",
+      "vendor_id": "apple",
+      "name": "Apple iPad",
+      "model_number": "iPad (10th / 9th Gen)",
+      "category": "tablet",
+      "category_icon": "📟",
+      "connectivity": ["wifi", "bluetooth"],
+      "matter_device_type": "Matter Controller Client",
+      "default_ports": [],
+      "hostname_patterns": ["ipad"],
+      "documentation_url": "https://support.apple.com/ipad",
+      "specs": "Versatile all-screen Apple iPad tablet for smart home dashboard controls and daily mobile workflows.",
+      "rhai_script_ref": "apple_ipad.rhai"
+    },
+    {
       "id": "apple_homepod",
       "vendor_id": "apple",
       "name": "Apple HomePod mini / HomePod",
@@ -561,6 +641,36 @@
       "documentation_url": "https://www.home-assistant.io/docs/",
       "specs": "Dedicated open-source home automation hub running Home Assistant OS/Supervised with web frontend, Matter Server, and local integrations.",
       "rhai_script_ref": "home_assistant.rhai"
+    },
+    {
+      "id": "hp_business_laptop",
+      "vendor_id": "hp",
+      "name": "HP EliteBook / ProBook Laptop",
+      "model_number": "EliteBook / ProBook (Windows)",
+      "category": "computer",
+      "category_icon": "💻",
+      "connectivity": ["wifi", "lan", "bluetooth"],
+      "matter_device_type": null,
+      "default_ports": [],
+      "hostname_patterns": ["hensoldt", "elitebook", "probook", "hp-laptop", "hplaptop"],
+      "documentation_url": "https://support.hp.com",
+      "specs": "Corporate Windows business laptop with enterprise security, TPM, and Wi-Fi 6 networking.",
+      "rhai_script_ref": "computer.rhai"
+    },
+    {
+      "id": "windows_pc",
+      "vendor_id": "microsoft",
+      "name": "Windows PC / Laptop",
+      "model_number": "Windows 11 / 10 Workstation",
+      "category": "computer",
+      "category_icon": "💻",
+      "connectivity": ["wifi", "lan"],
+      "matter_device_type": null,
+      "default_ports": [],
+      "hostname_patterns": ["desktop-", "laptop-", "win-", "pc-"],
+      "documentation_url": "https://support.microsoft.com/windows",
+      "specs": "Windows workstation running Windows 11/10 protected by Windows Defender and hardware firewall.",
+      "rhai_script_ref": "computer.rhai"
     }
   ]
 }
