@@ -252,19 +252,39 @@ fn render_devices_page(title: &str, snapshot: &RuntimeSnapshot) -> String {
         r#"<div class="card"><div class="empty-state"><h3>No devices detected yet</h3><p>Connected integration modules will automatically list discovered devices here.</p></div></div>"#.to_string()
     } else {
         let rows = snapshot.devices.iter().map(|device| {
+            let ip = device.metadata.get("ip").cloned().unwrap_or_else(|| "-".to_string());
+            let mac = device.metadata.get("mac").cloned().unwrap_or_default();
+            let vendor = device.metadata.get("vendor").cloned().unwrap_or_default();
+            let iface = device.metadata.get("interface").cloned().unwrap_or_default();
             let caps = device.capabilities.iter().map(|c| format!("<span class=\"badge\">{c}</span>")).collect::<Vec<_>>().join(" ");
+
+            let network_info = if mac.is_empty() {
+                format!("<code>{ip}</code>")
+            } else if vendor.is_empty() {
+                format!("<code>{ip}</code><br><small style=\"color:var(--muted)\">{mac}</small>")
+            } else {
+                format!("<code>{ip}</code><br><small style=\"color:var(--muted)\">{mac} &bull; {vendor}</small>")
+            };
+
+            let iface_badge = if iface.is_empty() {
+                format!("<span class=\"badge\">{}</span>", device.module_id)
+            } else {
+                format!("<span class=\"badge\">{}</span> <small style=\"color:var(--muted)\">({iface})</small>", device.module_id)
+            };
+
             format!(
-                "<tr><td><strong>{}</strong><br><small style=\"color:var(--muted)\">{}</small></td><td><span class=\"badge badge-kind\">{}</span></td><td><span class=\"badge\">{}</span></td><td>{}</td></tr>",
+                "<tr><td><strong>{}</strong><br><small style=\"color:var(--muted)\">{}</small></td><td><span class=\"badge badge-kind\">{}</span></td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 device.display_name,
                 device.device_id,
                 device.kind,
-                device.module_id,
+                network_info,
+                iface_badge,
                 if caps.is_empty() { String::from("-") } else { caps },
             )
         }).collect::<Vec<_>>().join("");
 
         format!(
-            r#"<div class="card"><h2>Detected Devices ({})</h2><div style="overflow-x:auto"><table><thead><tr><th>Device</th><th>Kind</th><th>Source Module</th><th>Capabilities</th></tr></thead><tbody>{}</tbody></table></div></div>"#,
+            r#"<div class="card"><h2>Detected Devices ({})</h2><div style="overflow-x:auto"><table><thead><tr><th>Device</th><th>Kind</th><th>Network (IP / MAC)</th><th>Source</th><th>Capabilities</th></tr></thead><tbody>{}</tbody></table></div></div>"#,
             snapshot.devices.len(),
             rows
         )

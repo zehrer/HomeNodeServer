@@ -1,18 +1,29 @@
+mod scanner;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use homenode_sdk::proto::{HealthState, ModuleRegistration, UpsertDevicesRequest};
 use homenode_sdk::{connect_control_client, device_record, module_health, module_manifest, ModuleEnvironment};
 
+use crate::scanner::{DiscoveredDevice, NetworkScanner, ScannerConfig};
+
 #[derive(Debug, Deserialize)]
 struct NetworkDiscoveryConfig {
     #[serde(default = "default_health_message")]
     health_message: String,
+    #[serde(default = "default_scan_interval_secs")]
+    scan_interval_secs: u64,
+    #[serde(default = "default_max_active_targets")]
+    max_active_targets: usize,
+    #[serde(default = "default_enable_active_icmp")]
+    enable_active_icmp: bool,
     #[serde(default)]
     demo_devices: Vec<DemoDevice>,
 }
@@ -21,12 +32,15 @@ impl Default for NetworkDiscoveryConfig {
     fn default() -> Self {
         Self {
             health_message: default_health_message(),
+            scan_interval_secs: default_scan_interval_secs(),
+            max_active_targets: default_max_active_targets(),
+            enable_active_icmp: default_enable_active_icmp(),
             demo_devices: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DemoDevice {
     device_id: String,
     display_name: String,
@@ -48,45 +62,158 @@ async fn main() -> Result<()> {
                 env.module_id.clone(),
                 "Network Discovery",
                 env!("CARGO_PKG_VERSION"),
-                ["network/discovery", "device/inventory"],
+                ["network/discovery", "device/inventory", "scanner/icmp", "scanner/arp"],
             )),
             initial_health: Some(module_health(
                 env.module_id.clone(),
                 HealthState::Starting,
-                "Starting network discovery stub",
+                "Starting network discovery scanner",
             )),
         })
         .await?;
 
+    let scanner_config = ScannerConfig {
+        max_active_targets: config.max_active_targets,
+        enable_active_icmp: config.enable_active_icmp,
+        interface_allowlist: Vec::new(),
+        interface_denylist: Vec::new(),
+    };
+    let scanner = NetworkScanner::new(scanner_config);
+
+    // Initial scan
+    info!("Running initial network discovery sweep...");
+    let mut devices = run_scan_and_convert(&scanner, &env.module_id).await;
+    append_demo_devices(&env.module_id, &mut devices, &config.demo_devices);
+
+    let initial_count = devices.len();
     client
         .upsert_devices(UpsertDevicesRequest {
             module_id: env.module_id.clone(),
-            devices: config
-                .demo_devices
-                .iter()
-                .map(|device| {
-                    device_record(
-                        env.module_id.clone(),
-                        device.device_id.clone(),
-                        device.display_name.clone(),
-                        device.kind.clone(),
-                        device.capabilities.clone(),
-                        HashMap::<String, String>::new(),
-                    )
-                })
-                .collect(),
+            devices,
         })
         .await?;
+
     client
         .report_health(module_health(
-            env.module_id,
+            env.module_id.clone(),
             HealthState::Ready,
-            config.health_message,
+            format!("{} ({} devices online)", config.health_message, initial_count),
         ))
         .await?;
 
+    // Background periodic scan loop
+    let socket_path = env.socket_path.clone();
+    let module_id = env.module_id.clone();
+    let scan_interval = Duration::from_secs(config.scan_interval_secs);
+    let health_message = config.health_message.clone();
+    let demo_devices = config.demo_devices.clone();
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(scan_interval);
+        ticker.tick().await; // skip immediate first tick
+
+        loop {
+            ticker.tick().await;
+            info!("Running periodic network discovery sweep...");
+            let mut updated = run_scan_and_convert(&scanner, &module_id).await;
+            append_demo_devices(&module_id, &mut updated, &demo_devices);
+            if updated.is_empty() {
+                continue;
+            }
+
+            let count = updated.len();
+            match connect_control_client(&socket_path).await {
+                Ok(mut rpc) => {
+                    if let Err(e) = rpc
+                        .upsert_devices(UpsertDevicesRequest {
+                            module_id: module_id.clone(),
+                            devices: updated,
+                        })
+                        .await
+                    {
+                        error!("Failed to update devices over gRPC: {e}");
+                    } else {
+                        let _ = rpc
+                            .report_health(module_health(
+                                module_id.clone(),
+                                HealthState::Ready,
+                                format!("{} ({} devices online)", health_message, count),
+                            ))
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to reconnect control client: {e}");
+                }
+            }
+        }
+    });
+
     std::future::pending::<()>().await;
     Ok(())
+}
+
+async fn run_scan_and_convert(
+    scanner: &NetworkScanner,
+    module_id: &str,
+) -> Vec<homenode_sdk::proto::DeviceRecord> {
+    match scanner.scan().await {
+        Ok(discovered) => discovered
+            .into_iter()
+            .map(|dev| convert_device(module_id, dev))
+            .collect(),
+        Err(err) => {
+            error!("Network scan failed: {err}");
+            Vec::new()
+        }
+    }
+}
+
+fn append_demo_devices(
+    module_id: &str,
+    devices: &mut Vec<homenode_sdk::proto::DeviceRecord>,
+    demo_devices: &[DemoDevice],
+) {
+    for demo in demo_devices {
+        if !devices.iter().any(|d| d.device_id == demo.device_id) {
+            devices.push(device_record(
+                module_id.to_string(),
+                demo.device_id.clone(),
+                demo.display_name.clone(),
+                demo.kind.clone(),
+                demo.capabilities.clone(),
+                HashMap::<String, String>::new(),
+            ));
+        }
+    }
+}
+
+fn convert_device(
+    module_id: &str,
+    device: DiscoveredDevice,
+) -> homenode_sdk::proto::DeviceRecord {
+    let mut metadata = HashMap::new();
+    metadata.insert("ip".to_string(), device.ip);
+    metadata.insert("interface".to_string(), device.interface);
+    if let Some(mac) = device.mac {
+        metadata.insert("mac".to_string(), mac);
+    }
+    if let Some(host) = device.hostname {
+        metadata.insert("hostname".to_string(), host);
+    }
+    if let Some(vendor) = device.vendor {
+        metadata.insert("vendor".to_string(), vendor.to_string());
+    }
+    metadata.insert("source".to_string(), device.source);
+
+    device_record(
+        module_id,
+        device.device_id,
+        device.display_name,
+        device.kind,
+        device.capabilities,
+        metadata,
+    )
 }
 
 async fn wait_for_client(
@@ -122,5 +249,17 @@ fn init_tracing() {
 }
 
 fn default_health_message() -> String {
-    String::from("Network discovery stub active")
+    String::from("Network discovery scanner active")
+}
+
+fn default_scan_interval_secs() -> u64 {
+    300
+}
+
+fn default_max_active_targets() -> usize {
+    256
+}
+
+fn default_enable_active_icmp() -> bool {
+    true
 }

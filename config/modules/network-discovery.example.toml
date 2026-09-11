@@ -1,5 +1,9 @@
-health_message = "Network discovery stub active"
+health_message = "Network discovery active"
+scan_interval_secs = 300
+max_active_targets = 256
+enable_active_icmp = true
 
+# Fallback demo devices when no physical network interfaces or devices are detected (e.g. CI environments)
 [[demo_devices]]
 device_id = "router-01"
 display_name = "Core Router"

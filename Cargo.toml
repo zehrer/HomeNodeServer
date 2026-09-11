@@ -17,11 +17,16 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1"
 axum = "0.7"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+dns-lookup = "2.0"
 hyper-util = "0.1"
+if-addrs = "0.13"
+ipnet = "2.10"
 prost = "0.13"
 protoc-bin-vendored = "3"
 rs-matter = "0.3.0"
 serde = { version = "1", features = ["derive"] }
+surge-ping = "0.8"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
