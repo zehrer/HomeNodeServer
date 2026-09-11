@@ -6,6 +6,9 @@ use rhai::{Dynamic, Engine, Scope, AST};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+pub mod catalog;
+pub use catalog::{CatalogDatabase, Product, Vendor};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceMeta {
     pub id: String,

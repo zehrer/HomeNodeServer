@@ -33,6 +33,12 @@ pub struct DiscoveredDevice {
     pub capabilities: Vec<String>,
     pub source: String,
     pub web_url: Option<String>,
+    #[serde(default)]
+    pub product_id: Option<String>,
+    #[serde(default)]
+    pub product_name: Option<String>,
+    #[serde(default)]
+    pub vendor_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,16 +80,19 @@ pub struct RawObservation {
 pub struct NetworkScanner {
     config: ScannerConfig,
     definitions_engine: Arc<homenode_definitions::RhaiDeviceEngine>,
+    catalog: Arc<homenode_definitions::CatalogDatabase>,
 }
 
 impl NetworkScanner {
     pub fn new(
         config: ScannerConfig,
         definitions_engine: Arc<homenode_definitions::RhaiDeviceEngine>,
+        catalog: Arc<homenode_definitions::CatalogDatabase>,
     ) -> Self {
         Self {
             config,
             definitions_engine,
+            catalog,
         }
     }
 
@@ -109,8 +118,8 @@ impl NetworkScanner {
         // 5. Reverse DNS hostname enrichment
         enrich_hostnames(&mut observations).await;
 
-        // 6. Aggregate by IP/MAC and classify devices using Rhai engine
-        let mut devices = aggregate_and_classify(observations, &self.definitions_engine);
+        // 6. Aggregate by IP/MAC and classify devices using Rhai engine & Hardware Catalog
+        let mut devices = aggregate_and_classify(observations, &self.definitions_engine, &self.catalog);
 
         // 7. Probe for web interfaces (ports 80, 5000, 8080, 443)
         enrich_web_urls(&mut devices).await;
@@ -463,29 +472,59 @@ fn classify_with_engine(
     }
 }
 
+fn resolve_vendor(
+    mac: Option<&str>,
+    catalog: &homenode_definitions::CatalogDatabase,
+) -> (Option<String>, Option<String>) {
+    if let Some(m) = mac {
+        if let Some(v) = catalog.find_vendor_by_mac(m) {
+            return (Some(v.id.clone()), Some(v.name.clone()));
+        }
+        if let Some(v) = guess_vendor(m) {
+            return (None, Some(v.to_string()));
+        }
+    }
+    (None, None)
+}
+
 fn aggregate_and_classify(
     observations: Vec<RawObservation>,
     engine: &homenode_definitions::RhaiDeviceEngine,
+    catalog: &homenode_definitions::CatalogDatabase,
 ) -> Vec<DiscoveredDevice> {
     let mut by_ip: HashMap<String, DiscoveredDevice> = HashMap::new();
 
     for obs in observations {
-        let vendor = obs.mac.as_deref().and_then(guess_vendor).map(String::from);
+        let (vendor_id, vendor_name) = resolve_vendor(obs.mac.as_deref(), catalog);
         let entry = by_ip.entry(obs.ip.clone()).or_insert_with(|| {
             let device_id = format!("net-{}", obs.ip.replace('.', "-"));
             let display_name = obs
                 .hostname
                 .clone()
                 .unwrap_or_else(|| format!("Host {}", obs.ip));
-            let (kind, category_title, category_icon, script_id) = classify_with_engine(
+            let (mut kind, category_title, mut category_icon, script_id) = classify_with_engine(
                 engine,
                 &display_name,
                 &obs.ip,
                 obs.mac.as_deref(),
                 obs.hostname.as_deref(),
-                vendor.as_deref(),
+                vendor_name.as_deref(),
                 &obs.interface,
             );
+
+            let (product_id, product_name) = if let Some(prod) = catalog.match_product(
+                obs.hostname.as_deref().unwrap_or(""),
+                vendor_name.as_deref(),
+                &[],
+            ) {
+                if kind == "network-device" {
+                    kind = prod.category.clone();
+                    category_icon = Some(prod.category_icon.clone());
+                }
+                (Some(prod.id.clone()), Some(prod.name.clone()))
+            } else {
+                (None, None)
+            };
 
             DiscoveredDevice {
                 device_id,
@@ -498,16 +537,21 @@ fn aggregate_and_classify(
                 mac: obs.mac.clone(),
                 hostname: obs.hostname.clone(),
                 interface: obs.interface.clone(),
-                vendor: vendor.clone(),
+                vendor: vendor_name.clone(),
                 capabilities: vec!["ip".to_string()],
                 source: obs.source.clone(),
                 web_url: None,
+                product_id,
+                product_name,
+                vendor_id: vendor_id.clone(),
             }
         });
 
         if entry.mac.is_none() && obs.mac.is_some() {
             entry.mac = obs.mac.clone();
-            entry.vendor = obs.mac.as_deref().and_then(guess_vendor).map(String::from);
+            let (v_id, v_name) = resolve_vendor(obs.mac.as_deref(), catalog);
+            entry.vendor = v_name;
+            entry.vendor_id = v_id;
             let (kind, category_title, category_icon, script_id) = classify_with_engine(
                 engine,
                 &entry.display_name,
@@ -521,6 +565,21 @@ fn aggregate_and_classify(
             entry.category_title = category_title;
             entry.category_icon = category_icon;
             entry.script_id = script_id;
+
+            if entry.product_id.is_none() {
+                if let Some(prod) = catalog.match_product(
+                    entry.hostname.as_deref().unwrap_or(""),
+                    entry.vendor.as_deref(),
+                    &[],
+                ) {
+                    if entry.kind == "network-device" {
+                        entry.kind = prod.category.clone();
+                        entry.category_icon = Some(prod.category_icon.clone());
+                    }
+                    entry.product_id = Some(prod.id.clone());
+                    entry.product_name = Some(prod.name.clone());
+                }
+            }
         }
 
         if (entry.hostname.is_none() || entry.display_name.starts_with("Host "))
@@ -542,6 +601,21 @@ fn aggregate_and_classify(
                 entry.category_title = category_title;
                 entry.category_icon = category_icon;
                 entry.script_id = script_id;
+
+                if entry.product_id.is_none() {
+                    if let Some(prod) = catalog.match_product(
+                        entry.hostname.as_deref().unwrap_or(""),
+                        entry.vendor.as_deref(),
+                        &[],
+                    ) {
+                        if entry.kind == "network-device" {
+                            entry.kind = prod.category.clone();
+                            entry.category_icon = Some(prod.category_icon.clone());
+                        }
+                        entry.product_id = Some(prod.id.clone());
+                        entry.product_name = Some(prod.name.clone());
+                    }
+                }
             }
         }
 
@@ -874,5 +948,28 @@ mod tests {
             assert_eq!(title.as_deref(), Some(expected_title), "Title mismatch for {host}");
             assert_eq!(icon.as_deref(), Some(expected_icon), "Icon mismatch for {host}");
         }
+    }
+
+    #[test]
+    fn resolves_vendor_and_product_from_catalog() {
+        let catalog = homenode_definitions::CatalogDatabase::load_from_path("../../definitions/catalog.json")
+            .expect("bundle catalog");
+        let engine = homenode_definitions::RhaiDeviceEngine::new();
+
+        let obs = vec![RawObservation {
+            ip: "192.168.178.95".to_string(),
+            mac: Some("c4:5b:be:aa:bb:cc".to_string()),
+            interface: "en0".to_string(),
+            hostname: Some("shellypro3em.fritz.box".to_string()),
+            source: "arp".to_string(),
+        }];
+
+        let devices = aggregate_and_classify(obs, &engine, &catalog);
+        assert_eq!(devices.len(), 1);
+        let dev = &devices[0];
+        assert_eq!(dev.vendor_id.as_deref(), Some("shelly"));
+        assert!(dev.vendor.as_deref().unwrap().contains("Shelly"));
+        assert_eq!(dev.product_id.as_deref(), Some("shelly_pro_3em"));
+        assert_eq!(dev.product_name.as_deref(), Some("Shelly Pro 3EM"));
     }
 }

@@ -52,8 +52,12 @@ struct WebState {
     docs_path: PathBuf,
     links_path: PathBuf,
     definitions_dir: PathBuf,
+    #[allow(dead_code)]
+    catalog_path: PathBuf,
+    catalog_overrides_path: PathBuf,
     docs_store: Arc<RwLock<HashMap<String, DeviceDocumentation>>>,
     links_store: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    catalog_store: Arc<RwLock<homenode_definitions::CatalogDatabase>>,
 }
 
 #[tokio::main]
@@ -91,11 +95,25 @@ async fn main() -> Result<()> {
     let docs_path = data_dir.join("device_documentation.json");
     let links_path = data_dir.join("device_links.json");
     let definitions_dir = workspace_root.join("definitions").join("devices");
+    let catalog_path = workspace_root.join("definitions").join("catalog.json");
+    let catalog_overrides_path = data_dir.join("catalog_overrides.json");
 
     let initial_docs = load_json_map(&docs_path);
     let initial_links = load_json_map(&links_path);
+    let mut initial_catalog = if catalog_path.exists() {
+        homenode_definitions::CatalogDatabase::load_from_path(&catalog_path).unwrap_or_default()
+    } else {
+        homenode_definitions::CatalogDatabase::new()
+    };
+    if catalog_overrides_path.exists() {
+        if let Ok(overrides) = homenode_definitions::CatalogDatabase::load_from_path(&catalog_overrides_path) {
+            initial_catalog.merge(overrides);
+        }
+    }
+
     let docs_store = Arc::new(RwLock::new(initial_docs));
     let links_store = Arc::new(RwLock::new(initial_links));
+    let catalog_store = Arc::new(RwLock::new(initial_catalog));
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     client
@@ -108,9 +126,14 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(devices_handler))
+        .route("/catalog", get(catalog_handler))
         .route("/status", get(status_handler))
         .route("/scan", post(scan_trigger_form_handler))
         .route("/api/scan", post(scan_trigger_api_handler))
+        .route("/api/catalog", get(get_catalog_handler))
+        .route("/api/catalog/vendor", post(add_vendor_handler))
+        .route("/api/catalog/product", post(add_product_handler))
+        .route("/api/devices/:id/assign-product", post(assign_device_product_handler))
         .route(
             "/api/devices/:id/documentation",
             get(get_device_doc_handler).post(save_device_doc_handler),
@@ -125,8 +148,11 @@ async fn main() -> Result<()> {
             docs_path,
             links_path,
             definitions_dir,
+            catalog_path,
+            catalog_overrides_path,
             docs_store,
             links_store,
+            catalog_store,
         });
 
     axum::serve(listener, app).await?;
@@ -188,10 +214,17 @@ async fn trigger_network_scan(socket_path: &Path) -> Result<()> {
 async fn devices_handler(State(state): State<WebState>) -> Html<String> {
     let docs = state.docs_store.read().await.clone();
     let links = state.links_store.read().await.clone();
+    let catalog = state.catalog_store.read().await.clone();
     let body = match load_snapshot(&state.socket_path).await {
-        Ok(snapshot) => render_devices_page(&state.status_title, &snapshot, &docs, &links),
+        Ok(snapshot) => render_devices_page(&state.status_title, &snapshot, &docs, &links, &catalog),
         Err(error) => render_error(&state.status_title, "devices", &error.to_string()),
     };
+    Html(body)
+}
+
+async fn catalog_handler(State(state): State<WebState>) -> Html<String> {
+    let catalog = state.catalog_store.read().await.clone();
+    let body = render_catalog_page(&state.status_title, &catalog);
     Html(body)
 }
 
@@ -295,6 +328,80 @@ async fn unlink_devices_handler(
             .into_response();
     }
     Json(serde_json::json!({"status": "unlinked"})).into_response()
+}
+
+// ------------------------------------------------------------------------------------------------
+// Vendor & Product Catalog API Handlers
+// ------------------------------------------------------------------------------------------------
+
+async fn get_catalog_handler(State(state): State<WebState>) -> Response {
+    let catalog = state.catalog_store.read().await;
+    Json(&*catalog).into_response()
+}
+
+async fn add_vendor_handler(
+    State(state): State<WebState>,
+    Json(vendor): Json<homenode_definitions::Vendor>,
+) -> Response {
+    let mut catalog = state.catalog_store.write().await;
+    catalog.add_or_update_vendor(vendor);
+    if let Err(err) = catalog.save_to_path(&state.catalog_overrides_path) {
+        error!("Failed to persist catalog overrides: {err}");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({"status": "saved"})).into_response()
+}
+
+async fn add_product_handler(
+    State(state): State<WebState>,
+    Json(product): Json<homenode_definitions::Product>,
+) -> Response {
+    let mut catalog = state.catalog_store.write().await;
+    catalog.add_or_update_product(product);
+    if let Err(err) = catalog.save_to_path(&state.catalog_overrides_path) {
+        error!("Failed to persist catalog overrides: {err}");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({"status": "saved"})).into_response()
+}
+
+#[derive(Deserialize)]
+struct AssignProductRequest {
+    doc_key: String,
+    product_id: String,
+}
+
+async fn assign_device_product_handler(
+    AxumPath(device_id): AxumPath<String>,
+    State(state): State<WebState>,
+    Json(payload): Json<AssignProductRequest>,
+) -> Response {
+    let catalog = state.catalog_store.read().await;
+    if let Some(product) = catalog.find_product(&payload.product_id) {
+        if let Some(doc_url) = &product.documentation_url {
+            let mut docs = state.docs_store.write().await;
+            let entry = docs.entry(payload.doc_key).or_default();
+            if entry.manual_url.is_none() || entry.manual_url.as_deref() == Some("") {
+                entry.manual_url = Some(doc_url.clone());
+                entry.updated_at = chrono::Utc::now().to_rfc3339();
+                let _ = persist_json(&state.docs_path, &*docs);
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "status": "assigned",
+        "device_id": device_id,
+        "product_id": payload.product_id
+    }))
+    .into_response()
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -836,6 +943,7 @@ fn build_unified_devices(
 
 fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
     let devices_active = if current_tab == "devices" { "class=\"active\"" } else { "" };
+    let catalog_active = if current_tab == "catalog" { "class=\"active\"" } else { "" };
     let status_active = if current_tab == "status" { "class=\"active\"" } else { "" };
     format!(
         r#"<!DOCTYPE html>
@@ -1183,6 +1291,7 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
         <h1>{title}</h1>
         <nav>
             <a href="/" {devices_active}>Detected Devices</a>
+            <a href="/catalog" {catalog_active}>Hardware Catalog</a>
             <a href="/status" {status_active}>System Status</a>
         </nav>
     </header>
@@ -1259,6 +1368,7 @@ fn render_devices_page(
     snapshot: &RuntimeSnapshot,
     docs: &HashMap<String, DeviceDocumentation>,
     links: &HashMap<String, Vec<String>>,
+    catalog: &homenode_definitions::CatalogDatabase,
 ) -> String {
     if snapshot.devices.is_empty() {
         let content = r#"
@@ -1343,6 +1453,36 @@ fn render_devices_page(
             let doc_key = if !mac.is_empty() { mac.clone() } else { p.device_id.clone() };
             let doc = docs.get(&doc_key).cloned().unwrap_or_default();
 
+            // Match product
+            let prod_match = p.metadata.get("product_id").and_then(|id| catalog.find_product(id)).or_else(|| {
+                catalog.match_product(
+                    p.metadata.get("hostname").map(|s| s.as_str()).unwrap_or(&p.display_name),
+                    p.metadata.get("vendor").map(|s| s.as_str()),
+                    &[],
+                )
+            });
+
+            let product_json = prod_match.map(|prod| {
+                let v = catalog.find_vendor(&prod.vendor_id);
+                serde_json::json!({
+                    "id": prod.id,
+                    "name": prod.name,
+                    "model_number": prod.model_number,
+                    "category": prod.category,
+                    "category_icon": prod.category_icon,
+                    "connectivity": prod.connectivity,
+                    "matter_device_type": prod.matter_device_type,
+                    "default_ports": prod.default_ports,
+                    "documentation_url": prod.documentation_url,
+                    "specs": prod.specs,
+                    "rhai_script_ref": prod.rhai_script_ref,
+                    "vendor_id": prod.vendor_id,
+                    "vendor_name": v.map(|ven| ven.name.clone()).unwrap_or_else(|| prod.vendor_id.clone()),
+                    "vendor_website": v.and_then(|ven| ven.website.clone()),
+                    "vendor_icon": v.map(|ven| ven.icon.clone()).unwrap_or_else(|| "🏢".to_string()),
+                })
+            });
+
             let secondaries_json: Vec<serde_json::Value> = udev.secondary_interfaces.iter().map(|s| {
                 serde_json::json!({
                     "device_id": s.device_id,
@@ -1381,11 +1521,24 @@ fn render_devices_page(
                 "updated_at": doc.updated_at,
                 "secondaries": secondaries_json,
                 "candidate": candidate_json,
+                "product": product_json,
             })
         })
         .collect();
 
     let client_devices_json = serde_json::to_string(&client_devices).unwrap_or_else(|_| "[]".to_string());
+
+    let all_products_json: Vec<serde_json::Value> = catalog.products.iter().map(|prod| {
+        let v = catalog.find_vendor(&prod.vendor_id);
+        serde_json::json!({
+            "id": prod.id,
+            "vendor_id": prod.vendor_id,
+            "vendor_name": v.map(|ven| ven.name.clone()).unwrap_or_else(|| prod.vendor_id.clone()),
+            "name": prod.name,
+            "category": prod.category,
+        })
+    }).collect();
+    let all_products_str = serde_json::to_string(&all_products_json).unwrap_or_else(|_| "[]".to_string());
 
     // Right side device list groups
     let mut group_cards_html = String::new();
@@ -1479,6 +1632,7 @@ fn render_devices_page(
         r#"
     <script>
     const allDevices = {};
+    const allProducts = {};
     let currentCategory = 'all';
     let selectedDeviceId = null;
 
@@ -1544,6 +1698,57 @@ fn render_devices_page(
             webBtn = `<div style="margin-top:10px;"><a href="${{dev.web_url}}" target="_blank" class="btn btn-primary btn-sm" style="font-size:12px; width:100%; justify-content:center;">🌐 Open Web Interface</a></div>`;
         }}
 
+        // Hardware Product Profile
+        let productCard = '';
+        if (dev.product) {{
+            const p = dev.product;
+            let matterBadge = '';
+            if (p.matter_device_type) {{
+                matterBadge = `<span class="badge" style="background:#059669; color:#fff; font-size:11px; margin-top:4px;">✨ Matter: ${{escapeHtml(p.matter_device_type)}}</span> `;
+            }}
+            let vendorLink = escapeHtml(p.vendor_name);
+            if (p.vendor_website) {{
+                vendorLink = `<a href="${{p.vendor_website}}" target="_blank" style="color:var(--primary); text-decoration:none; font-weight:600;">${{p.vendor_icon || '🏢'}} ${{escapeHtml(p.vendor_name)}} ↗</a>`;
+            }}
+            let docBtn = '';
+            if (p.documentation_url) {{
+                docBtn = `<div style="margin-top:6px;"><a href="${{p.documentation_url}}" target="_blank" class="btn btn-sm" style="background:var(--badge-bg); color:var(--text); font-size:11px; text-decoration:none;">📖 Official Product Manual / Specs ↗</a></div>`;
+            }}
+            let specsText = p.specs ? `<p style="font-size:12px; color:var(--muted); margin-top:4px;">${{escapeHtml(p.specs)}}</p>` : '';
+            let modelText = p.model_number ? `<span style="font-size:11px; color:var(--muted);">&bull; Model: <code>${{escapeHtml(p.model_number)}}</code></span>` : '';
+
+            productCard = `
+                <div class="inspector-sec" style="background:var(--primary-bg); border:1px solid rgba(37,99,235,0.2); border-radius:8px; padding:12px; margin-top:12px;">
+                    <div class="inspector-title" style="margin-bottom:4px;">
+                        <span style="color:var(--primary);">🏷️ Hardware Product Profile</span>
+                        <span class="badge badge-kind" style="font-size:10px;">${{p.category}}</span>
+                    </div>
+                    <div style="font-size:14px; font-weight:700;">${{escapeHtml(p.name)}} ${{modelText}}</div>
+                    <div style="font-size:12px; margin-top:2px;">${{vendorLink}}</div>
+                    ${{matterBadge}}
+                    ${{specsText}}
+                    ${{docBtn}}
+                </div>
+            `;
+        }}
+
+        // Product assignment dropdown
+        let productOptions = '<option value="">-- Associate Product / Model --</option>';
+        if (typeof allProducts !== 'undefined') {{
+            allProducts.forEach(prod => {{
+                const sel = (dev.product && dev.product.id === prod.id) ? 'selected' : '';
+                productOptions += `<option value="${{prod.id}}" ${{sel}}>${{prod.vendor_name || prod.vendor_id}}: ${{prod.name}}</option>`;
+            }});
+        }}
+        let assignBox = `
+            <div style="margin-top:8px; display:flex; gap:6px;">
+                <select id="insp-assign-prod" class="form-control" style="font-size:11px; padding:4px 6px;">
+                    ${{productOptions}}
+                </select>
+                <button type="button" class="btn btn-sm" style="font-size:11px; padding:4px 8px;" onclick="assignProduct('${{dev.device_id}}', '${{dev.doc_key}}')">Assign</button>
+            </div>
+        `;
+
         // Secondary / Linked Interfaces
         let ifacesHtml = `
             <div class="iface-card">
@@ -1592,6 +1797,8 @@ fn render_devices_page(
                     </div>
                 </div>
                 ${{webBtn}}
+                ${{productCard}}
+                ${{assignBox}}
             </div>
 
             <!-- Network Interfaces -->
@@ -1788,6 +1995,19 @@ fn render_devices_page(
         }}
     }}
 
+    async function assignProduct(deviceId, docKey) {{
+        const prodId = document.getElementById('insp-assign-prod').value;
+        if (!prodId) return;
+        const res = await fetch(`/api/devices/${{deviceId}}/assign-product`, {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ doc_key: docKey, product_id: prodId }})
+        }});
+        if (res.ok) {{
+            window.location.reload();
+        }}
+    }}
+
     // Initial load: select device from hash or first available device
     window.addEventListener('DOMContentLoaded', () => {{
         const hash = (window.location.hash || '').replace('#', '');
@@ -1799,7 +2019,8 @@ fn render_devices_page(
     }});
     </script>
     "#,
-        client_devices_json
+        client_devices_json,
+        all_products_str
     );
 
     let content = format!(
@@ -1878,6 +2099,405 @@ fn render_status_page(title: &str, snapshot: &RuntimeSnapshot) -> String {
     );
 
     page_layout(title, "status", &content)
+}
+
+fn render_catalog_page(
+    title: &str,
+    catalog: &homenode_definitions::CatalogDatabase,
+) -> String {
+    let matter_count = catalog
+        .products
+        .iter()
+        .filter(|p| p.matter_device_type.is_some())
+        .count();
+
+    let mut vendor_cards = String::new();
+    let mut vendor_options = String::new();
+
+    for v in &catalog.vendors {
+        vendor_options.push_str(&format!(
+            r#"<option value="{}">{} {}</option>"#,
+            v.id, v.icon, v.name
+        ));
+
+        let prods = catalog.products_for_vendor(&v.id);
+        let website_link = if let Some(w) = &v.website {
+            format!(r#"<a href="{w}" target="_blank" style="color:var(--primary); text-decoration:none; font-size:13px; font-weight:600;">🌐 Website ↗</a>"#)
+        } else {
+            String::new()
+        };
+
+        let support_link = if let Some(s) = &v.support_url {
+            format!(r#" <a href="{s}" target="_blank" style="color:var(--muted); text-decoration:none; font-size:13px;">[Support] ↗</a>"#)
+        } else {
+            String::new()
+        };
+
+        let mut protocols_badges = String::new();
+        for proto in &v.protocols {
+            protocols_badges.push_str(&format!(r#"<span class="badge" style="font-size:11px;">{proto}</span> "#));
+        }
+
+        let mut oui_str = String::new();
+        if !v.oui_prefixes.is_empty() {
+            let prefixes = v.oui_prefixes.iter().map(|p| format!("<code>{p}</code>")).collect::<Vec<_>>().join(", ");
+            oui_str = format!(r#"<div style="font-size:11px; color:var(--muted); margin-top:4px;">MAC Prefixes: {prefixes}</div>"#);
+        }
+
+        let desc_html = if let Some(d) = &v.description {
+            format!(r#"<p style="font-size:13px; color:var(--muted); margin-top:6px; margin-bottom:12px;">{d}</p>"#)
+        } else {
+            String::new()
+        };
+
+        let mut prod_rows = String::new();
+        for p in &prods {
+            let matter_badge = if let Some(m) = &p.matter_device_type {
+                format!(r#"<br><span class="badge" style="background:#059669; color:#fff; font-size:10px; margin-top:3px;">✨ Matter: {m}</span>"#)
+            } else {
+                String::new()
+            };
+
+            let doc_link = if let Some(d) = &p.documentation_url {
+                format!(r#"<a href="{d}" target="_blank" class="btn-sm btn-web" style="text-decoration:none;">📖 Manual ↗</a>"#)
+            } else {
+                "-".to_string()
+            };
+
+            let conn_badges = p.connectivity.iter().map(|c| format!(r#"<span class="badge" style="font-size:10px;">{c}</span>"#)).collect::<Vec<_>>().join(" ");
+            let ports_str = if p.default_ports.is_empty() {
+                "-".to_string()
+            } else {
+                p.default_ports.iter().map(|port| port.to_string()).collect::<Vec<_>>().join(", ")
+            };
+
+            let model_str = p.model_number.as_deref().unwrap_or("-");
+            let specs_str = p.specs.as_deref().unwrap_or("-");
+
+            prod_rows.push_str(&format!(
+                r#"<tr>
+                    <td><strong>{} {}</strong>{}<br><small style="color:var(--muted)">Model: <code>{}</code></small></td>
+                    <td><span class="badge badge-kind">{}</span></td>
+                    <td>{}</td>
+                    <td><code>{}</code></td>
+                    <td style="max-width:320px; font-size:12px; color:var(--muted);">{}</td>
+                    <td style="text-align:right;">{}</td>
+                </tr>"#,
+                p.category_icon, p.name, matter_badge, model_str, p.category, conn_badges, ports_str, specs_str, doc_link
+            ));
+        }
+
+        let products_table = if prod_rows.is_empty() {
+            r#"<div style="font-size:12px; color:var(--muted); font-style:italic;">No registered products under this vendor yet.</div>"#.to_string()
+        } else {
+            format!(
+                r#"<div style="overflow-x:auto;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Product Model</th>
+                                <th>Category</th>
+                                <th>Connectivity</th>
+                                <th>Default Ports</th>
+                                <th>Specifications</th>
+                                <th style="text-align:right;">Documentation</th>
+                            </tr>
+                        </thead>
+                        <tbody>{}</tbody>
+                    </table>
+                </div>"#,
+                prod_rows
+            )
+        };
+
+        vendor_cards.push_str(&format!(
+            r#"<div class="card vendor-card" data-name="{}" data-id="{}">
+                <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px; margin-bottom:8px;">
+                    <div>
+                        <h3 style="font-size:18px; display:flex; align-items:center; gap:8px;">
+                            <span>{}</span> <span>{}</span>
+                        </h3>
+                        <div style="margin-top:4px;">{} {}</div>
+                        {}
+                    </div>
+                    <div>{}</div>
+                </div>
+                {}
+                <div style="margin-top:10px;">
+                    <div style="font-size:12px; font-weight:600; color:var(--muted); text-transform:uppercase; margin-bottom:6px;">
+                        Known Hardware Models ({}):
+                    </div>
+                    {}
+                </div>
+            </div>"#,
+            v.name.to_lowercase(), v.id,
+            v.icon, v.name,
+            website_link, support_link,
+            oui_str,
+            protocols_badges,
+            desc_html,
+            prods.len(),
+            products_table
+        ));
+    }
+
+    let content = format!(
+        r#"
+        <div class="toolbar" style="align-items:flex-start; margin-bottom:20px;">
+            <div>
+                <h2>Vendor & Product Database</h2>
+                <p style="color:var(--muted); font-size:13px;">
+                    Central smart hardware profiles, IEEE OUI manufacturer mappings, Matter profiles, and product specifications.
+                </p>
+                <div style="display:flex; gap:10px; margin-top:8px; flex-wrap:wrap;">
+                    <span class="badge" style="font-size:12px; padding:4px 10px;">🏢 {} Vendors</span>
+                    <span class="badge" style="font-size:12px; padding:4px 10px;">🔌 {} Hardware Models</span>
+                    <span class="badge" style="font-size:12px; padding:4px 10px; background:#059669; color:#fff;">✨ {} Matter-Certified</span>
+                </div>
+            </div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <button type="button" class="btn btn-primary" onclick="openModal('add-product-modal')">➕ Add Product</button>
+                <button type="button" class="btn" style="background:var(--badge-bg); color:var(--text);" onclick="openModal('add-vendor-modal')">🏢 Add Vendor</button>
+            </div>
+        </div>
+
+        <div style="margin-bottom:20px;">
+            <input type="text" id="catalog-search" class="form-control" placeholder="🔍 Filter vendors, products, protocols, categories..." oninput="filterCatalog()" />
+        </div>
+
+        <div id="vendor-list">
+            {}
+        </div>
+
+        <!-- Add Vendor Modal -->
+        <div id="add-vendor-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:999; overflow-y:auto;">
+            <div class="card" style="max-width:560px; margin:40px auto; padding:24px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+                    <h3>🏢 Add New Hardware Vendor</h3>
+                    <button type="button" class="btn-sm" onclick="closeModal('add-vendor-modal')">✕</button>
+                </div>
+                <form id="add-vendor-form" onsubmit="submitVendor(event)">
+                    <div style="margin-bottom:10px;">
+                        <label style="font-size:12px; font-weight:600;">Vendor ID (slug, e.g. shelly, avm)</label>
+                        <input type="text" id="v-id" class="form-control" required placeholder="acme" />
+                    </div>
+                    <div style="margin-bottom:10px;">
+                        <label style="font-size:12px; font-weight:600;">Vendor Name</label>
+                        <input type="text" id="v-name" class="form-control" required placeholder="Acme Smart Devices Corp" />
+                    </div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px;">
+                        <div>
+                            <label style="font-size:12px; font-weight:600;">Website URL</label>
+                            <input type="url" id="v-web" class="form-control" placeholder="https://..." />
+                        </div>
+                        <div>
+                            <label style="font-size:12px; font-weight:600;">Icon Emoji</label>
+                            <input type="text" id="v-icon" class="form-control" value="🏢" />
+                        </div>
+                    </div>
+                    <div style="margin-bottom:10px;">
+                        <label style="font-size:12px; font-weight:600;">IEEE MAC OUI Prefixes (comma-separated)</label>
+                        <input type="text" id="v-oui" class="form-control" placeholder="00:11:22, 33:44:55" />
+                    </div>
+                    <div style="margin-bottom:10px;">
+                        <label style="font-size:12px; font-weight:600;">Supported Protocols (comma-separated)</label>
+                        <input type="text" id="v-proto" class="form-control" placeholder="wifi, matter, lan, ble" />
+                    </div>
+                    <div style="margin-bottom:14px;">
+                        <label style="font-size:12px; font-weight:600;">Description</label>
+                        <textarea id="v-desc" class="form-control" placeholder="Vendor summary..."></textarea>
+                    </div>
+                    <div style="display:flex; justify-content:flex-end; gap:8px;">
+                        <button type="button" class="btn" style="background:var(--badge-bg); color:var(--text);" onclick="closeModal('add-vendor-modal')">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Save Vendor</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Add Product Modal -->
+        <div id="add-product-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:999; overflow-y:auto;">
+            <div class="card" style="max-width:620px; margin:40px auto; padding:24px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+                    <h3>🔌 Add New Hardware Product</h3>
+                    <button type="button" class="btn-sm" onclick="closeModal('add-product-modal')">✕</button>
+                </div>
+                <form id="add-product-form" onsubmit="submitProduct(event)">
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px;">
+                        <div>
+                            <label style="font-size:12px; font-weight:600;">Manufacturer / Vendor</label>
+                            <select id="p-vendor" class="form-control" required>
+                                {}
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:12px; font-weight:600;">Product ID (slug)</label>
+                            <input type="text" id="p-id" class="form-control" required placeholder="shelly_plus_1" />
+                        </div>
+                    </div>
+                    <div style="display:grid; grid-template-columns:2fr 1fr; gap:10px; margin-bottom:10px;">
+                        <div>
+                            <label style="font-size:12px; font-weight:600;">Product Commercial Name</label>
+                            <input type="text" id="p-name" class="form-control" required placeholder="Shelly Plus 1" />
+                        </div>
+                        <div>
+                            <label style="font-size:12px; font-weight:600;">Model / Part Number</label>
+                            <input type="text" id="p-model" class="form-control" placeholder="SNSW-001X16EU" />
+                        </div>
+                    </div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px;">
+                        <div>
+                            <label style="font-size:12px; font-weight:600;">Category</label>
+                            <select id="p-category" class="form-control">
+                                <option value="energy">Solar & Energy (energy)</option>
+                                <option value="smart-plug">Smart Plugs & Sockets (smart-plug)</option>
+                                <option value="router">Routers & Gateways (router)</option>
+                                <option value="sensor">Sensors & Detectors (sensor)</option>
+                                <option value="lighting">Smart Lighting (lighting)</option>
+                                <option value="hub">Smart Home Hubs (hub)</option>
+                                <option value="nas">Network Storage & NAS (nas)</option>
+                                <option value="display">Smart Displays & Clocks (display)</option>
+                                <option value="computer">Computers & Laptops (computer)</option>
+                                <option value="appliance">Home Appliances (appliance)</option>
+                                <option value="audio">Audio & Speakers (audio)</option>
+                                <option value="network-device">Network & Other Devices</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:12px; font-weight:600;">Category Icon</label>
+                            <input type="text" id="p-icon" class="form-control" value="⚡" />
+                        </div>
+                    </div>
+                    <div style="margin-bottom:10px;">
+                        <label style="font-size:12px; font-weight:600;">Matter Device Type Profile (Optional)</label>
+                        <input type="text" id="p-matter" class="form-control" placeholder="e.g. On/Off Light (0x0100), Electrical Sensor (0x0503)" />
+                    </div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px;">
+                        <div>
+                            <label style="font-size:12px; font-weight:600;">Connectivity (comma-separated)</label>
+                            <input type="text" id="p-conn" class="form-control" placeholder="wifi, lan, bluetooth" />
+                        </div>
+                        <div>
+                            <label style="font-size:12px; font-weight:600;">Default Listening Ports</label>
+                            <input type="text" id="p-ports" class="form-control" placeholder="80, 443" />
+                        </div>
+                    </div>
+                    <div style="margin-bottom:10px;">
+                        <label style="font-size:12px; font-weight:600;">Hostname Patterns (comma-separated substrings for auto-match)</label>
+                        <input type="text" id="p-patterns" class="form-control" placeholder="shellyplus1, shelly-1" />
+                    </div>
+                    <div style="margin-bottom:10px;">
+                        <label style="font-size:12px; font-weight:600;">Official Manual / Documentation URL</label>
+                        <input type="url" id="p-doc" class="form-control" placeholder="https://..." />
+                    </div>
+                    <div style="margin-bottom:14px;">
+                        <label style="font-size:12px; font-weight:600;">Hardware Specifications</label>
+                        <textarea id="p-specs" class="form-control" placeholder="Key technical specifications, voltage, relays..."></textarea>
+                    </div>
+                    <div style="display:flex; justify-content:flex-end; gap:8px;">
+                        <button type="button" class="btn" style="background:var(--badge-bg); color:var(--text);" onclick="closeModal('add-product-modal')">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Save Product</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <script>
+        function filterCatalog() {{
+            const q = (document.getElementById('catalog-search').value || '').toLowerCase();
+            const cards = document.querySelectorAll('.vendor-card');
+            cards.forEach(card => {{
+                const text = card.innerText.toLowerCase();
+                if (!q || text.includes(q)) {{
+                    card.style.display = '';
+                }} else {{
+                    card.style.display = 'none';
+                }}
+            }});
+        }}
+
+        function openModal(id) {{
+            const el = document.getElementById(id);
+            if (el) el.style.display = 'block';
+        }}
+
+        function closeModal(id) {{
+            const el = document.getElementById(id);
+            if (el) el.style.display = 'none';
+        }}
+
+        async function submitVendor(e) {{
+            e.preventDefault();
+            const ouiRaw = document.getElementById('v-oui').value || '';
+            const protoRaw = document.getElementById('v-proto').value || '';
+            const vendor = {{
+                id: document.getElementById('v-id').value.trim(),
+                name: document.getElementById('v-name').value.trim(),
+                website: document.getElementById('v-web').value.trim() || null,
+                support_url: null,
+                icon: document.getElementById('v-icon').value.trim() || '🏢',
+                oui_prefixes: ouiRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
+                protocols: protoRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
+                description: document.getElementById('v-desc').value.trim() || null
+            }};
+
+            const res = await fetch('/api/catalog/vendor', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify(vendor)
+            }});
+
+            if (res.ok) {{
+                window.location.reload();
+            }} else {{
+                alert('Failed to save vendor');
+            }}
+        }}
+
+        async function submitProduct(e) {{
+            e.preventDefault();
+            const connRaw = document.getElementById('p-conn').value || '';
+            const portsRaw = document.getElementById('p-ports').value || '';
+            const patRaw = document.getElementById('p-patterns').value || '';
+
+            const product = {{
+                id: document.getElementById('p-id').value.trim(),
+                vendor_id: document.getElementById('p-vendor').value,
+                name: document.getElementById('p-name').value.trim(),
+                model_number: document.getElementById('p-model').value.trim() || null,
+                category: document.getElementById('p-category').value,
+                category_icon: document.getElementById('p-icon').value.trim() || '🔌',
+                connectivity: connRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
+                matter_device_type: document.getElementById('p-matter').value.trim() || null,
+                default_ports: portsRaw.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n)),
+                hostname_patterns: patRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
+                documentation_url: document.getElementById('p-doc').value.trim() || null,
+                specs: document.getElementById('p-specs').value.trim() || null,
+                rhai_script_ref: null
+            }};
+
+            const res = await fetch('/api/catalog/product', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify(product)
+            }});
+
+            if (res.ok) {{
+                window.location.reload();
+            }} else {{
+                alert('Failed to save product');
+            }}
+        }}
+        </script>
+        "#,
+        catalog.vendors.len(),
+        catalog.products.len(),
+        matter_count,
+        vendor_cards,
+        vendor_options
+    );
+
+    page_layout(title, "catalog", &content)
 }
 
 fn format_health_state(state: i32) -> (&'static str, &'static str) {

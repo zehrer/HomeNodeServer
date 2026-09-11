@@ -1082,6 +1082,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "homenode-definitions",
  "homenode-sdk",
  "serde",
  "serde_json",

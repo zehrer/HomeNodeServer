@@ -109,7 +109,33 @@ async fn main() -> Result<()> {
         tracing::warn!("No Rhai device definitions loaded; using fallback classification");
     }
 
-    let scanner = NetworkScanner::new(scanner_config, std::sync::Arc::new(definitions_engine));
+    let candidate_catalog_paths = [
+        workspace_root.join("definitions").join("catalog.json"),
+        std::path::PathBuf::from("definitions/catalog.json"),
+        std::path::PathBuf::from("../../definitions/catalog.json"),
+    ];
+
+    let mut catalog = homenode_definitions::CatalogDatabase::new();
+    for path in candidate_catalog_paths {
+        if path.exists() {
+            if let Ok(c) = homenode_definitions::CatalogDatabase::load_from_path(&path) {
+                info!(
+                    "Loaded hardware catalog with {} vendors and {} products from {}",
+                    c.vendors.len(),
+                    c.products.len(),
+                    path.display()
+                );
+                catalog = c;
+                break;
+            }
+        }
+    }
+
+    let scanner = NetworkScanner::new(
+        scanner_config,
+        std::sync::Arc::new(definitions_engine),
+        std::sync::Arc::new(catalog),
+    );
 
     // Initial scan
     info!("Running initial network discovery sweep...");
@@ -293,6 +319,15 @@ fn convert_device(
     }
     if let Some(web_url) = device.web_url {
         metadata.insert("web_url".to_string(), web_url);
+    }
+    if let Some(product_id) = device.product_id {
+        metadata.insert("product_id".to_string(), product_id);
+    }
+    if let Some(product_name) = device.product_name {
+        metadata.insert("product_name".to_string(), product_name);
+    }
+    if let Some(vendor_id) = device.vendor_id {
+        metadata.insert("vendor_id".to_string(), vendor_id);
     }
     metadata.insert("category".to_string(), device.kind.clone());
     metadata.insert("source".to_string(), device.source);
