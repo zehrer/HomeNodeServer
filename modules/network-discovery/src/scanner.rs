@@ -32,6 +32,7 @@ pub struct DiscoveredDevice {
     pub vendor: Option<String>,
     pub capabilities: Vec<String>,
     pub source: String,
+    pub web_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +110,11 @@ impl NetworkScanner {
         enrich_hostnames(&mut observations).await;
 
         // 6. Aggregate by IP/MAC and classify devices using Rhai engine
-        let devices = aggregate_and_classify(observations, &self.definitions_engine);
+        let mut devices = aggregate_and_classify(observations, &self.definitions_engine);
+
+        // 7. Probe for web interfaces (ports 80, 5000, 8080, 443)
+        enrich_web_urls(&mut devices).await;
+
         info!("Network scan completed: found {} unique devices", devices.len());
 
         Ok(devices)
@@ -496,6 +501,7 @@ fn aggregate_and_classify(
                 vendor: vendor.clone(),
                 capabilities: vec!["ip".to_string()],
                 source: obs.source.clone(),
+                web_url: None,
             }
         });
 
@@ -561,6 +567,36 @@ fn classify_device(name: &str, ip: &str, mac: Option<&str>) -> String {
     if lower.contains("printer") || lower.contains("epson") || lower.contains("canon") || lower.contains("brother") || lower.contains("hp-") {
         return "printer".to_string();
     }
+    if lower.contains("synology") || lower.contains("diskstation") || lower.contains("rackstation") || vendor.contains("synology") {
+        return "nas".to_string();
+    }
+    if (lower.contains("repeater") || lower.contains("mesh")) && (lower.contains("fritz") || vendor.contains("avm")) {
+        return "router".to_string();
+    }
+    if lower.contains("awtrix") {
+        return "display".to_string();
+    }
+    if lower.contains("meshtastic") {
+        return "radio".to_string();
+    }
+    if lower.contains("everything-presence") || lower.contains("ep1-") || lower.contains("epl-") {
+        return "sensor".to_string();
+    }
+    if lower.contains("fronius") || vendor.contains("fronius") || lower.contains("symo") || lower.contains("gen24") {
+        return "energy".to_string();
+    }
+    if lower.contains("miele") || vendor.contains("miele") {
+        return "appliance".to_string();
+    }
+    if lower.contains("govee") || lower.contains("wiz") || vendor.contains("govee") || lower.starts_with("led-") {
+        return "lighting".to_string();
+    }
+    if lower.contains("switchbot") || vendor.contains("switchbot") || vendor.contains("woan") {
+        return "hub".to_string();
+    }
+    if lower.contains("plug") || lower.contains("outlet") || lower.contains("tasmota") {
+        return "smart-plug".to_string();
+    }
     if lower.contains("camera") || lower.contains("blink") || lower.contains("ring") {
         return "camera".to_string();
     }
@@ -597,14 +633,62 @@ fn guess_vendor(mac: &str) -> Option<&'static str> {
     let prefix: String = norm.split(':').take(3).collect::<Vec<_>>().join(":");
 
     match prefix.as_str() {
-        "b4:fc:7d" | "3c:37:12" | "dc:39:6f" => Some("AVM Fritz!Box"),
+        "b4:fc:7d" | "3c:37:12" | "dc:39:6f" | "9c:c7:a6" | "38:10:d5" => Some("AVM Fritz!Box"),
         "b8:27:eb" | "dc:a6:32" | "e4:5f:01" => Some("Raspberry Pi Foundation"),
-        "24:6f:28" | "24:0a:c4" | "30:ae:a4" => Some("Espressif Inc."),
+        "24:6f:28" | "24:0a:c4" | "30:ae:a4" | "84:0d:8e" | "44:17:93" | "48:55:19" | "e0:98:06"
+        | "c8:2e:18" | "14:08:08" | "88:57:21" | "4c:a9:19" => Some("Espressif Inc."),
         "00:17:88" => Some("Philips Lighting / Hue"),
         "00:11:32" => Some("Synology"),
+        "00:03:ac" => Some("Fronius"),
+        "00:1d:63" => Some("Miele & Cie."),
+        "d0:c9:07" | "ec:2c:e2" => Some("Govee / Intellirocks"),
+        "18:8b:0e" => Some("SwitchBot / Woan Tech"),
+        "10:20:ba" => Some("Meshtastic / Heltec"),
         "cc:40:85" | "a0:85:e3" | "be:39:d4" | "90:dd:5d" => Some("Apple Inc."),
         _ => None,
     }
+}
+
+async fn enrich_web_urls(devices: &mut [DiscoveredDevice]) {
+    let mut join_set = JoinSet::new();
+    let sem = Arc::new(Semaphore::new(32));
+
+    for (idx, dev) in devices.iter().enumerate() {
+        if let Ok(ip) = dev.ip.parse::<Ipv4Addr>() {
+            let permit_sem = sem.clone();
+            join_set.spawn(async move {
+                let _permit = permit_sem.acquire().await;
+                let url = probe_web_url(ip).await;
+                (idx, url)
+            });
+        }
+    }
+
+    while let Some(res) = join_set.join_next().await {
+        if let Ok((idx, Some(url))) = res {
+            if idx < devices.len() {
+                devices[idx].web_url = Some(url);
+            }
+        }
+    }
+}
+
+async fn probe_web_url(ip: Ipv4Addr) -> Option<String> {
+    // Check common web ports in priority order: 80, 5000 (Synology DSM), 8080 (Alt HTTP), 443 (HTTPS)
+    for (port, scheme) in [(80, "http"), (5000, "http"), (8080, "http"), (443, "https")] {
+        let addr = SocketAddr::new(IpAddr::V4(ip), port);
+        if tokio::time::timeout(Duration::from_millis(100), TcpStream::connect(addr))
+            .await
+            .is_ok_and(|r| r.is_ok())
+        {
+            return if port == 80 || port == 443 {
+                Some(format!("{scheme}://{ip}"))
+            } else {
+                Some(format!("{scheme}://{ip}:{port}"))
+            };
+        }
+    }
+    None
 }
 
 fn normalize_mac(mac: &str) -> String {
@@ -735,5 +819,42 @@ mod tests {
         assert_eq!(kind_tab, "tablet");
         assert_eq!(title_tab.as_deref(), Some("Tablets"));
         assert_eq!(icon_tab.as_deref(), Some("📟"));
+    }
+
+    #[test]
+    fn classifies_user_devices_from_rhai_definitions_directory() {
+        let mut engine = homenode_definitions::RhaiDeviceEngine::new();
+        let loaded = engine.load_from_dir("../../definitions/devices").unwrap();
+        assert!(loaded >= 11, "Expected at least 11 definition scripts loaded, got {loaded}");
+
+        let cases = [
+            ("outlet01.fritz.box", "smart-plug", "Smart Plugs & Sockets", "🔌"),
+            ("synologynas.fritz.box", "nas", "Network Storage & NAS", "🗄️"),
+            ("repeater-eg.fritz.box", "router", "Routers & Gateways", "🌐"),
+            ("awtrix-126650.fritz.box", "display", "Smart Clocks & Displays", "⏰"),
+            ("switchbot-hub-2-327118.fritz.box", "hub", "Smart Home Hubs", "🎛️"),
+            ("meshtastic-0ca8a0.fritz.box", "radio", "LoRa & Mesh Radios", "📻"),
+            ("everything-presence-wc.fritz.box", "sensor", "Sensors & Detectors", "👁️"),
+            ("fronius.fritz.box", "energy", "Solar & Energy Systems", "☀️"),
+            ("miele.fritz.box", "appliance", "Home Appliances", "🧺"),
+            ("led-govee-sophie.fritz.box", "lighting", "Smart Lighting", "💡"),
+            ("led-wiz-ug.fritz.box", "lighting", "Smart Lighting", "💡"),
+        ];
+
+        for (host, expected_cat, expected_title, expected_icon) in cases {
+            let vendor = if host.contains("repeater") { Some("AVM Fritz!Box") } else { None };
+            let (cat, title, icon, _) = classify_with_engine(
+                &engine,
+                host,
+                "192.168.178.100",
+                None,
+                Some(host),
+                vendor,
+                "en0",
+            );
+            assert_eq!(cat, expected_cat, "Mismatch for {host}: got {cat} expected {expected_cat}");
+            assert_eq!(title.as_deref(), Some(expected_title), "Title mismatch for {host}");
+            assert_eq!(icon.as_deref(), Some(expected_icon), "Icon mismatch for {host}");
+        }
     }
 }

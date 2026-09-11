@@ -7,8 +7,10 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+chrono = { workspace = true }
 homenode-sdk = { path = "../../crates/homenode-sdk" }
-serde.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio.workspace = true
 toml.workspace = true
 tonic.workspace = true

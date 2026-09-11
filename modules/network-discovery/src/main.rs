@@ -291,6 +291,9 @@ fn convert_device(
     if let Some(script_id) = device.script_id {
         metadata.insert("script_id".to_string(), script_id);
     }
+    if let Some(web_url) = device.web_url {
+        metadata.insert("web_url".to_string(), web_url);
+    }
     metadata.insert("category".to_string(), device.kind.clone());
     metadata.insert("source".to_string(), device.source);
 
