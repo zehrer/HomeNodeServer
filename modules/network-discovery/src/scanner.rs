@@ -1557,6 +1557,7 @@ mod tests {
             ("ipadm2.fritz.box", "tablet", "Tablets", "📟"),
             ("ipadm5.fritz.box", "tablet", "Tablets", "📟"),
             ("hensoldt-steffi.fritz.box", "computer", "Computers & Laptops", "💻"),
+            ("edgy0020071074.fritz.box", "energy", "Solar & Energy Systems", "☀️"),
         ];
 
         for (host, expected_cat, expected_title, expected_icon) in cases {

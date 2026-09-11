@@ -339,6 +339,15 @@ mod tests {
             let hp_laptop = catalog.match_product("hensoldt-steffi.fritz.box", Some("HP Inc."), &[]);
             assert!(hp_laptop.is_some());
             assert_eq!(hp_laptop.unwrap().id, "hp_business_laptop");
+
+            // Test Discovergy Smart Meter Gateway lookup & product match
+            let disc_vendor = catalog.find_vendor_by_mac("2c:dd:0c:a5:94:64");
+            assert!(disc_vendor.is_some());
+            assert_eq!(disc_vendor.unwrap().id, "discovergy");
+
+            let disc_gateway = catalog.match_product("edgy0020071074.fritz.box", Some("Discovergy GmbH"), &[]);
+            assert!(disc_gateway.is_some());
+            assert_eq!(disc_gateway.unwrap().id, "discovergy_edgy_gateway");
         }
     }
 }

@@ -219,6 +219,16 @@
       "oui_prefixes": ["7c:1e:52", "00:15:5d", "dc:98:40"],
       "protocols": ["wifi", "lan", "bluetooth"],
       "description": "Windows computing hardware, Surface workstations, and enterprise operating system ecosystem."
+    },
+    {
+      "id": "discovergy",
+      "name": "Discovergy GmbH",
+      "website": "https://discovergy.com",
+      "support_url": "https://discovergy.com/kontakt",
+      "icon": "⚡",
+      "oui_prefixes": ["2c:dd:0c"],
+      "protocols": ["lan", "tls"],
+      "description": "German smart metering operator and hardware manufacturer of intelligent electricity meters and EDGY communication gateways."
     }
   ],
   "products": [
@@ -671,6 +681,21 @@
       "documentation_url": "https://support.microsoft.com/windows",
       "specs": "Windows workstation running Windows 11/10 protected by Windows Defender and hardware firewall.",
       "rhai_script_ref": "computer.rhai"
+    },
+    {
+      "id": "discovergy_edgy_gateway",
+      "vendor_id": "discovergy",
+      "name": "Discovergy EDGY Smart Meter Gateway",
+      "model_number": "EDGY Gateway (Smart Metering)",
+      "category": "energy",
+      "category_icon": "⚡",
+      "connectivity": ["lan"],
+      "matter_device_type": null,
+      "default_ports": [],
+      "hostname_patterns": ["edgy", "discovergy"],
+      "documentation_url": "https://discovergy.com",
+      "specs": "Dedicated smart meter communication gateway transmitting encrypted real-time electricity generation and consumption data.",
+      "rhai_script_ref": "discovergy_meter.rhai"
     }
   ]
 }
