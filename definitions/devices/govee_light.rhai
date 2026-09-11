@@ -18,4 +18,6 @@ fn identify(obs) {
         || host.contains("govee")
         || vendor.contains("govee")
         || host.starts_with("led-govee")
+        || host.contains("h600d")
+        || name.contains("h600d")
 }

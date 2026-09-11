@@ -403,6 +403,21 @@
       "rhai_script_ref": "govee_light.rhai"
     },
     {
+      "id": "govee_h600d",
+      "vendor_id": "govee",
+      "name": "Govee Smart LED Bulb (Matter)",
+      "model_number": "H600D",
+      "category": "lighting",
+      "category_icon": "💡",
+      "connectivity": ["wifi", "bluetooth", "matter"],
+      "matter_device_type": "Color Temperature Light (0x010C)",
+      "default_ports": [5540],
+      "hostname_patterns": ["h600d", "govee-h600d"],
+      "documentation_url": "https://www.govee.com/products/govee-wi-fi-bluetooth-led-bulb",
+      "specs": "Smart RGBWW LED light bulb with native Matter over Wi-Fi, 16M colors, tunable white 2700K-6500K, and app control.",
+      "rhai_script_ref": "govee_light.rhai"
+    },
+    {
       "id": "wiz_smart_light",
       "vendor_id": "wiz",
       "name": "WiZ Connected Smart LED Light",

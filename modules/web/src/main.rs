@@ -42,6 +42,8 @@ pub struct DeviceDocumentation {
     #[serde(default)]
     pub manual_url: Option<String>,
     #[serde(default)]
+    pub product_id: Option<String>,
+    #[serde(default)]
     pub updated_at: String,
 }
 
@@ -277,9 +279,11 @@ async fn save_device_doc_handler(
 ) -> Response {
     let mut store = state.docs_store.write().await;
     let now = chrono::Utc::now().to_rfc3339();
+    let existing_prod = store.get(&device_id).and_then(|d| d.product_id.clone());
     let entry = DeviceDocumentation {
         notes: payload.notes,
         manual_url: payload.manual_url.filter(|u| !u.trim().is_empty()),
+        product_id: existing_prod,
         updated_at: now,
     };
     store.insert(device_id, entry);
@@ -423,15 +427,16 @@ async fn assign_device_product_handler(
 ) -> Response {
     let catalog = state.catalog_store.read().await;
     if let Some(product) = catalog.find_product(&payload.product_id) {
+        let mut docs = state.docs_store.write().await;
+        let entry = docs.entry(payload.doc_key).or_default();
+        entry.product_id = Some(product.id.clone());
         if let Some(doc_url) = &product.documentation_url {
-            let mut docs = state.docs_store.write().await;
-            let entry = docs.entry(payload.doc_key).or_default();
             if entry.manual_url.is_none() || entry.manual_url.as_deref() == Some("") {
                 entry.manual_url = Some(doc_url.clone());
-                entry.updated_at = chrono::Utc::now().to_rfc3339();
-                let _ = persist_json(&state.docs_path, &*docs);
             }
         }
+        entry.updated_at = chrono::Utc::now().to_rfc3339();
+        let _ = persist_json(&state.docs_path, &*docs);
     }
     Json(serde_json::json!({
         "status": "assigned",
@@ -1506,14 +1511,16 @@ fn render_devices_page(
 
             let doc = docs.get(&doc_key).cloned().unwrap_or_default();
 
-            // Match product
-            let prod_match = p.metadata.get("product_id").and_then(|id| catalog.find_product(id)).or_else(|| {
-                catalog.match_product(
-                    p.metadata.get("hostname").map(|s| s.as_str()).unwrap_or(&p.display_name),
-                    p.metadata.get("vendor").map(|s| s.as_str()),
-                    &[],
-                )
-            });
+            // Match product (checking manual/doc assignment first, then discovery metadata, then catalog rules)
+            let prod_match = doc.product_id.as_deref().and_then(|id| catalog.find_product(id))
+                .or_else(|| p.metadata.get("product_id").and_then(|id| catalog.find_product(id)))
+                .or_else(|| {
+                    catalog.match_product(
+                        p.metadata.get("hostname").map(|s| s.as_str()).unwrap_or(&p.display_name),
+                        p.metadata.get("vendor").map(|s| s.as_str()),
+                        &[],
+                    )
+                });
 
             let product_json = prod_match.map(|prod| {
                 let v = catalog.find_vendor(&prod.vendor_id);
