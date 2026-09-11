@@ -362,25 +362,48 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
     )
 }
 
-struct CategoryDef {
-    key: &'static str,
-    title: &'static str,
-    icon: &'static str,
+fn default_category_presentation(key: &str) -> (&'static str, &'static str) {
+    match key {
+        "phone" => ("Smartphones", "📱"),
+        "tablet" => ("Tablets", "📟"),
+        "voip-phone" => ("VoIP Phones", "☎️"),
+        "computer" => ("Computers & Laptops", "💻"),
+        "wearable" => ("Wearables", "⌚"),
+        "camera" => ("Cameras", "📷"),
+        "audio" => ("Audio & Speakers", "🔊"),
+        "iot" => ("Smart Home & IoT", "💡"),
+        "printer" => ("Printers", "🖨️"),
+        "streaming" => ("TV & Streaming", "📺"),
+        "router" => ("Routers & Gateways", "🌐"),
+        _ => ("Network & Other Devices", "🔌"),
+    }
 }
 
-const CATEGORIES: &[CategoryDef] = &[
-    CategoryDef { key: "phone", title: "Phones", icon: "☎️" },
-    CategoryDef { key: "camera", title: "Cameras", icon: "📷" },
-    CategoryDef { key: "computer", title: "Computers & Laptops", icon: "💻" },
-    CategoryDef { key: "mobile", title: "Mobile Devices", icon: "📱" },
-    CategoryDef { key: "wearable", title: "Wearables", icon: "⌚" },
-    CategoryDef { key: "audio", title: "Audio & Speakers", icon: "🔊" },
-    CategoryDef { key: "iot", title: "Smart Home & IoT", icon: "💡" },
-    CategoryDef { key: "printer", title: "Printers", icon: "🖨️" },
-    CategoryDef { key: "streaming", title: "TV & Streaming", icon: "📺" },
-    CategoryDef { key: "router", title: "Routers & Gateways", icon: "🌐" },
-    CategoryDef { key: "network-device", title: "Network Infrastructure & Other", icon: "🔌" },
-];
+fn category_sort_order(key: &str) -> u32 {
+    match key {
+        "phone" => 1,
+        "tablet" => 2,
+        "voip-phone" => 3,
+        "computer" => 4,
+        "wearable" => 5,
+        "camera" => 6,
+        "audio" => 7,
+        "iot" => 8,
+        "printer" => 9,
+        "streaming" => 10,
+        "router" => 11,
+        "network-device" => 90,
+        _ => 50, // Custom dynamic script categories appear right before network infrastructure
+    }
+}
+
+#[derive(Clone)]
+struct DynamicCategory {
+    key: String,
+    title: String,
+    icon: String,
+    devices: Vec<homenode_sdk::proto::DeviceRecord>,
+}
 
 fn render_devices_page(title: &str, snapshot: &RuntimeSnapshot) -> String {
     if snapshot.devices.is_empty() {
@@ -397,18 +420,43 @@ fn render_devices_page(title: &str, snapshot: &RuntimeSnapshot) -> String {
         return page_layout(title, "devices", content);
     }
 
-    // Group devices by category
-    let mut groups: std::collections::HashMap<&'static str, Vec<&homenode_sdk::proto::DeviceRecord>> =
+    // Dynamically cluster devices by the category defined in device metadata/scripts
+    let mut category_map: std::collections::HashMap<String, DynamicCategory> =
         std::collections::HashMap::new();
 
     for device in &snapshot.devices {
-        let cat_key = CATEGORIES
-            .iter()
-            .find(|c| c.key == device.kind)
-            .map(|c| c.key)
-            .unwrap_or("network-device");
-        groups.entry(cat_key).or_default().push(device);
+        let cat_key = device
+            .metadata
+            .get("category")
+            .cloned()
+            .unwrap_or_else(|| device.kind.clone());
+
+        let (fallback_title, fallback_icon) = default_category_presentation(&cat_key);
+        let title = device
+            .metadata
+            .get("category_title")
+            .cloned()
+            .unwrap_or_else(|| fallback_title.to_string());
+        let icon = device
+            .metadata
+            .get("category_icon")
+            .cloned()
+            .unwrap_or_else(|| fallback_icon.to_string());
+
+        let entry = category_map
+            .entry(cat_key.clone())
+            .or_insert_with(|| DynamicCategory {
+                key: cat_key,
+                title,
+                icon,
+                devices: Vec::new(),
+            });
+
+        entry.devices.push(device.clone());
     }
+
+    let mut categories: Vec<_> = category_map.into_values().collect();
+    categories.sort_by_key(|c| (category_sort_order(&c.key), c.title.clone()));
 
     // Render filter pills
     let mut pills_html = format!(
@@ -416,22 +464,20 @@ fn render_devices_page(title: &str, snapshot: &RuntimeSnapshot) -> String {
         snapshot.devices.len()
     );
 
-    for cat in CATEGORIES {
-        if let Some(list) = groups.get(cat.key) {
-            pills_html.push_str(&format!(
-                r#"<button type="button" class="pill" onclick="selectCategory('{}', this)">{} {} ({})</button>"#,
-                cat.key, cat.icon, cat.title, list.len()
-            ));
-        }
+    for cat in &categories {
+        pills_html.push_str(&format!(
+            r#"<button type="button" class="pill" onclick="selectCategory('{}', this)">{} {} ({})</button>"#,
+            cat.key, cat.icon, cat.title, cat.devices.len()
+        ));
     }
 
     // Render group cards
     let mut group_cards_html = String::new();
-    for cat in CATEGORIES {
-        if let Some(list) = groups.get(cat.key) {
-            let rows = list
-                .iter()
-                .map(|device| {
+    for cat in &categories {
+        let rows = cat
+            .devices
+            .iter()
+            .map(|device| {
                     let ip = device
                         .metadata
                         .get("ip")
@@ -500,10 +546,9 @@ fn render_devices_page(title: &str, snapshot: &RuntimeSnapshot) -> String {
                 cat.key,
                 cat.icon,
                 cat.title,
-                list.len(),
+                cat.devices.len(),
                 rows
             ));
-        }
     }
 
     let script = r#"

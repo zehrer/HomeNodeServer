@@ -22,6 +22,9 @@ pub struct DiscoveredDevice {
     pub device_id: String,
     pub display_name: String,
     pub kind: String,
+    pub category_title: Option<String>,
+    pub category_icon: Option<String>,
+    pub script_id: Option<String>,
     pub ip: String,
     pub mac: Option<String>,
     pub hostname: Option<String>,
@@ -69,11 +72,18 @@ pub struct RawObservation {
 
 pub struct NetworkScanner {
     config: ScannerConfig,
+    definitions_engine: Arc<homenode_definitions::RhaiDeviceEngine>,
 }
 
 impl NetworkScanner {
-    pub fn new(config: ScannerConfig) -> Self {
-        Self { config }
+    pub fn new(
+        config: ScannerConfig,
+        definitions_engine: Arc<homenode_definitions::RhaiDeviceEngine>,
+    ) -> Self {
+        Self {
+            config,
+            definitions_engine,
+        }
     }
 
     pub async fn scan(&self) -> Result<Vec<DiscoveredDevice>> {
@@ -98,8 +108,8 @@ impl NetworkScanner {
         // 5. Reverse DNS hostname enrichment
         enrich_hostnames(&mut observations).await;
 
-        // 6. Aggregate by IP/MAC and classify devices
-        let devices = aggregate_and_classify(observations);
+        // 6. Aggregate by IP/MAC and classify devices using Rhai engine
+        let devices = aggregate_and_classify(observations, &self.definitions_engine);
         info!("Network scan completed: found {} unique devices", devices.len());
 
         Ok(devices)
@@ -417,28 +427,73 @@ async fn enrich_hostnames(observations: &mut [RawObservation]) {
     }
 }
 
-fn aggregate_and_classify(observations: Vec<RawObservation>) -> Vec<DiscoveredDevice> {
+fn classify_with_engine(
+    engine: &homenode_definitions::RhaiDeviceEngine,
+    name: &str,
+    ip: &str,
+    mac: Option<&str>,
+    hostname: Option<&str>,
+    vendor: Option<&str>,
+    interface: &str,
+) -> (String, Option<String>, Option<String>, Option<String>) {
+    let obs = homenode_definitions::ObservationContext {
+        ip: ip.to_string(),
+        mac: mac.map(String::from),
+        hostname: hostname.map(String::from),
+        name: name.to_string(),
+        vendor: vendor.map(String::from),
+        interface: interface.to_string(),
+    };
+
+    if let Some(m) = engine.identify(&obs) {
+        (
+            m.meta.category,
+            Some(m.meta.category_title),
+            Some(m.meta.category_icon),
+            Some(m.script_id),
+        )
+    } else {
+        let fallback_kind = classify_device(name, ip, mac);
+        (fallback_kind, None, None, None)
+    }
+}
+
+fn aggregate_and_classify(
+    observations: Vec<RawObservation>,
+    engine: &homenode_definitions::RhaiDeviceEngine,
+) -> Vec<DiscoveredDevice> {
     let mut by_ip: HashMap<String, DiscoveredDevice> = HashMap::new();
 
     for obs in observations {
+        let vendor = obs.mac.as_deref().and_then(guess_vendor).map(String::from);
         let entry = by_ip.entry(obs.ip.clone()).or_insert_with(|| {
             let device_id = format!("net-{}", obs.ip.replace('.', "-"));
             let display_name = obs
                 .hostname
                 .clone()
                 .unwrap_or_else(|| format!("Host {}", obs.ip));
-            let kind = classify_device(&display_name, &obs.ip, obs.mac.as_deref());
-            let vendor = obs.mac.as_deref().and_then(guess_vendor).map(String::from);
+            let (kind, category_title, category_icon, script_id) = classify_with_engine(
+                engine,
+                &display_name,
+                &obs.ip,
+                obs.mac.as_deref(),
+                obs.hostname.as_deref(),
+                vendor.as_deref(),
+                &obs.interface,
+            );
 
             DiscoveredDevice {
                 device_id,
                 display_name,
                 kind,
+                category_title,
+                category_icon,
+                script_id,
                 ip: obs.ip.clone(),
                 mac: obs.mac.clone(),
                 hostname: obs.hostname.clone(),
                 interface: obs.interface.clone(),
-                vendor,
+                vendor: vendor.clone(),
                 capabilities: vec!["ip".to_string()],
                 source: obs.source.clone(),
             }
@@ -447,7 +502,19 @@ fn aggregate_and_classify(observations: Vec<RawObservation>) -> Vec<DiscoveredDe
         if entry.mac.is_none() && obs.mac.is_some() {
             entry.mac = obs.mac.clone();
             entry.vendor = obs.mac.as_deref().and_then(guess_vendor).map(String::from);
-            entry.kind = classify_device(&entry.display_name, &entry.ip, obs.mac.as_deref());
+            let (kind, category_title, category_icon, script_id) = classify_with_engine(
+                engine,
+                &entry.display_name,
+                &entry.ip,
+                entry.mac.as_deref(),
+                entry.hostname.as_deref(),
+                entry.vendor.as_deref(),
+                &entry.interface,
+            );
+            entry.kind = kind;
+            entry.category_title = category_title;
+            entry.category_icon = category_icon;
+            entry.script_id = script_id;
         }
 
         if (entry.hostname.is_none() || entry.display_name.starts_with("Host "))
@@ -456,7 +523,19 @@ fn aggregate_and_classify(observations: Vec<RawObservation>) -> Vec<DiscoveredDe
             if let Some(h) = obs.hostname {
                 entry.display_name = h.clone();
                 entry.hostname = Some(h);
-                entry.kind = classify_device(&entry.display_name, &entry.ip, entry.mac.as_deref());
+                let (kind, category_title, category_icon, script_id) = classify_with_engine(
+                    engine,
+                    &entry.display_name,
+                    &entry.ip,
+                    entry.mac.as_deref(),
+                    entry.hostname.as_deref(),
+                    entry.vendor.as_deref(),
+                    &entry.interface,
+                );
+                entry.kind = kind;
+                entry.category_title = category_title;
+                entry.category_icon = category_icon;
+                entry.script_id = script_id;
             }
         }
 
@@ -609,5 +688,52 @@ mod tests {
         assert_eq!(classify_device("homepod-r-2.fritz.box", "192.168.178.82", None), "audio");
         assert_eq!(classify_device("applewatch10stephan.fritz.box", "192.168.178.49", None), "wearable");
         assert_eq!(classify_device("fritz.box", "192.168.178.1", None), "router");
+    }
+
+    #[test]
+    fn classifies_phone_and_tablet_with_rhai_engine() {
+        let mut engine = homenode_definitions::RhaiDeviceEngine::new();
+        engine
+            .load_script_str(
+                r#"
+            fn meta() { #{ id: "iphone", name: "iPhone", category: "phone", category_title: "Smartphones", category_icon: "📱" } }
+            fn identify(obs) { obs.name.to_lower().contains("iphone") }
+        "#,
+            )
+            .unwrap();
+        engine
+            .load_script_str(
+                r#"
+            fn meta() { #{ id: "ipad", name: "iPad", category: "tablet", category_title: "Tablets", category_icon: "📟" } }
+            fn identify(obs) { obs.name.to_lower().contains("ipad") }
+        "#,
+            )
+            .unwrap();
+
+        let (kind_phone, title_phone, icon_phone, _) = classify_with_engine(
+            &engine,
+            "stephans-iphone",
+            "192.168.178.51",
+            None,
+            None,
+            None,
+            "en0",
+        );
+        assert_eq!(kind_phone, "phone");
+        assert_eq!(title_phone.as_deref(), Some("Smartphones"));
+        assert_eq!(icon_phone.as_deref(), Some("📱"));
+
+        let (kind_tab, title_tab, icon_tab, _) = classify_with_engine(
+            &engine,
+            "stephans-ipad",
+            "192.168.178.52",
+            None,
+            None,
+            None,
+            "en0",
+        );
+        assert_eq!(kind_tab, "tablet");
+        assert_eq!(title_tab.as_deref(), Some("Tablets"));
+        assert_eq!(icon_tab.as_deref(), Some("📟"));
     }
 }

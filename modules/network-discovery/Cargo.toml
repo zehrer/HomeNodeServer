@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 dns-lookup.workspace = true
+homenode-definitions = { path = "../../crates/homenode-definitions" }
 homenode-sdk = { path = "../../crates/homenode-sdk" }
 if-addrs.workspace = true
 ipnet.workspace = true

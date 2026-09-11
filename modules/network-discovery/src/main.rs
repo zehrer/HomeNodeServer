@@ -78,7 +78,38 @@ async fn main() -> Result<()> {
         interface_allowlist: Vec::new(),
         interface_denylist: Vec::new(),
     };
-    let scanner = NetworkScanner::new(scanner_config);
+
+    let mut definitions_engine = homenode_definitions::RhaiDeviceEngine::new();
+    let workspace_root = env
+        .server_config_path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let candidate_paths = [
+        workspace_root.join("definitions").join("devices"),
+        std::path::PathBuf::from("definitions/devices"),
+        std::path::PathBuf::from("../../definitions/devices"),
+    ];
+
+    let mut loaded_scripts = 0;
+    for path in candidate_paths {
+        if path.exists() {
+            if let Ok(n) = definitions_engine.load_from_dir(&path) {
+                if n > 0 {
+                    loaded_scripts = n;
+                    info!("Loaded {n} Rhai device definitions from {}", path.display());
+                    break;
+                }
+            }
+        }
+    }
+    if loaded_scripts == 0 {
+        tracing::warn!("No Rhai device definitions loaded; using fallback classification");
+    }
+
+    let scanner = NetworkScanner::new(scanner_config, std::sync::Arc::new(definitions_engine));
 
     // Initial scan
     info!("Running initial network discovery sweep...");
@@ -249,8 +280,18 @@ fn convert_device(
         metadata.insert("hostname".to_string(), host);
     }
     if let Some(vendor) = device.vendor {
-        metadata.insert("vendor".to_string(), vendor.to_string());
+        metadata.insert("vendor".to_string(), vendor);
     }
+    if let Some(title) = device.category_title {
+        metadata.insert("category_title".to_string(), title);
+    }
+    if let Some(icon) = device.category_icon {
+        metadata.insert("category_icon".to_string(), icon);
+    }
+    if let Some(script_id) = device.script_id {
+        metadata.insert("script_id".to_string(), script_id);
+    }
+    metadata.insert("category".to_string(), device.kind.clone());
     metadata.insert("source".to_string(), device.source);
 
     device_record(
