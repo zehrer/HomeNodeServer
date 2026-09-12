@@ -218,6 +218,7 @@ async fn main() -> Result<()> {
         )
         .route("/api/devices/:id/category", post(update_device_category_handler))
         .route("/api/devices/:id/analyze", post(analyze_device_handler))
+        .route("/api/devices/:id/ping", post(ping_device_handler))
         .route("/api/devices/link", post(link_devices_handler))
         .route("/api/devices/unlink", post(unlink_devices_handler))
         .route("/api/devices/:id/forget", post(forget_device_handler))
@@ -905,6 +906,192 @@ async fn analyze_device_handler(
     .into_response()
 }
 
+async fn ping_device_handler(
+    AxumPath(device_id): AxumPath<String>,
+    State(state): State<WebState>,
+) -> Response {
+    let snapshot = match load_snapshot(&state.socket_path).await {
+        Ok(s) => s,
+        Err(err) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "reachable": false,
+                    "error": err.to_string(),
+                    "message": "Failed to load runtime snapshot"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let found_ip = snapshot
+        .devices
+        .iter()
+        .find(|d| d.device_id == device_id || d.metadata.get("mac").map(|m| m.as_str()) == Some(&device_id))
+        .and_then(|d| d.metadata.get("ip").cloned())
+        .or_else(|| {
+            let history_path = state.docs_path.parent().unwrap_or(std::path::Path::new(".")).join("device_history.json");
+            if let Ok(content) = std::fs::read_to_string(&history_path) {
+                if let Ok(hist) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let norm = device_id.trim().to_lowercase();
+                    if let Some(records) = hist.get("records").and_then(|r| r.as_object()) {
+                        for (k, v) in records {
+                            let k_norm = k.trim().to_lowercase();
+                            let mac_norm = v.get("mac").and_then(|m| m.as_str()).map(|m| m.trim().to_lowercase());
+                            let id_norm = v.get("device_id").and_then(|m| m.as_str()).map(|m| m.trim().to_lowercase());
+                            if k_norm == norm || mac_norm.as_deref() == Some(&norm) || id_norm.as_deref() == Some(&norm) {
+                                return v.get("ip").and_then(|ip| ip.as_str()).map(|s| s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        })
+        .or_else(|| {
+            if device_id.starts_with("net-") {
+                let candidate = device_id.replace("net-", "").replace('-', ".");
+                if candidate.parse::<Ipv4Addr>().is_ok() {
+                    return Some(candidate);
+                }
+            }
+            None
+        });
+
+    let ip_str = match found_ip {
+        Some(ip) => ip,
+        None => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "reachable": false,
+                    "error": "device_ip_not_found",
+                    "message": "Device IP address could not be determined"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let ip: Ipv4Addr = match ip_str.parse() {
+        Ok(addr) => addr,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "reachable": false,
+                    "error": "invalid_ip",
+                    "message": format!("Invalid IP address '{ip_str}'")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut reachable = false;
+    let mut rtt_ms: Option<f64> = None;
+    let mut method = String::new();
+
+    // 1. ICMP ping (1 packet, 1 second timeout)
+    let ping_cmd = tokio::process::Command::new("ping")
+        .args(["-c", "1", "-t", "1", &ip_str])
+        .output()
+        .await;
+
+    if let Ok(output) = ping_cmd {
+        if output.status.success() {
+            reachable = true;
+            method = "icmp".to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(pos) = stdout.find("time=") {
+                let rest = &stdout[pos + 5..];
+                if let Some(end) = rest.find(" ms") {
+                    if let Ok(val) = rest[..end].trim().parse::<f64>() {
+                        rtt_ms = Some(val);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. If ICMP didn't respond, try fast TCP connects on standard ports
+    if !reachable {
+        let probe_ports = [80, 443, 8080, 22, 62078, 5000, 5353];
+        for port in probe_ports {
+            let addr = SocketAddr::new(IpAddr::V4(ip), port);
+            let start = std::time::Instant::now();
+            if tokio::time::timeout(Duration::from_millis(150), TcpStream::connect(addr))
+                .await
+                .is_ok_and(|r| r.is_ok())
+            {
+                reachable = true;
+                method = format!("tcp:{}", port);
+                rtt_ms = Some((start.elapsed().as_micros() as f64) / 1000.0);
+                break;
+            }
+        }
+    }
+
+    let message = if reachable {
+        if let Some(rtt) = rtt_ms {
+            format!("Online (reply in {:.1} ms via {})", rtt, method)
+        } else {
+            format!("Online (responded via {})", method)
+        }
+    } else {
+        "Device did not respond to ping or TCP probes (100% packet loss)".to_string()
+    };
+
+    if reachable {
+        // Sync to device_history.json
+        let history_path = state.docs_path.parent().unwrap_or(std::path::Path::new(".")).join("device_history.json");
+        if let Ok(content) = std::fs::read_to_string(&history_path) {
+            if let Ok(mut hist) = serde_json::from_str::<serde_json::Value>(&content) {
+                let norm = device_id.trim().to_lowercase();
+                if let Some(records) = hist.get_mut("records").and_then(|r| r.as_object_mut()) {
+                    let mut updated = false;
+                    for (k, v) in records.iter_mut() {
+                        let k_norm = k.trim().to_lowercase();
+                        let mac_norm = v.get("mac").and_then(|m| m.as_str()).map(|m| m.trim().to_lowercase());
+                        let id_norm = v.get("device_id").and_then(|m| m.as_str()).map(|m| m.trim().to_lowercase());
+                        let ip_match = v.get("ip").and_then(|i| i.as_str()) == Some(&ip_str);
+                        if k_norm == norm || mac_norm.as_deref() == Some(&norm) || id_norm.as_deref() == Some(&norm) || ip_match {
+                            if let Some(obj) = v.as_object_mut() {
+                                obj.insert("is_active".to_string(), serde_json::Value::Bool(true));
+                                obj.insert("last_seen".to_string(), serde_json::Value::String(now.clone()));
+                                updated = true;
+                            }
+                        }
+                    }
+                    if updated {
+                        let _ = persist_json(&history_path, &hist);
+                    }
+                }
+            }
+        }
+
+        // Trigger background rescan in network-discovery so supervisor snapshot updates
+        if let Ok(mut client) = connect_control_client(&state.socket_path).await {
+            let _ = client.send_command(homenode_sdk::proto::ModuleCommand {
+                target_module_id: "network-discovery".to_string(),
+                action: "scan".to_string(),
+                params: std::collections::HashMap::new(),
+            }).await;
+        }
+    }
+
+    Json(serde_json::json!({
+        "reachable": reachable,
+        "rtt_ms": rtt_ms,
+        "method": method,
+        "last_seen": now,
+        "message": message
+    }))
+    .into_response()
+}
+
 async fn probe_http_banner(ip: Ipv4Addr, port: u16) -> Option<(Option<String>, Option<String>)> {
     let addr = SocketAddr::new(IpAddr::V4(ip), port);
     let mut stream = tokio::time::timeout(Duration::from_millis(250), TcpStream::connect(addr))
@@ -1545,6 +1732,30 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
                 background: #1d4ed8;
             }}
         }}
+        .btn-ping {{
+            background: #f8fafc;
+            color: #475569;
+            border: 1px solid #cbd5e1;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            transition: all 0.15s;
+        }}
+        .btn-ping:hover {{
+            background: #e2e8f0;
+            color: #0f172a;
+        }}
+        @media (prefers-color-scheme: dark) {{
+            .btn-ping {{
+                background: #1e293b;
+                color: #cbd5e1;
+                border-color: #475569;
+            }}
+            .btn-ping:hover {{
+                background: #334155;
+            }}
+        }}
         
         .pills {{
             display: flex;
@@ -2182,10 +2393,23 @@ fn render_devices_page(
 
                 let doc_icon = if has_docs { r#" <span style="color:var(--status-green); font-size:11px;" title="Documentation / Name saved">📝✓</span>"# } else { "" };
 
+                let action_buttons = if !is_active {
+                    let ping_btn = format!(
+                        r#"<button type="button" class="btn-sm btn-ping" data-ping-id="{}" onclick="event.stopPropagation(); pingDevice('{}', this)" title="Ping device to check reachability">📡 Ping</button>"#,
+                        device.device_id, device.device_id
+                    );
+                    if !web_button.is_empty() {
+                        format!(r#"<div style="display:inline-flex; gap:6px; justify-content:flex-end; align-items:center;">{ping_btn}{web_button}</div>"#)
+                    } else {
+                        ping_btn
+                    }
+                } else {
+                    web_button
+                };
+
                 format!(
                     r#"<tr class="device-item" data-id="{}" data-status="{}" data-active="{}" onclick="selectDevice('{}')">
                         <td>{}<strong class="dev-display-name">{}</strong>{}{}{}<br><small style="color:var(--muted)">{} &bull; {}</small></td>
-                        <td><span class="badge badge-kind">{} {}</span></td>
                         <td>{}</td>
                         <td style="text-align:right;">{}</td>
                     </tr>"#,
@@ -2200,10 +2424,8 @@ fn render_devices_page(
                     matter_badges,
                     device.device_id,
                     device.module_id,
-                    cat.icon,
-                    cat.title,
                     network_info,
-                    web_button,
+                    action_buttons,
                 )
             })
             .collect::<Vec<_>>()
@@ -2219,7 +2441,6 @@ fn render_devices_page(
                         <thead>
                             <tr>
                                 <th>Device</th>
-                                <th>Category</th>
                                 <th>Network (IP / MAC)</th>
                                 <th style="text-align:right;">Quick Action</th>
                             </tr>
@@ -2529,7 +2750,10 @@ fn render_devices_page(
                         <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#94a3b8;"></span>
                         <span style="font-weight:600; font-size:12px; color:#475569;">Former Device (Offline)</span>
                     </div>
-                    <span style="font-size:11px; color:#64748b;" title="${{dev.last_seen || ''}}">Last seen: ${{formatRelativeTime(dev.last_seen)}}</span>
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <span style="font-size:11px; color:#64748b;" title="${{dev.last_seen || ''}}">Last seen: ${{formatRelativeTime(dev.last_seen)}}</span>
+                        <button type="button" class="btn-sm btn-ping" style="font-size:11px; padding:2px 8px; cursor:pointer;" onclick="pingDevice('${{dev.device_id}}', this)" title="Ping device to check reachability">📡 Ping</button>
+                    </div>
                 </div>
             `;
         }}
@@ -2696,6 +2920,94 @@ fn render_devices_page(
         }} catch (e) {{
             statusEl.innerText = 'Network error: ' + e;
             statusEl.style.color = 'var(--status-red)';
+        }}
+    }}
+
+    async function pingDevice(deviceId, btn) {{
+        const originalText = btn ? btn.innerHTML : '📡 Ping';
+        if (btn) {{
+            btn.disabled = true;
+            btn.innerHTML = '⏳ Pinging...';
+        }}
+
+        try {{
+            const res = await fetch('/api/devices/' + encodeURIComponent(deviceId) + '/ping', {{
+                method: 'POST'
+            }});
+            const data = await res.json();
+
+            if (data.reachable) {{
+                const rttText = data.rtt_ms ? (data.rtt_ms.toFixed(1) + ' ms') : data.method;
+                if (btn) {{
+                    btn.innerHTML = '✅ Online (' + rttText + ')';
+                    btn.style.borderColor = '#10b981';
+                    btn.style.color = '#065f46';
+                    btn.style.background = '#ecfdf5';
+                }}
+
+                // Update in allDevices memory
+                const dev = allDevices.find(d => d.device_id === deviceId || d.doc_key === deviceId);
+                if (dev) {{
+                    dev.is_active = true;
+                    dev.status = 'active';
+                    dev.last_seen = data.last_seen || new Date().toISOString();
+
+                    // If inspector is open for this device, re-render it
+                    if (selectedDeviceId === dev.device_id) {{
+                        renderInspector(dev);
+                    }}
+                }}
+
+                // Update table row indicators
+                const tr = document.querySelector(`tr[data-id="${{deviceId}}"]`);
+                if (tr) {{
+                    tr.setAttribute('data-status', 'active');
+                    tr.setAttribute('data-active', 'true');
+                    const dot = tr.querySelector('.status-dot');
+                    if (dot) {{
+                        dot.style.background = '#10b981';
+                        dot.title = 'Online / Active';
+                    }}
+                    const badges = tr.querySelectorAll('.badge');
+                    badges.forEach(b => {{
+                        if (b.innerText.includes('Offline')) b.remove();
+                    }});
+                }}
+
+                setTimeout(() => {{
+                    if (btn) {{
+                        btn.disabled = false;
+                        if (btn.classList.contains('btn-ping')) {{
+                            btn.style.display = 'none';
+                        }} else {{
+                            btn.innerHTML = originalText;
+                            btn.style.borderColor = '';
+                            btn.style.color = '';
+                            btn.style.background = '';
+                        }}
+                    }}
+                }}, 3500);
+            }} else {{
+                if (btn) {{
+                    btn.innerHTML = '❌ Offline';
+                    btn.style.borderColor = '#f87171';
+                    btn.style.color = '#991b1b';
+                    btn.style.background = '#fef2f2';
+                    setTimeout(() => {{
+                        btn.disabled = false;
+                        btn.innerHTML = originalText;
+                        btn.style.borderColor = '';
+                        btn.style.color = '';
+                        btn.style.background = '';
+                    }}, 2500);
+                }}
+            }}
+        }} catch (err) {{
+            if (btn) {{
+                btn.disabled = false;
+                btn.innerHTML = '⚠️ Error';
+                setTimeout(() => {{ btn.innerHTML = originalText; }}, 2000);
+            }}
         }}
     }}
 
