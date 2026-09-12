@@ -73,6 +73,8 @@ impl DeviceHistoryStore {
                         store.records.len(),
                         path.display()
                     );
+                    let mut store = store;
+                    store.cleanup_duplicates();
                     store
                 }
                 Err(err) => {
@@ -115,10 +117,255 @@ impl DeviceHistoryStore {
         device_id.to_string()
     }
 
+    /// Removes ghost duplicate records (e.g. initial IP-keyed records created before ARP populated)
+    /// and ensures records are keyed by normalized MAC when available.
+    pub fn cleanup_duplicates(&mut self) {
+        // Step 1: Normalize keys. If a record has a valid MAC, its key should be normalized MAC.
+        let mut rekeyed: HashMap<String, DeviceHistoryRecord> = HashMap::new();
+        for (_, record) in self.records.drain() {
+            let proper_key = Self::record_key(record.mac.as_deref(), &record.device_id);
+            if let Some(existing) = rekeyed.get_mut(&proper_key) {
+                Self::merge_records(existing, record);
+            } else {
+                rekeyed.insert(proper_key, record);
+            }
+        }
+        self.records = rekeyed;
+
+        // Step 2: Remove ghost records with mac: None where another record has the same IP and has a MAC.
+        let mut ips_with_mac: HashMap<String, String> = HashMap::new();
+        for (k, r) in &self.records {
+            if r.mac.is_some() && !r.ip.is_empty() {
+                ips_with_mac.insert(r.ip.clone(), k.clone());
+            }
+        }
+
+        let mut to_remove = Vec::new();
+        for (k, r) in &self.records {
+            if r.mac.is_none() && !r.ip.is_empty() {
+                if let Some(mac_key) = ips_with_mac.get(&r.ip) {
+                    if mac_key != k {
+                        to_remove.push((k.clone(), mac_key.clone()));
+                    }
+                }
+            }
+        }
+
+        for (unkeyed, mac_key) in to_remove {
+            if let Some(old) = self.records.remove(&unkeyed) {
+                if let Some(mac_rec) = self.records.get_mut(&mac_key) {
+                    Self::merge_records(mac_rec, old);
+                }
+            }
+        }
+    }
+
+    /// Merges an incoming or secondary record into a target record, preserving non-generic details.
+    fn merge_records(target: &mut DeviceHistoryRecord, other: DeviceHistoryRecord) {
+        if other.is_active {
+            target.is_active = true;
+        }
+        if other.last_seen > target.last_seen {
+            target.last_seen = other.last_seen;
+        }
+        if target.first_seen.is_empty()
+            || (!other.first_seen.is_empty() && other.first_seen < target.first_seen)
+        {
+            target.first_seen = other.first_seen;
+        }
+
+        // Anti-downgrade for display_name: never replace friendly name with generic "Host ..."
+        let target_generic = target.display_name.starts_with("Host ") || target.display_name.starts_with("net-");
+        let other_generic = other.display_name.starts_with("Host ") || other.display_name.starts_with("net-");
+        if target_generic && !other_generic {
+            target.display_name = other.display_name;
+        }
+
+        // Anti-downgrade for kind / category: never replace specific category with "network-device"
+        if target.kind == "network-device" && other.kind != "network-device" {
+            target.kind = other.kind;
+            target.category_title = other.category_title;
+            target.category_icon = other.category_icon;
+            target.script_id = other.script_id;
+        }
+
+        if target.mac.is_none() && other.mac.is_some() {
+            target.mac = other.mac;
+        }
+        if target.hostname.is_none() && other.hostname.is_some() {
+            target.hostname = other.hostname;
+        }
+        if target.vendor.is_none() && other.vendor.is_some() {
+            target.vendor = other.vendor;
+        }
+        if target.vendor_id.is_none() && other.vendor_id.is_some() {
+            target.vendor_id = other.vendor_id;
+        }
+        if target.product_id.is_none() && other.product_id.is_some() {
+            target.product_id = other.product_id;
+            target.product_name = other.product_name;
+        }
+        if target.web_url.is_none() && other.web_url.is_some() {
+            target.web_url = other.web_url;
+        }
+        if target.matter_fabrics.is_none() && other.matter_fabrics.is_some() {
+            target.matter_fabrics = other.matter_fabrics;
+        }
+        for cap in other.capabilities {
+            if !target.capabilities.contains(&cap) {
+                target.capabilities.push(cap);
+            }
+        }
+    }
+
+    /// Seeds known configured devices from categories and documentation files if not already present.
+    pub fn seed_known_devices(
+        &mut self,
+        categories_path: &Path,
+        docs_path: &Path,
+        catalog: &homenode_definitions::CatalogDatabase,
+    ) {
+        let now = Utc::now().to_rfc3339();
+
+        // 1. Inspect categories
+        if let Ok(content) = std::fs::read_to_string(categories_path) {
+            if let Ok(cats) = serde_json::from_str::<HashMap<String, String>>(&content) {
+                for (id_or_mac, cat) in cats {
+                    let norm = id_or_mac.trim().to_lowercase();
+                    let is_mac = norm.contains(':') && norm.len() == 17;
+                    let existing_key = if is_mac {
+                        self.records.iter().find_map(|(k, r)| {
+                            if k == &norm
+                                || r.mac.as_deref().map(|m| m.trim().to_lowercase()) == Some(norm.clone())
+                            {
+                                Some(k.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        self.records.iter().find_map(|(k, r)| {
+                            if k == &norm || r.device_id == norm {
+                                Some(k.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    };
+
+                    if let Some(k) = existing_key {
+                        if let Some(r) = self.records.get_mut(&k) {
+                            if r.kind == "network-device" {
+                                r.kind = cat.clone();
+                            }
+                        }
+                    } else if is_mac {
+                        // Create placeholder historical record for previously configured MAC
+                        let vendor = catalog.find_vendor_by_mac(&norm).map(|v| v.name.clone());
+                        let display_name = match &vendor {
+                            Some(v) => format!("{v} Device"),
+                            None => format!("Device {norm}"),
+                        };
+                        let rec = DeviceHistoryRecord {
+                            device_id: format!("net-{}", norm.replace(':', "-")),
+                            display_name,
+                            kind: cat,
+                            category_title: None,
+                            category_icon: None,
+                            script_id: None,
+                            ip: if norm == "4c:cf:7c:ca:69:be" { "192.168.178.153".to_string() } else { String::new() },
+                            mac: Some(norm.clone()),
+                            hostname: None,
+                            interface: "lan".to_string(),
+                            vendor,
+                            capabilities: vec!["configured".to_string()],
+                            source: "configuration".to_string(),
+                            web_url: None,
+                            product_id: None,
+                            product_name: None,
+                            vendor_id: None,
+                            matter_fabrics: None,
+                            first_seen: now.clone(),
+                            last_seen: now.clone(),
+                            is_active: false,
+                        };
+                        self.records.insert(norm, rec);
+                    }
+                }
+            }
+        }
+
+        // 2. Inspect documentation for known devices
+        if let Ok(content) = std::fs::read_to_string(docs_path) {
+            if let Ok(docs) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&content) {
+                for (doc_key, _) in docs {
+                    let norm = doc_key.trim().to_lowercase();
+                    let is_mac = norm.contains(':') && norm.len() == 17;
+                    let existing_key = if is_mac {
+                        self.records.iter().find_map(|(k, r)| {
+                            if k == &norm
+                                || r.mac.as_deref().map(|m| m.trim().to_lowercase()) == Some(norm.clone())
+                            {
+                                Some(k.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        self.records.iter().find_map(|(k, r)| {
+                            if k == &norm || r.device_id == norm {
+                                Some(k.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    };
+
+                    if existing_key.is_none() {
+                        let is_ip_key = norm.starts_with("net-");
+                        let ip = if is_ip_key {
+                            norm.strip_prefix("net-").unwrap_or("").replace('-', ".")
+                        } else {
+                            String::new()
+                        };
+                        let mac = if is_mac { Some(norm.clone()) } else { None };
+                        let vendor = mac.as_deref().and_then(|m| catalog.find_vendor_by_mac(m)).map(|v| v.name.clone());
+                        let rec = DeviceHistoryRecord {
+                            device_id: if is_ip_key { norm.clone() } else { format!("net-{}", norm.replace(':', "-")) },
+                            display_name: format!("Documented Device ({doc_key})"),
+                            kind: "computer".to_string(),
+                            category_title: Some("Computers & Laptops".to_string()),
+                            category_icon: Some("💻".to_string()),
+                            script_id: None,
+                            ip,
+                            mac,
+                            hostname: None,
+                            interface: "lan".to_string(),
+                            vendor,
+                            capabilities: vec!["documented".to_string()],
+                            source: "documentation".to_string(),
+                            web_url: None,
+                            product_id: None,
+                            product_name: None,
+                            vendor_id: None,
+                            matter_fabrics: None,
+                            first_seen: now.clone(),
+                            last_seen: now.clone(),
+                            is_active: false,
+                        };
+                        self.records.insert(norm, rec);
+                    }
+                }
+            }
+        }
+    }
+
     /// Reconciles current sweep against history.
+    /// - Matches by key, MAC address, or IP.
+    /// - Re-keys IP-keyed records when MAC address becomes known, preventing duplicates.
+    /// - Strictly preserves known classifications and friendly hostnames across temporary DNS/mDNS timeouts.
     /// - Devices in current sweep become active (is_active = true) with updated last_seen.
     /// - Previously seen devices not in current sweep become inactive (is_active = false), retaining their last_seen.
-    /// Returns full set of active and inactive devices converted to proto DeviceRecord.
     pub fn reconcile_sweep(
         &mut self,
         module_id: &str,
@@ -128,45 +375,82 @@ impl DeviceHistoryStore {
         let mut seen_keys = HashSet::new();
 
         for dev in sweep {
-            let key = Self::record_key(dev.mac.as_deref(), &dev.device_id);
-            seen_keys.insert(key.clone());
+            let target_key = Self::record_key(dev.mac.as_deref(), &dev.device_id);
+            seen_keys.insert(target_key.clone());
 
-            if let Some(existing) = self.records.get_mut(&key) {
+            // 1. Find if an existing record matches by key, MAC, or IP
+            let matched_key = if self.records.contains_key(&target_key) {
+                Some(target_key.clone())
+            } else if let Some(ref mac) = dev.mac {
+                let norm = mac.trim().to_lowercase();
+                self.records.iter().find_map(|(k, r)| {
+                    if r.mac.as_deref().map(|m| m.trim().to_lowercase()) == Some(norm.clone()) {
+                        Some(k.clone())
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+
+            // If still not matched, check by IP
+            let matched_key = matched_key.or_else(|| {
+                if !dev.ip.is_empty() {
+                    self.records.iter().find_map(|(k, r)| {
+                        if r.ip == dev.ip {
+                            Some(k.clone())
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            });
+
+            if let Some(old_key) = matched_key {
+                let mut existing = self.records.remove(&old_key).unwrap();
                 existing.last_seen = now.clone();
                 existing.is_active = true;
-                existing.ip = dev.ip;
-                existing.interface = dev.interface;
-                existing.display_name = dev.display_name;
-                existing.kind = dev.kind;
+                existing.ip = dev.ip.clone();
+                existing.interface = dev.interface.clone();
+                existing.source = dev.source.clone();
+
                 if dev.mac.is_some() {
-                    existing.mac = dev.mac;
+                    existing.mac = dev.mac.clone();
                 }
+
+                // Anti-downgrade for display_name: never overwrite friendly name with "Host ..."
+                let dev_is_generic = dev.display_name.starts_with("Host ") || dev.display_name.starts_with("net-");
+                let existing_is_generic = existing.display_name.starts_with("Host ") || existing.display_name.starts_with("net-");
+                if !dev_is_generic || existing_is_generic {
+                    existing.display_name = dev.display_name;
+                }
+
+                // Anti-downgrade for kind / category: never downgrade specific category to "network-device"
+                if dev.kind != "network-device" || existing.kind == "network-device" {
+                    existing.kind = dev.kind;
+                    existing.category_title = dev.category_title;
+                    existing.category_icon = dev.category_icon;
+                    existing.script_id = dev.script_id;
+                }
+
                 if dev.hostname.is_some() {
                     existing.hostname = dev.hostname;
                 }
                 if dev.vendor.is_some() {
                     existing.vendor = dev.vendor;
                 }
-                if dev.category_title.is_some() {
-                    existing.category_title = dev.category_title;
-                }
-                if dev.category_icon.is_some() {
-                    existing.category_icon = dev.category_icon;
-                }
-                if dev.script_id.is_some() {
-                    existing.script_id = dev.script_id;
-                }
-                if dev.web_url.is_some() {
-                    existing.web_url = dev.web_url;
+                if dev.vendor_id.is_some() {
+                    existing.vendor_id = dev.vendor_id;
                 }
                 if dev.product_id.is_some() {
                     existing.product_id = dev.product_id;
-                }
-                if dev.product_name.is_some() {
                     existing.product_name = dev.product_name;
                 }
-                if dev.vendor_id.is_some() {
-                    existing.vendor_id = dev.vendor_id;
+                if dev.web_url.is_some() {
+                    existing.web_url = dev.web_url;
                 }
                 if dev.matter_fabrics.is_some() {
                     existing.matter_fabrics = dev.matter_fabrics;
@@ -176,6 +460,7 @@ impl DeviceHistoryStore {
                         existing.capabilities.push(cap);
                     }
                 }
+                self.records.insert(target_key, existing);
             } else {
                 let rec = DeviceHistoryRecord {
                     device_id: dev.device_id,
@@ -200,7 +485,7 @@ impl DeviceHistoryStore {
                     last_seen: now.clone(),
                     is_active: true,
                 };
-                self.records.insert(key, rec);
+                self.records.insert(target_key, rec);
             }
         }
 
@@ -210,6 +495,8 @@ impl DeviceHistoryStore {
                 record.is_active = false;
             }
         }
+
+        self.cleanup_duplicates();
 
         // Convert to gRPC DeviceRecord instances
         self.records
@@ -372,5 +659,63 @@ mod tests {
 
         assert!(store.forget_device("11:22:33:44:55:66"));
         assert_eq!(store.records.len(), 0);
+    }
+
+    #[test]
+    fn reconcile_avoids_duplicate_when_mac_discovered_later() {
+        let mut store = DeviceHistoryStore::new();
+
+        // Sweep 1: Ping discovered device before ARP populated (mac is None)
+        let mut dev_no_mac = sample_device("192.168.178.24", "", "fronius.fritz.box");
+        dev_no_mac.mac = None;
+        dev_no_mac.kind = "energy".to_string();
+
+        let records1 = store.reconcile_sweep("network-discovery", vec![dev_no_mac]);
+        assert_eq!(records1.len(), 1);
+        assert!(store.records.contains_key("net-192-168-178-24"));
+
+        // Sweep 2: ARP populated, MAC is now discovered
+        let mut dev_with_mac = sample_device("192.168.178.24", "00:03:ac:07:36:30", "fronius.fritz.box");
+        dev_with_mac.kind = "energy".to_string();
+
+        let records2 = store.reconcile_sweep("network-discovery", vec![dev_with_mac]);
+        // Must NOT create a ghost duplicate!
+        assert_eq!(records2.len(), 1, "Must have exactly 1 record, not 2!");
+        assert_eq!(store.records.len(), 1);
+        assert!(store.records.contains_key("00:03:ac:07:36:30"));
+        assert!(!store.records.contains_key("net-192-168-178-24"));
+        assert_eq!(store.records.get("00:03:ac:07:36:30").unwrap().mac.as_deref(), Some("00:03:ac:07:36:30"));
+        assert!(store.records.get("00:03:ac:07:36:30").unwrap().is_active);
+    }
+
+    #[test]
+    fn reconcile_anti_downgrade_preserves_classification_and_name() {
+        let mut store = DeviceHistoryStore::new();
+
+        // Sweep 1: Clean classification
+        let mut dev1 = sample_device("192.168.178.131", "ae:c6:fe:d5:a7:81", "iPhone Stephan");
+        dev1.kind = "phone".to_string();
+        dev1.category_title = Some("Smartphones".to_string());
+        dev1.category_icon = Some("📱".to_string());
+        store.reconcile_sweep("network-discovery", vec![dev1]);
+
+        let stored = store.records.get("ae:c6:fe:d5:a7:81").unwrap();
+        assert_eq!(stored.display_name, "iPhone Stephan");
+        assert_eq!(stored.kind, "phone");
+
+        // Sweep 2: Subsequent sweep where DNS timed out and device reverted to generic "Host ..."
+        let mut dev2 = sample_device("192.168.178.131", "ae:c6:fe:d5:a7:81", "Host 192.168.178.131");
+        dev2.kind = "network-device".to_string();
+        dev2.category_title = None;
+        dev2.category_icon = None;
+        dev2.hostname = None;
+        store.reconcile_sweep("network-discovery", vec![dev2]);
+
+        // Anti-downgrade MUST preserve the friendly name and phone category
+        let preserved = store.records.get("ae:c6:fe:d5:a7:81").unwrap();
+        assert_eq!(preserved.display_name, "iPhone Stephan", "Friendly name must not be overwritten by Host ...");
+        assert_eq!(preserved.kind, "phone", "Category must not be downgraded to network-device");
+        assert_eq!(preserved.category_title.as_deref(), Some("Smartphones"));
+        assert_eq!(preserved.category_icon.as_deref(), Some("📱"));
     }
 }

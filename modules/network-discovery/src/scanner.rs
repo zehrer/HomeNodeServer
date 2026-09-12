@@ -112,6 +112,9 @@ impl NetworkScanner {
         if self.config.enable_active_icmp {
             let active = self.run_active_sweep(&interfaces, &observations).await;
             observations.extend(active);
+            // Immediately re-collect ARP table and neighbor cache to capture MACs populated by ICMP replies
+            observations.extend(collect_from_arp());
+            observations.extend(collect_from_ip_neigh().await);
         }
 
         // 4. mDNS hints (avahi-browse or dns-sd)
@@ -425,7 +428,7 @@ async fn enrich_hostnames(observations: &mut [RawObservation]) {
     let mut join_set = JoinSet::new();
     for (ip_str, ip_addr) in targets {
         join_set.spawn(async move {
-            let resolved = tokio::time::timeout(Duration::from_millis(500), async move {
+            let resolved = tokio::time::timeout(Duration::from_millis(2000), async move {
                 tokio::task::spawn_blocking(move || lookup_addr(&ip_addr))
                     .await
                     .ok()
@@ -481,7 +484,7 @@ fn classify_with_engine(
             Some(m.script_id),
         )
     } else {
-        let fallback_kind = classify_device(name, ip, mac);
+        let fallback_kind = classify_device_full(name, ip, mac, hostname, vendor);
         (fallback_kind, None, None, None)
     }
 }
@@ -576,24 +579,26 @@ fn aggregate_and_classify(
                 entry.vendor.as_deref(),
                 &entry.interface,
             );
-            entry.kind = kind;
-            entry.category_title = category_title;
-            entry.category_icon = category_icon;
-            entry.script_id = script_id;
+            if kind != "network-device" || entry.kind == "network-device" {
+                entry.kind = kind;
+            }
+            if category_title.is_some() {
+                entry.category_title = category_title;
+                entry.category_icon = category_icon;
+                entry.script_id = script_id;
+            }
 
-            if entry.product_id.is_none() {
-                if let Some(prod) = catalog.match_product(
-                    entry.hostname.as_deref().unwrap_or(""),
-                    entry.vendor.as_deref(),
-                    &[],
-                ) {
-                    if entry.kind == "network-device" {
-                        entry.kind = prod.category.clone();
-                        entry.category_icon = Some(prod.category_icon.clone());
-                    }
-                    entry.product_id = Some(prod.id.clone());
-                    entry.product_name = Some(prod.name.clone());
+            if let Some(prod) = catalog.match_product(
+                entry.hostname.as_deref().unwrap_or(""),
+                entry.vendor.as_deref(),
+                &[],
+            ) {
+                if entry.kind == "network-device" {
+                    entry.kind = prod.category.clone();
+                    entry.category_icon = Some(prod.category_icon.clone());
                 }
+                entry.product_id = Some(prod.id.clone());
+                entry.product_name = Some(prod.name.clone());
             }
         }
 
@@ -612,24 +617,26 @@ fn aggregate_and_classify(
                     entry.vendor.as_deref(),
                     &entry.interface,
                 );
-                entry.kind = kind;
-                entry.category_title = category_title;
-                entry.category_icon = category_icon;
-                entry.script_id = script_id;
+                if kind != "network-device" || entry.kind == "network-device" {
+                    entry.kind = kind;
+                }
+                if category_title.is_some() {
+                    entry.category_title = category_title;
+                    entry.category_icon = category_icon;
+                    entry.script_id = script_id;
+                }
 
-                if entry.product_id.is_none() {
-                    if let Some(prod) = catalog.match_product(
-                        entry.hostname.as_deref().unwrap_or(""),
-                        entry.vendor.as_deref(),
-                        &[],
-                    ) {
-                        if entry.kind == "network-device" {
-                            entry.kind = prod.category.clone();
-                            entry.category_icon = Some(prod.category_icon.clone());
-                        }
-                        entry.product_id = Some(prod.id.clone());
-                        entry.product_name = Some(prod.name.clone());
+                if let Some(prod) = catalog.match_product(
+                    entry.hostname.as_deref().unwrap_or(""),
+                    entry.vendor.as_deref(),
+                    &[],
+                ) {
+                    if entry.kind == "network-device" {
+                        entry.kind = prod.category.clone();
+                        entry.category_icon = Some(prod.category_icon.clone());
                     }
+                    entry.product_id = Some(prod.id.clone());
+                    entry.product_name = Some(prod.name.clone());
                 }
             }
         }
@@ -698,88 +705,102 @@ fn aggregate_and_classify(
     devices
 }
 
-fn classify_device(name: &str, ip: &str, mac: Option<&str>) -> String {
+fn classify_device_full(
+    name: &str,
+    ip: &str,
+    mac: Option<&str>,
+    hostname: Option<&str>,
+    vendor: Option<&str>,
+) -> String {
     let lower = name.to_lowercase();
-    let vendor = mac.and_then(guess_vendor).unwrap_or("").to_lowercase();
+    let host = hostname.unwrap_or("").to_lowercase();
+    let vend = vendor
+        .map(|v| v.to_lowercase())
+        .or_else(|| mac.and_then(guess_vendor).map(|v| v.to_lowercase()))
+        .unwrap_or_default();
 
-    if lower.contains("vpn") || lower.contains("wireguard") || lower.contains("ipsec") || lower.contains("iphonestephan") {
+    if lower.contains("vpn") || host.contains("vpn") || lower.contains("wireguard") || host.contains("wireguard") || lower.contains("ipsec") || host.contains("ipsec") || lower.contains("iphonestephan") || host.contains("iphonestephan") {
         return "vpn".to_string();
     }
 
-    if lower.contains("printer") || lower.contains("epson") || lower.contains("canon") || lower.contains("brother") || lower.contains("hp-") {
+    if lower.contains("printer") || host.contains("printer") || lower.contains("epson") || host.contains("epson") || lower.contains("canon") || host.contains("canon") || lower.contains("brother") || host.contains("brother") || lower.contains("hp-") || host.contains("hp-") {
         return "printer".to_string();
     }
-    if lower.contains("synology") || lower.contains("diskstation") || lower.contains("rackstation") || vendor.contains("synology") {
+    if lower.contains("synology") || host.contains("synology") || lower.contains("diskstation") || host.contains("diskstation") || lower.contains("rackstation") || host.contains("rackstation") || vend.contains("synology") {
         return "nas".to_string();
     }
-    if (lower.contains("repeater") || lower.contains("mesh")) && (lower.contains("fritz") || vendor.contains("avm")) {
+    if (lower.contains("repeater") || host.contains("repeater") || lower.contains("mesh") || host.contains("mesh")) && (lower.contains("fritz") || host.contains("fritz") || vend.contains("avm")) {
         return "router".to_string();
     }
-    if lower.contains("awtrix") {
+    if lower.contains("awtrix") || host.contains("awtrix") {
         return "display".to_string();
     }
-    if lower.contains("meshtastic") {
+    if lower.contains("meshtastic") || host.contains("meshtastic") {
         return "radio".to_string();
     }
-    if lower.contains("everything-presence") || lower.contains("ep1-") || lower.contains("epl-") {
+    if lower.contains("everything-presence") || host.contains("everything-presence") || lower.contains("ep1-") || host.contains("ep1-") || lower.contains("epl-") || host.contains("epl-") {
         return "sensor".to_string();
     }
-    if lower.contains("fronius") || vendor.contains("fronius") || lower.contains("symo") || lower.contains("gen24") {
+    if lower.contains("fronius") || host.contains("fronius") || vend.contains("fronius") || lower.contains("symo") || host.contains("symo") || lower.contains("gen24") || host.contains("gen24") {
         return "energy".to_string();
     }
-    if lower.contains("miele") || vendor.contains("miele") {
+    if lower.contains("miele") || host.contains("miele") || vend.contains("miele") {
         return "appliance".to_string();
     }
-    if lower.contains("govee") || lower.contains("wiz") || vendor.contains("govee") || lower.starts_with("led-") {
+    if lower.contains("govee") || host.contains("govee") || lower.contains("wiz") || host.contains("wiz") || vend.contains("govee") || lower.starts_with("led-") || host.starts_with("led-") {
         return "lighting".to_string();
     }
-    if lower.contains("switchbot") || vendor.contains("switchbot") || vendor.contains("woan") {
+    if lower.contains("switchbot") || host.contains("switchbot") || vend.contains("switchbot") || vend.contains("woan") {
         return "hub".to_string();
     }
-    if lower.contains("plug") || lower.contains("outlet") || lower.contains("tasmota") {
+    if lower.contains("plug") || host.contains("plug") || lower.contains("outlet") || host.contains("outlet") || lower.contains("tasmota") || host.contains("tasmota") {
         return "smart-plug".to_string();
     }
-    if lower.contains("camera") || lower.contains("blink") || lower.contains("ring") {
+    if lower.contains("camera") || host.contains("camera") || lower.contains("blink") || host.contains("blink") || lower.contains("ring") || host.contains("ring") {
         return "camera".to_string();
     }
-    if lower.contains("watch") {
+    if lower.contains("watch") || host.contains("watch") {
         return "wearable".to_string();
     }
-    if lower.contains("iphone") || lower.contains("ipad") || lower.contains("galaxy") || lower.contains("pixel") || lower.contains("android") {
+    if lower.contains("iphone") || host.contains("iphone") || lower.contains("ipad") || host.contains("ipad") || lower.contains("galaxy") || host.contains("galaxy") || lower.contains("pixel") || host.contains("pixel") || lower.contains("android") || host.contains("android") {
         return "mobile".to_string();
     }
-    if lower.contains("macbook") || lower.contains("imac") || lower.contains("macmini") || lower.contains("pc") || lower.contains("desktop") || lower.contains("laptop") {
+    if lower.contains("macbook") || host.contains("macbook") || lower.contains("imac") || host.contains("imac") || lower.contains("macmini") || host.contains("macmini") || lower.contains("pc") || lower.contains("desktop") || host.contains("desktop") || lower.contains("laptop") || host.contains("laptop") || lower.contains("homenode") || host.contains("homenode") || lower.contains("workstation") || host.contains("workstation") || vend.contains("dell") || vend.contains("lenovo") {
         return "computer".to_string();
     }
-    if lower.contains("apple-tv") || lower.contains("chromecast") || lower.contains("firetv") || lower.contains("shield") || lower.contains("tv") {
+    if lower.contains("apple-tv") || host.contains("apple-tv") || lower.contains("appletv") || host.contains("appletv") || lower.contains("chromecast") || host.contains("chromecast") || lower.contains("firetv") || host.contains("firetv") || lower.contains("shield") || host.contains("shield") || lower.contains("tv") || host.contains("tv") {
         return "streaming".to_string();
     }
-    if lower.contains("homepod") || lower.contains("sonos") || lower.contains("speaker") {
+    if lower.contains("homepod") || host.contains("homepod") || lower.contains("sonos") || host.contains("sonos") || lower.contains("speaker") || host.contains("speaker") {
         return "audio".to_string();
     }
-    if lower.contains("snom") || lower.contains("voip") || lower.contains("sip") {
+    if lower.contains("snom") || host.contains("snom") || lower.contains("voip") || host.contains("voip") || lower.contains("sip") || host.contains("sip") {
         return "phone".to_string();
     }
-    if lower.contains("ecoflow") || vendor.contains("ecoflow") {
+    if lower.contains("ecoflow") || host.contains("ecoflow") || vend.contains("ecoflow") {
         return "energy".to_string();
     }
-    if (lower.contains("shelly") || vendor.contains("shelly")) && (lower.contains("3em") || lower.contains("em3")) {
+    if (lower.contains("shelly") || host.contains("shelly") || vend.contains("shelly")) && (lower.contains("3em") || host.contains("3em") || lower.contains("em3") || host.contains("em3")) {
         return "energy".to_string();
     }
-    if lower.contains("hue") || (vendor.contains("philips") && lower.contains("gateway")) {
+    if lower.contains("hue") || host.contains("hue") || (vend.contains("philips") && (lower.contains("gateway") || host.contains("gateway"))) {
         return "hub".to_string();
     }
-    if lower.contains("netatmo") || vendor.contains("netatmo") {
+    if lower.contains("netatmo") || host.contains("netatmo") || vend.contains("netatmo") {
         return "sensor".to_string();
     }
-    if vendor.contains("espressif") || vendor.contains("raspberry") || lower.contains("shelly") || lower.contains("sonoff") || lower.contains("esp32") || lower.contains("esp8266") {
+    if vend.contains("espressif") || vend.contains("raspberry") || lower.contains("shelly") || host.contains("shelly") || lower.contains("sonoff") || host.contains("sonoff") || lower.contains("esp32") || host.contains("esp32") || lower.contains("esp8266") || host.contains("esp8266") || lower.contains("lwip") || host.contains("lwip") {
         return "iot".to_string();
     }
-    if lower == "fritz.box" || lower.starts_with("fritz.box") || lower.contains("fritz!box") || lower.contains("router") || lower.contains("gateway") || ip.ends_with(".1") {
+    if lower == "fritz.box" || lower.starts_with("fritz.box") || host == "fritz.box" || host.starts_with("fritz.box") || lower.contains("fritz!box") || lower.contains("router") || host.contains("router") || lower.contains("gateway") || host.contains("gateway") || ip.ends_with(".1") {
         return "router".to_string();
     }
 
     "network-device".to_string()
+}
+
+fn classify_device(name: &str, ip: &str, mac: Option<&str>) -> String {
+    classify_device_full(name, ip, mac, None, None)
 }
 
 fn guess_vendor(mac: &str) -> Option<&'static str> {

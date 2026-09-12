@@ -35,6 +35,15 @@ fn identify(obs) {
     if host.contains("hensoldt") {
         return true;
     }
+    if name.contains("homenode") || host.contains("homenode") {
+        return true;
+    }
+    if name.contains("workstation") || host.contains("workstation") || name.contains("server") || host.contains("server") {
+        return true;
+    }
+    if name.contains("windows") || host.contains("windows") || name.contains("win10") || host.contains("win10") || name.contains("win11") || host.contains("win11") {
+        return true;
+    }
 
     let is_printer = name.contains("print") || name.contains("laserjet") || name.contains("deskjet") || name.contains("officejet")
         || host.contains("print") || host.contains("laserjet") || host.contains("deskjet") || host.contains("officejet");

@@ -11,5 +11,8 @@ fn meta() {
 
 fn identify(obs) {
     let name = obs.name.to_lower();
-    name.contains("watch") || name.contains("band") || name.contains("wearable")
+    let host = obs.hostname.to_lower();
+    name.contains("watch") || host.contains("watch")
+        || name.contains("band") || host.contains("band")
+        || name.contains("wearable") || host.contains("wearable")
 }

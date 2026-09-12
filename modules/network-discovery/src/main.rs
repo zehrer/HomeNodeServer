@@ -146,16 +146,22 @@ async fn main() -> Result<()> {
         }
     }
 
+    let catalog_arc = std::sync::Arc::new(catalog);
     let scanner = NetworkScanner::new(
         scanner_config,
         std::sync::Arc::new(definitions_engine),
-        std::sync::Arc::new(catalog),
+        catalog_arc.clone(),
     );
 
     let data_dir = workspace_root.join("data");
     let _ = std::fs::create_dir_all(&data_dir);
     let history_path = data_dir.join("device_history.json");
-    let history_store = Arc::new(Mutex::new(DeviceHistoryStore::load_from_path(&history_path)));
+    let categories_path = data_dir.join("device_categories.json");
+    let docs_path = data_dir.join("device_documentation.json");
+
+    let mut store_obj = DeviceHistoryStore::load_from_path(&history_path);
+    store_obj.seed_known_devices(&categories_path, &docs_path, &catalog_arc);
+    let history_store = Arc::new(Mutex::new(store_obj));
 
     // Initial scan
     info!("Running initial network discovery sweep...");

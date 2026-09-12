@@ -25,5 +25,5 @@ fn identify(obs) {
         return false;
     }
 
-    name.contains("iphone")
+    name.contains("iphone") || host.contains("iphone")
 }

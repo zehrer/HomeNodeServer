@@ -40,6 +40,8 @@ impl Default for WebConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeviceDocumentation {
+    #[serde(default)]
+    pub name: Option<String>,
     pub notes: String,
     #[serde(default)]
     pub manual_url: Option<String>,
@@ -413,7 +415,11 @@ async fn load_snapshot(socket_path: &Path) -> Result<RuntimeSnapshot> {
 
 #[derive(Deserialize)]
 struct SaveDocRequest {
-    notes: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
     manual_url: Option<String>,
 }
 
@@ -434,13 +440,23 @@ async fn save_device_doc_handler(
     let mut store = state.docs_store.write().await;
     let now = chrono::Utc::now().to_rfc3339();
     let existing_prod = store.get(&device_id).and_then(|d| d.product_id.clone());
-    let entry = DeviceDocumentation {
-        notes: payload.notes,
-        manual_url: payload.manual_url.filter(|u| !u.trim().is_empty()),
-        product_id: existing_prod,
-        updated_at: now,
-    };
-    store.insert(device_id, entry);
+    let clean_name = payload.name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let clean_notes = payload.notes.unwrap_or_default();
+    let clean_url = payload.manual_url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+    let is_empty_doc = clean_name.is_none() && clean_notes.trim().is_empty() && clean_url.is_none() && existing_prod.is_none();
+    if is_empty_doc {
+        store.remove(&device_id);
+    } else {
+        let entry = DeviceDocumentation {
+            name: clean_name.clone(),
+            notes: clean_notes,
+            manual_url: clean_url,
+            product_id: existing_prod,
+            updated_at: now,
+        };
+        store.insert(device_id.clone(), entry);
+    }
     if let Err(err) = persist_json(&state.docs_path, &*store) {
         error!("Failed to persist device documentation: {err}");
         return (
@@ -449,6 +465,42 @@ async fn save_device_doc_handler(
         )
             .into_response();
     }
+
+    // Also sync custom name or fallback to device_history.json
+    let history_path = state.docs_path.parent().unwrap_or(std::path::Path::new(".")).join("device_history.json");
+    if let Ok(content) = std::fs::read_to_string(&history_path) {
+        if let Ok(mut hist) = serde_json::from_str::<serde_json::Value>(&content) {
+            let norm = device_id.trim().to_lowercase();
+            if let Some(records) = hist.get_mut("records").and_then(|r| r.as_object_mut()) {
+                let mut updated = false;
+                for (k, v) in records.iter_mut() {
+                    let k_norm = k.trim().to_lowercase();
+                    let mac_norm = v.get("mac").and_then(|m| m.as_str()).map(|m| m.trim().to_lowercase());
+                    let id_norm = v.get("device_id").and_then(|m| m.as_str()).map(|m| m.trim().to_lowercase());
+                    if k_norm == norm || mac_norm.as_deref() == Some(&norm) || id_norm.as_deref() == Some(&norm) {
+                        if let Some(obj) = v.as_object_mut() {
+                            if let Some(ref new_name) = clean_name {
+                                obj.insert("display_name".to_string(), serde_json::Value::String(new_name.clone()));
+                                updated = true;
+                            } else {
+                                let fallback = obj.get("hostname")
+                                    .and_then(|h| h.as_str())
+                                    .filter(|h| !h.is_empty())
+                                    .or_else(|| obj.get("device_id").and_then(|id| id.as_str()))
+                                    .unwrap_or("Unknown Device");
+                                obj.insert("display_name".to_string(), serde_json::Value::String(fallback.to_string()));
+                                updated = true;
+                            }
+                        }
+                    }
+                }
+                if updated {
+                    let _ = persist_json(&history_path, &hist);
+                }
+            }
+        }
+    }
+
     Json(serde_json::json!({"status": "saved"})).into_response()
 }
 
@@ -1162,10 +1214,39 @@ fn build_unified_devices(
     devices: &[DeviceRecord],
     links: &HashMap<String, Vec<String>>,
 ) -> Vec<UnifiedDevice> {
+    // Defense-in-depth deduplication by IP: prioritize records with MAC and active status
+    let mut deduped: Vec<DeviceRecord> = Vec::new();
+    let mut seen_ips: HashMap<String, usize> = HashMap::new();
+    for d in devices {
+        let ip = d.metadata.get("ip").cloned().unwrap_or_default();
+        if ip.is_empty() {
+            deduped.push(d.clone());
+            continue;
+        }
+        if let Some(&existing_idx) = seen_ips.get(&ip) {
+            let existing = &deduped[existing_idx];
+            let existing_has_mac = existing.metadata.get("mac").is_some();
+            let new_has_mac = d.metadata.get("mac").is_some();
+            let existing_active = existing.metadata.get("is_active").map(|s| s.as_str()) == Some("true");
+            let new_active = d.metadata.get("is_active").map(|s| s.as_str()) == Some("true");
+
+            let prefer_new = (!existing_has_mac && new_has_mac)
+                || (!existing_active && new_active)
+                || (existing.display_name.starts_with("Host ") && !d.display_name.starts_with("Host "));
+
+            if prefer_new {
+                deduped[existing_idx] = d.clone();
+            }
+        } else {
+            seen_ips.insert(ip, deduped.len());
+            deduped.push(d.clone());
+        }
+    }
+
     let mut dev_map: HashMap<String, DeviceRecord> = HashMap::new();
     let mut mac_map: HashMap<String, String> = HashMap::new();
 
-    for d in devices {
+    for d in &deduped {
         dev_map.insert(d.device_id.clone(), d.clone());
         if let Some(mac) = d.metadata.get("mac") {
             mac_map.insert(mac.clone(), d.device_id.clone());
@@ -1184,7 +1265,7 @@ fn build_unified_devices(
     }
 
     let mut unified = Vec::new();
-    for d in devices {
+    for d in &deduped {
         if secondary_ids.contains(&d.device_id) {
             continue;
         }
@@ -1205,7 +1286,7 @@ fn build_unified_devices(
         }
 
         let candidate = if secondaries.is_empty() {
-            detect_merge_candidate(d, devices, links)
+            detect_merge_candidate(d, &deduped, links)
         } else {
             None
         };
@@ -1656,6 +1737,56 @@ fn default_category_presentation(key: &str) -> (&'static str, &'static str) {
     }
 }
 
+fn canonical_category_key(key: &str, title: &str) -> &'static str {
+    match title {
+        "Smartphones" => "phone",
+        "Tablets" => "tablet",
+        "VoIP Phones" => "voip-phone",
+        "Computers & Laptops" => "computer",
+        "Network Storage & NAS" => "nas",
+        "Routers & Gateways" => "router",
+        "Smart Lighting" => "lighting",
+        "Smart Plugs & Sockets" => "smart-plug",
+        "Smart Clocks & Displays" => "display",
+        "Sensors & Detectors" => "sensor",
+        "Solar & Energy Systems" => "energy",
+        "Home Appliances" => "appliance",
+        "LoRa & Mesh Radios" => "radio",
+        "Smart Home Hubs" => "hub",
+        "Smart Home & IoT" => "iot",
+        "Wearables" => "wearable",
+        "Cameras" => "camera",
+        "Audio & Speakers" => "audio",
+        "Printers" => "printer",
+        "TV & Streaming" => "streaming",
+        "VPN & Virtual Devices" => "vpn",
+        _ => match key {
+            "phone" | "smartphone" | "smartphones" => "phone",
+            "tablet" | "tablets" | "ipad" => "tablet",
+            "voip-phone" | "voip" => "voip-phone",
+            "computer" | "computers" | "laptop" | "pc" => "computer",
+            "nas" => "nas",
+            "router" | "gateway" => "router",
+            "lighting" | "light" => "lighting",
+            "smart-plug" | "plug" => "smart-plug",
+            "display" => "display",
+            "sensor" => "sensor",
+            "energy" => "energy",
+            "appliance" => "appliance",
+            "radio" => "radio",
+            "hub" => "hub",
+            "iot" => "iot",
+            "wearable" => "wearable",
+            "camera" => "camera",
+            "audio" => "audio",
+            "printer" => "printer",
+            "streaming" => "streaming",
+            "vpn" => "vpn",
+            _ => "network-device",
+        },
+    }
+}
+
 fn category_sort_order(key: &str) -> u32 {
     match key {
         "phone" => 1,
@@ -1775,7 +1906,7 @@ fn render_devices_page(
     let mut category_map: HashMap<String, DynamicCategory> = HashMap::new();
     for udev in &unified_devices {
         let dev = &udev.primary;
-        let mac = dev.metadata.get("mac").cloned().unwrap_or_default();
+        let mac = dev.metadata.get("mac").cloned().unwrap_or_default().trim().to_lowercase();
         let doc_key = if !mac.is_empty() { mac.clone() } else { dev.device_id.clone() };
 
         let (cat_key, title, icon) = if let Some(over_cat) = category_overrides.get(&doc_key).or_else(|| category_overrides.get(&dev.device_id)) {
@@ -1801,10 +1932,11 @@ fn render_devices_page(
             (cat, t, i)
         };
 
+        let canon_key = canonical_category_key(&cat_key, &title);
         let entry = category_map
-            .entry(cat_key.clone())
+            .entry(canon_key.to_string())
             .or_insert_with(|| DynamicCategory {
-                key: cat_key,
+                key: canon_key.to_string(),
                 title,
                 icon,
                 devices: Vec::new(),
@@ -1849,21 +1981,32 @@ fn render_devices_page(
                 let (fallback_title, fallback_icon) = default_category_presentation(&cat);
                 let t = p.metadata.get("category_title").cloned().unwrap_or_else(|| fallback_title.to_string());
                 let i = p.metadata.get("category_icon").cloned().unwrap_or_else(|| fallback_icon.to_string());
-                (cat, t, i)
+                let canon = canonical_category_key(&cat, &t);
+                (canon.to_string(), t, i)
             };
 
-            let doc = docs.get(&doc_key).cloned().unwrap_or_default();
+            let doc = docs.get(&doc_key)
+                .or_else(|| if !mac.is_empty() { docs.get(&mac) } else { None })
+                .or_else(|| docs.get(&p.device_id))
+                .cloned()
+                .unwrap_or_default();
 
-            // Match product (checking manual/doc assignment first, then discovery metadata, then catalog rules)
+            let effective_display_name = if let Some(ref custom) = doc.name.as_deref().filter(|n| !n.trim().is_empty()) {
+                custom.to_string()
+            } else {
+                p.display_name.clone()
+            };
+
+            // Match product (checking manual/doc assignment first, then fresh catalog rules, then discovery metadata)
             let prod_match = doc.product_id.as_deref().and_then(|id| catalog.find_product(id))
-                .or_else(|| p.metadata.get("product_id").and_then(|id| catalog.find_product(id)))
                 .or_else(|| {
                     catalog.match_product(
                         p.metadata.get("hostname").map(|s| s.as_str()).unwrap_or(&p.display_name),
                         p.metadata.get("vendor").map(|s| s.as_str()),
                         &[],
                     )
-                });
+                })
+                .or_else(|| p.metadata.get("product_id").and_then(|id| catalog.find_product(id)));
 
             let product_json = prod_match.map(|prod| {
                 let v = catalog.find_vendor(&prod.vendor_id);
@@ -1908,15 +2051,16 @@ fn render_devices_page(
             });
 
             let dev_matter_fabrics = extract_device_matter_fabrics(p, &udev.secondary_interfaces, matter_fabric_metas);
-
-            let is_active = p.metadata.get("status").map(|s| s == "active").unwrap_or(true);
+            let status = p.metadata.get("status").cloned().unwrap_or_else(|| "active".to_string());
+            let is_active = p.metadata.get("status").map(|s| s.as_str()) != Some("inactive");
             let first_seen = p.metadata.get("first_seen").cloned().unwrap_or_default();
             let last_seen = p.metadata.get("last_seen").cloned().unwrap_or_default();
-            let status = p.metadata.get("status").cloned().unwrap_or_else(|| if is_active { "active".to_string() } else { "inactive".to_string() });
 
             serde_json::json!({
                 "device_id": p.device_id,
-                "display_name": p.display_name,
+                "display_name": effective_display_name,
+                "original_name": p.display_name,
+                "custom_name": doc.name.unwrap_or_default(),
                 "category": category,
                 "category_title": category_title,
                 "category_icon": category_icon,
@@ -1964,12 +2108,24 @@ fn render_devices_page(
             .map(|udev| {
                 let device = &udev.primary;
                 let ip = device.metadata.get("ip").cloned().unwrap_or_else(|| "-".to_string());
-                let mac = device.metadata.get("mac").cloned().unwrap_or_default();
+                let mac = device.metadata.get("mac").cloned().unwrap_or_default().trim().to_lowercase();
                 let vendor = device.metadata.get("vendor").cloned().unwrap_or_default();
                 let web_url = device.metadata.get("web_url").cloned();
 
                 let doc_key = if !mac.is_empty() { mac.clone() } else { device.device_id.clone() };
-                let has_docs = docs.get(&doc_key).is_some_and(|d| !d.notes.trim().is_empty());
+                let doc = docs.get(&doc_key)
+                    .or_else(|| if !mac.is_empty() { docs.get(&mac) } else { None })
+                    .or_else(|| docs.get(&device.device_id))
+                    .cloned()
+                    .unwrap_or_default();
+
+                let effective_display_name = if let Some(ref custom) = doc.name.as_deref().filter(|n| !n.trim().is_empty()) {
+                    custom.to_string()
+                } else {
+                    device.display_name.clone()
+                };
+
+                let has_docs = !doc.notes.trim().is_empty() || doc.manual_url.is_some() || doc.name.is_some();
 
                 let dev_fabrics = extract_device_matter_fabrics(device, &udev.secondary_interfaces, matter_fabric_metas);
                 let mut matter_badges = String::new();
@@ -2024,11 +2180,11 @@ fn render_devices_page(
                     String::new()
                 };
 
-                let doc_icon = if has_docs { r#" <span style="color:var(--status-green); font-size:11px;" title="Documentation saved">📝✓</span>"# } else { "" };
+                let doc_icon = if has_docs { r#" <span style="color:var(--status-green); font-size:11px;" title="Documentation / Name saved">📝✓</span>"# } else { "" };
 
                 format!(
                     r#"<tr class="device-item" data-id="{}" data-status="{}" data-active="{}" onclick="selectDevice('{}')">
-                        <td>{}<strong>{}</strong>{}{}{}<br><small style="color:var(--muted)">{} &bull; {}</small></td>
+                        <td>{}<strong class="dev-display-name">{}</strong>{}{}{}<br><small style="color:var(--muted)">{} &bull; {}</small></td>
                         <td><span class="badge badge-kind">{} {}</span></td>
                         <td>{}</td>
                         <td style="text-align:right;">{}</td>
@@ -2038,7 +2194,7 @@ fn render_devices_page(
                     is_active,
                     device.device_id,
                     status_dot,
-                    device.display_name,
+                    effective_display_name,
                     offline_badge,
                     doc_icon,
                     matter_badges,
@@ -2400,7 +2556,7 @@ fn render_devices_page(
                 <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
                     <span style="font-size:24px;">${{dev.category_icon}}</span>
                     <div>
-                        <h3 style="font-size:16px;">${{dev.display_name}}</h3>
+                        <h3 id="insp-header-title" style="font-size:16px;">${{dev.display_name}}</h3>
                         <span class="badge badge-kind">${{dev.category_title}}</span>
                     </div>
                 </div>
@@ -2422,21 +2578,25 @@ fn render_devices_page(
                 ${{candidateBox}}
             </div>
 
-            <!-- Documentation & Notes -->
+            <!-- Device Identity & Documentation -->
             <div class="inspector-sec">
                 <div class="inspector-title">
-                    <span>Documentation & Notes</span>
-                    <span id="doc-status" style="color:var(--status-green); font-size:11px;"></span>
+                    <span>Identity & Documentation</span>
+                    <span id="doc-status" style="font-size:11px;"></span>
                 </div>
                 <div style="margin-bottom:8px;">
-                    <label style="font-size:11px; color:var(--muted); font-weight:600;">Manual / Documentation URL</label>
+                    <label style="font-size:11px; color:var(--muted); font-weight:600;">Device Name (Optional override)</label>
+                    <input type="text" id="insp-name" class="form-control" value="${{escapeAttr(dev.custom_name || '')}}" placeholder="${{escapeAttr(dev.display_name)}}" />
+                </div>
+                <div style="margin-bottom:8px;">
+                    <label style="font-size:11px; color:var(--muted); font-weight:600;">Manual / Documentation URL (Optional)</label>
                     <input type="url" id="insp-manual-url" class="form-control" value="${{escapeAttr(dev.manual_url)}}" placeholder="https://..." />
                 </div>
                 <div style="margin-bottom:8px;">
-                    <label style="font-size:11px; color:var(--muted); font-weight:600;">Device Notes (Markdown)</label>
+                    <label style="font-size:11px; color:var(--muted); font-weight:600;">Device Notes (Optional)</label>
                     <textarea id="insp-notes" class="form-control" placeholder="Installation location, credentials hint, firmware version...">${{escapeHtml(dev.notes)}}</textarea>
                 </div>
-                <button type="button" class="btn btn-sm btn-primary" onclick="saveInspectorNotes('${{dev.doc_key}}')">💾 Save Notes</button>
+                <button type="button" class="btn btn-sm btn-primary" onclick="saveInspectorNotes('${{dev.doc_key}}')">💾 Save Details</button>
             </div>
 
             <!-- Analyzer & Port Scan -->
@@ -2500,30 +2660,42 @@ fn render_devices_page(
     }}
 
     async function saveInspectorNotes(docKey) {{
+        const nameInput = document.getElementById('insp-name');
+        const customName = nameInput ? nameInput.value.trim() : '';
         const notes = document.getElementById('insp-notes').value;
         const manualUrl = document.getElementById('insp-manual-url').value;
         const statusEl = document.getElementById('doc-status');
 
         statusEl.innerText = 'Saving...';
+        statusEl.style.color = 'var(--muted)';
         try {{
             const res = await fetch('/api/devices/' + encodeURIComponent(docKey) + '/documentation', {{
                 method: 'POST',
                 headers: {{ 'Content-Type': 'application/json' }},
-                body: JSON.stringify({{ notes: notes, manual_url: manualUrl }})
+                body: JSON.stringify({{ name: customName, notes: notes, manual_url: manualUrl }})
             }});
             if (res.ok) {{
                 statusEl.innerText = 'Saved!';
-                const dev = allDevices.find(d => d.doc_key === docKey);
+                statusEl.style.color = 'var(--status-green)';
+                const dev = allDevices.find(d => d.doc_key === docKey || d.device_id === docKey);
                 if (dev) {{
+                    dev.custom_name = customName;
+                    dev.display_name = customName || dev.original_name || dev.display_name;
                     dev.notes = notes;
                     dev.manual_url = manualUrl;
+                    const titleEl = document.getElementById('insp-header-title');
+                    if (titleEl) titleEl.innerText = dev.display_name;
+                    const rowNameEl = document.querySelector(`tr[data-id="${{dev.device_id}}"] .dev-display-name`);
+                    if (rowNameEl) rowNameEl.innerText = dev.display_name;
                 }}
                 setTimeout(() => {{ statusEl.innerText = ''; }}, 2000);
             }} else {{
                 statusEl.innerText = 'Error saving';
+                statusEl.style.color = 'var(--status-red)';
             }}
         }} catch (e) {{
-            statusEl.innerText = 'Network error';
+            statusEl.innerText = 'Network error: ' + e;
+            statusEl.style.color = 'var(--status-red)';
         }}
     }}
 

@@ -354,6 +354,35 @@ mod tests {
             assert!(ipad_pro_m5.is_some());
             assert_eq!(ipad_pro_m5.unwrap().id, "apple_ipad_pro_m5");
 
+            // Test iPhone product variants
+            let iphone13pro = catalog.match_product("iphone13pro.fritz.box", Some("Apple Inc."), &[]);
+            assert!(iphone13pro.is_some());
+            assert_eq!(iphone13pro.unwrap().id, "apple_iphone_13_pro");
+
+            let iphone16pro = catalog.match_product("iphone16pro.fritz.box", Some("Apple Inc."), &[]);
+            assert!(iphone16pro.is_some());
+            assert_eq!(iphone16pro.unwrap().id, "apple_iphone_16_pro");
+
+            let iphone16e = catalog.match_product("iphone16e.fritz.box", Some("Apple Inc."), &[]);
+            assert!(iphone16e.is_some());
+            assert_eq!(iphone16e.unwrap().id, "apple_iphone_16e");
+
+            let iphone17pro = catalog.match_product("iphone17pro.fritz.box", Some("Apple Inc."), &[]);
+            assert!(iphone17pro.is_some());
+            assert_eq!(iphone17pro.unwrap().id, "apple_iphone_17_pro");
+
+            let iphonemini = catalog.match_product("iphone-mini.fritz.box", Some("Apple Inc."), &[]);
+            assert!(iphonemini.is_some());
+            assert_eq!(iphonemini.unwrap().id, "apple_iphone_mini");
+
+            let iphonese2 = catalog.match_product("iphonese2.fritz.box", Some("Apple Inc."), &[]);
+            assert!(iphonese2.is_some());
+            assert_eq!(iphonese2.unwrap().id, "apple_iphone_se2");
+
+            let iphone_generic = catalog.match_product("iphone.fritz.box", Some("Apple Inc."), &[]);
+            assert!(iphone_generic.is_some());
+            assert_eq!(iphone_generic.unwrap().id, "apple_iphone");
+
             // Test HP corporate laptop lookup & product match
             let hp_vendor = catalog.find_vendor_by_mac("4c:cf:7c:ca:69:be");
             assert!(hp_vendor.is_some());
