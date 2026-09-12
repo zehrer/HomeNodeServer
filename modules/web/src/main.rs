@@ -218,6 +218,7 @@ async fn main() -> Result<()> {
         .route("/api/devices/:id/analyze", post(analyze_device_handler))
         .route("/api/devices/link", post(link_devices_handler))
         .route("/api/devices/unlink", post(unlink_devices_handler))
+        .route("/api/devices/:id/forget", post(forget_device_handler))
         .route("/api/definitions/save", post(save_definition_handler))
         .with_state(WebState {
             socket_path: env.socket_path,
@@ -523,6 +524,40 @@ async fn update_device_category_handler(
     }
     Json(serde_json::json!({"status": "updated"})).into_response()
 }
+
+async fn forget_device_handler(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<WebState>,
+) -> Response {
+    let mut client = match connect_control_client(&state.socket_path).await {
+        Ok(c) => c,
+        Err(err) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let mut params = std::collections::HashMap::new();
+    params.insert("device_id".to_string(), id);
+    match client
+        .send_command(homenode_sdk::proto::ModuleCommand {
+            target_module_id: "network-discovery".to_string(),
+            action: "forget".to_string(),
+            params,
+        })
+        .await
+    {
+        Ok(_) => Json(serde_json::json!({"status": "forgotten"})).into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 
 // ------------------------------------------------------------------------------------------------
 // Matter Fabrics API Handlers
@@ -1454,6 +1489,31 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
             font-weight: 600;
         }}
         
+        .status-pills {{
+            display: flex;
+            gap: 6px;
+            align-items: center;
+            margin-bottom: 14px;
+            flex-wrap: wrap;
+        }}
+        .status-pill {{
+            padding: 4px 11px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--surface);
+            font-size: 12px;
+            cursor: pointer;
+            color: var(--muted);
+            transition: all 0.15s;
+        }}
+        .status-pill:hover {{ color: var(--text); border-color: var(--muted); }}
+        .status-pill.active {{
+            background: var(--primary-bg);
+            border-color: var(--primary);
+            color: var(--primary);
+            font-weight: 600;
+        }}
+        
         .search-input {{
             padding: 6px 12px;
             border-radius: 6px;
@@ -1705,6 +1765,12 @@ fn render_devices_page(
     }
 
     let unified_devices = build_unified_devices(&snapshot.devices, links);
+    let total_count = unified_devices.len();
+    let active_count = unified_devices
+        .iter()
+        .filter(|u| u.primary.metadata.get("status").map(|s| s.as_str()) != Some("inactive"))
+        .count();
+    let inactive_count = total_count.saturating_sub(active_count);
 
     let mut category_map: HashMap<String, DynamicCategory> = HashMap::new();
     for udev in &unified_devices {
@@ -1843,6 +1909,11 @@ fn render_devices_page(
 
             let dev_matter_fabrics = extract_device_matter_fabrics(p, &udev.secondary_interfaces, matter_fabric_metas);
 
+            let is_active = p.metadata.get("status").map(|s| s == "active").unwrap_or(true);
+            let first_seen = p.metadata.get("first_seen").cloned().unwrap_or_default();
+            let last_seen = p.metadata.get("last_seen").cloned().unwrap_or_default();
+            let status = p.metadata.get("status").cloned().unwrap_or_else(|| if is_active { "active".to_string() } else { "inactive".to_string() });
+
             serde_json::json!({
                 "device_id": p.device_id,
                 "display_name": p.display_name,
@@ -1862,6 +1933,10 @@ fn render_devices_page(
                 "candidate": candidate_json,
                 "product": product_json,
                 "matter_fabrics": dev_matter_fabrics,
+                "status": status,
+                "is_active": is_active,
+                "first_seen": first_seen,
+                "last_seen": last_seen,
             })
         })
         .collect();
@@ -1928,18 +2003,43 @@ fn render_devices_page(
                     String::new()
                 };
 
+                let is_active = device.metadata.get("status").map(|s| s.as_str()) != Some("inactive");
+                let last_seen = device.metadata.get("last_seen").cloned().unwrap_or_default();
+                let status_val = if is_active { "active" } else { "inactive" };
+
+                let status_dot = if is_active {
+                    r#"<span class="status-dot" style="background:#10b981; display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px;" title="Online / Active"></span>"#
+                } else {
+                    r#"<span class="status-dot" style="background:#94a3b8; display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px;" title="Offline / Former"></span>"#
+                };
+
+                let offline_badge = if !is_active {
+                    let ls_hint = if !last_seen.is_empty() {
+                        format!(r#" title="Last seen: {}""#, last_seen)
+                    } else {
+                        String::new()
+                    };
+                    format!(r#" <span class="badge" style="background:#f1f5f9; color:#64748b; font-size:10px; border:1px solid #cbd5e1; padding:1px 5px;"{}>⚪ Offline</span>"#, ls_hint)
+                } else {
+                    String::new()
+                };
+
                 let doc_icon = if has_docs { r#" <span style="color:var(--status-green); font-size:11px;" title="Documentation saved">📝✓</span>"# } else { "" };
 
                 format!(
-                    r#"<tr class="device-item" data-id="{}" onclick="selectDevice('{}')">
-                        <td><strong>{}</strong>{}{}<br><small style="color:var(--muted)">{} &bull; {}</small></td>
+                    r#"<tr class="device-item" data-id="{}" data-status="{}" data-active="{}" onclick="selectDevice('{}')">
+                        <td>{}<strong>{}</strong>{}{}{}<br><small style="color:var(--muted)">{} &bull; {}</small></td>
                         <td><span class="badge badge-kind">{} {}</span></td>
                         <td>{}</td>
                         <td style="text-align:right;">{}</td>
                     </tr>"#,
                     device.device_id,
+                    status_val,
+                    is_active,
                     device.device_id,
+                    status_dot,
                     device.display_name,
+                    offline_badge,
                     doc_icon,
                     matter_badges,
                     device.device_id,
@@ -1986,6 +2086,7 @@ fn render_devices_page(
     const allDevices = {};
     const allProducts = {};
     let currentCategory = 'all';
+    let currentStatusFilter = 'all';
     let selectedDeviceId = null;
 
     function selectCategory(cat, el) {{
@@ -1993,6 +2094,42 @@ fn render_devices_page(
         document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
         el.classList.add('active');
         filterDevices();
+    }}
+
+    function setStatusFilter(status, el) {{
+        currentStatusFilter = status;
+        document.querySelectorAll('.status-pill').forEach(p => p.classList.remove('active'));
+        el.classList.add('active');
+        filterDevices();
+    }}
+
+    function formatRelativeTime(iso) {{
+        if (!iso) return 'Unknown';
+        const date = new Date(iso);
+        if (isNaN(date.getTime())) return iso;
+        const now = new Date();
+        const diffSec = Math.floor((now - date) / 1000);
+        if (diffSec < 0 || diffSec < 60) return 'Just now';
+        const diffMin = Math.floor(diffSec / 60);
+        if (diffMin < 60) return diffMin + 'm ago';
+        const diffHours = Math.floor(diffMin / 60);
+        if (diffHours < 24) return diffHours + 'h ago';
+        const diffDays = Math.floor(diffHours / 24);
+        if (diffDays < 7) return diffDays + 'd ago';
+        return date.toLocaleDateString(undefined, {{ month: 'short', day: 'numeric', year: 'numeric' }});
+    }}
+
+    function formatFullDate(iso) {{
+        if (!iso) return 'Not recorded';
+        const date = new Date(iso);
+        if (isNaN(date.getTime())) return iso;
+        return date.toLocaleString(undefined, {{
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+        }});
     }}
 
     function filterDevices() {{
@@ -2008,7 +2145,10 @@ fn render_devices_page(
             rows.forEach(row => {{
                 const text = row.innerText.toLowerCase();
                 const matchesSearch = !q || text.includes(q);
-                if (matchesSearch) {{
+                const status = row.getAttribute('data-status') || 'active';
+                const matchesStatus = (currentStatusFilter === 'all' || currentStatusFilter === status);
+
+                if (matchesSearch && matchesStatus) {{
                     row.style.display = '';
                     visibleRows++;
                 }} else {{
@@ -2215,6 +2355,46 @@ fn render_devices_page(
             `;
         }}
 
+        let statusBadge = '';
+        if (dev.is_active) {{
+            statusBadge = `
+                <div style="display:flex; align-items:center; justify-content:space-between; margin-top:8px; padding:6px 10px; background:#ecfdf5; border:1px solid #a7f3d0; border-radius:6px;">
+                    <div style="display:flex; align-items:center; gap:6px;">
+                        <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#10b981;"></span>
+                        <span style="font-weight:600; font-size:12px; color:#065f46;">Active (Online)</span>
+                    </div>
+                    <span style="font-size:11px; color:#047857;" title="${{dev.last_seen || ''}}">Seen: ${{formatRelativeTime(dev.last_seen)}}</span>
+                </div>
+            `;
+        }} else {{
+            statusBadge = `
+                <div style="display:flex; align-items:center; justify-content:space-between; margin-top:8px; padding:6px 10px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:6px;">
+                    <div style="display:flex; align-items:center; gap:6px;">
+                        <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#94a3b8;"></span>
+                        <span style="font-weight:600; font-size:12px; color:#475569;">Former Device (Offline)</span>
+                    </div>
+                    <span style="font-size:11px; color:#64748b;" title="${{dev.last_seen || ''}}">Last seen: ${{formatRelativeTime(dev.last_seen)}}</span>
+                </div>
+            `;
+        }}
+
+        let historyBox = `
+            <div class="inspector-sec" style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:8px 10px; margin-top:8px;">
+                <div style="font-size:11px; font-weight:600; color:var(--muted); margin-bottom:4px;">⏱️ Device History</div>
+                <div style="display:grid; grid-template-columns: 85px 1fr; gap: 3px 6px; font-size:11px;">
+                    <span style="color:var(--muted);">First Seen:</span> <span title="${{dev.first_seen || ''}}">${{formatFullDate(dev.first_seen)}}</span>
+                    <span style="color:var(--muted);">Last Seen:</span> <span title="${{dev.last_seen || ''}}">${{formatFullDate(dev.last_seen)}}</span>
+                </div>
+                ${{!dev.is_active ? `
+                    <div style="margin-top:8px; text-align:right;">
+                        <button type="button" class="btn btn-sm" style="color:var(--status-red); border-color:#fca5a5; font-size:11px; cursor:pointer;" onclick="forgetDevice('${{dev.device_id}}', '${{escapeAttr(dev.display_name)}}')">
+                            🗑️ Remove from History
+                        </button>
+                    </div>
+                ` : ''}}
+            </div>
+        `;
+
         panel.innerHTML = `
             <div>
                 <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
@@ -2224,6 +2404,8 @@ fn render_devices_page(
                         <span class="badge badge-kind">${{dev.category_title}}</span>
                     </div>
                 </div>
+                ${{statusBadge}}
+                ${{historyBox}}
                 ${{categorySelectorBox}}
                 ${{webBtn}}
                 ${{productCard}}
@@ -2498,6 +2680,25 @@ fn render_devices_page(
         }}
     }}
 
+    async function forgetDevice(deviceId, deviceName) {{
+        if (!confirm(`Are you sure you want to remove "${{deviceName || deviceId}}" from history?\n\nIf this device connects to the network again in the future, it will be rediscovered.`)) {{
+            return;
+        }}
+
+        try {{
+            const res = await fetch('/api/devices/' + encodeURIComponent(deviceId) + '/forget', {{
+                method: 'POST'
+            }});
+            if (res.ok) {{
+                window.location.reload();
+            }} else {{
+                alert('Failed to remove device from history.');
+            }}
+        }} catch (e) {{
+            alert('Network error: ' + e);
+        }}
+    }}
+
     // Initial load: select device from hash or first available device
     window.addEventListener('DOMContentLoaded', () => {{
         const hash = (window.location.hash || '').replace('#', '');
@@ -2526,6 +2727,12 @@ fn render_devices_page(
                 </form>
             </div>
         </div>
+        <div class="status-pills">
+            <span style="font-size:12px; font-weight:600; color:var(--muted); margin-right:4px;">Filter:</span>
+            <button type="button" class="status-pill active" id="filter-status-all" onclick="setStatusFilter('all', this)">All ({})</button>
+            <button type="button" class="status-pill" id="filter-status-active" onclick="setStatusFilter('active', this)">🟢 Active ({})</button>
+            <button type="button" class="status-pill" id="filter-status-inactive" onclick="setStatusFilter('inactive', this)">⚪ Former / Offline ({})</button>
+        </div>
         <div class="pills">{}</div>
         
         <div class="workspace-grid">
@@ -2548,6 +2755,9 @@ fn render_devices_page(
 
         {}"#,
         unified_devices.len(),
+        total_count,
+        active_count,
+        inactive_count,
         pills_html,
         group_cards_html,
         script

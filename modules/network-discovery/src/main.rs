@@ -1,18 +1,22 @@
+mod history;
 mod scanner;
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use tracing::{error, info};
+use tokio::sync::Mutex;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use homenode_sdk::proto::{HealthState, ModuleRegistration, UpsertDevicesRequest};
 use homenode_sdk::{connect_control_client, device_record, module_health, module_manifest, ModuleEnvironment};
 
-use crate::scanner::{DiscoveredDevice, NetworkScanner, ScannerConfig};
+use crate::history::DeviceHistoryStore;
+use crate::scanner::{NetworkScanner, ScannerConfig};
 
 #[derive(Debug, Deserialize)]
 struct NetworkDiscoveryConfig {
@@ -148,12 +152,34 @@ async fn main() -> Result<()> {
         std::sync::Arc::new(catalog),
     );
 
+    let data_dir = workspace_root.join("data");
+    let _ = std::fs::create_dir_all(&data_dir);
+    let history_path = data_dir.join("device_history.json");
+    let history_store = Arc::new(Mutex::new(DeviceHistoryStore::load_from_path(&history_path)));
+
     // Initial scan
     info!("Running initial network discovery sweep...");
-    let mut devices = run_scan_and_convert(&scanner, &env.module_id).await;
+    let sweep = match scanner.scan().await {
+        Ok(discovered) => discovered,
+        Err(err) => {
+            error!("Initial network scan failed: {err}");
+            Vec::new()
+        }
+    };
+
+    let mut devices = {
+        let mut store = history_store.lock().await;
+        let devs = store.reconcile_sweep(&env.module_id, sweep);
+        if let Err(e) = store.save_to_path(&history_path) {
+            warn!("Failed to save initial device history: {e}");
+        }
+        devs
+    };
     append_demo_devices(&env.module_id, &mut devices, &config.demo_devices);
 
-    let initial_count = devices.len();
+    let active_count = devices.iter().filter(|d| d.metadata.get("status").map(|s| s.as_str()) == Some("active")).count();
+    let total_count = devices.len();
+
     client
         .upsert_devices(UpsertDevicesRequest {
             module_id: env.module_id.clone(),
@@ -165,7 +191,7 @@ async fn main() -> Result<()> {
         .report_health(module_health(
             env.module_id.clone(),
             HealthState::Ready,
-            format!("{} ({} devices online)", config.health_message, initial_count),
+            format!("{} ({} active / {} total)", config.health_message, active_count, total_count),
         ))
         .await?;
 
@@ -183,6 +209,8 @@ async fn main() -> Result<()> {
     let cmd_socket_path = env.socket_path.clone();
     let cmd_module_id = env.module_id.clone();
     let trigger_sender = trigger_tx.clone();
+    let history_store_cmd = history_store.clone();
+    let history_path_cmd = history_path.clone();
 
     tokio::spawn(async move {
         loop {
@@ -200,6 +228,16 @@ async fn main() -> Result<()> {
                                 if cmd.action == "scan" {
                                     info!("Received on-demand scan command from supervisor");
                                     let _ = trigger_sender.try_send(());
+                                } else if cmd.action == "forget" {
+                                    if let Some(target) = cmd.params.get("device_id").or_else(|| cmd.params.get("id")) {
+                                        info!("Received command to forget device: {}", target);
+                                        let mut store = history_store_cmd.lock().await;
+                                        if store.forget_device(target) {
+                                            let _ = store.save_to_path(&history_path_cmd);
+                                            info!("Device {} removed from history, triggering rescan", target);
+                                            let _ = trigger_sender.try_send(());
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -216,6 +254,9 @@ async fn main() -> Result<()> {
         }
     });
 
+    let history_store_loop = history_store.clone();
+    let history_path_loop = history_path.clone();
+
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(scan_interval);
         ticker.tick().await; // skip immediate first tick
@@ -230,13 +271,31 @@ async fn main() -> Result<()> {
                 }
             }
 
-            let mut updated = run_scan_and_convert(&scanner, &module_id).await;
+            let sweep = match scanner.scan().await {
+                Ok(discovered) => discovered,
+                Err(err) => {
+                    error!("Network scan sweep failed: {err}");
+                    Vec::new()
+                }
+            };
+
+            let mut updated = {
+                let mut store = history_store_loop.lock().await;
+                let devs = store.reconcile_sweep(&module_id, sweep);
+                if let Err(e) = store.save_to_path(&history_path_loop) {
+                    warn!("Failed to save device history: {e}");
+                }
+                devs
+            };
+
             append_demo_devices(&module_id, &mut updated, &demo_devices);
             if updated.is_empty() {
                 continue;
             }
 
-            let count = updated.len();
+            let active_count = updated.iter().filter(|d| d.metadata.get("status").map(|s| s.as_str()) == Some("active")).count();
+            let total_count = updated.len();
+
             match connect_control_client(&socket_path).await {
                 Ok(mut rpc) => {
                     if let Err(e) = rpc
@@ -252,7 +311,7 @@ async fn main() -> Result<()> {
                             .report_health(module_health(
                                 module_id.clone(),
                                 HealthState::Ready,
-                                format!("{} ({} devices online)", health_message, count),
+                                format!("{} ({} active / {} total)", health_message, active_count, total_count),
                             ))
                             .await;
                     }
@@ -266,22 +325,6 @@ async fn main() -> Result<()> {
 
     std::future::pending::<()>().await;
     Ok(())
-}
-
-async fn run_scan_and_convert(
-    scanner: &NetworkScanner,
-    module_id: &str,
-) -> Vec<homenode_sdk::proto::DeviceRecord> {
-    match scanner.scan().await {
-        Ok(discovered) => discovered
-            .into_iter()
-            .map(|dev| convert_device(module_id, dev))
-            .collect(),
-        Err(err) => {
-            error!("Network scan failed: {err}");
-            Vec::new()
-        }
-    }
 }
 
 fn append_demo_devices(
@@ -301,59 +344,6 @@ fn append_demo_devices(
             ));
         }
     }
-}
-
-fn convert_device(
-    module_id: &str,
-    device: DiscoveredDevice,
-) -> homenode_sdk::proto::DeviceRecord {
-    let mut metadata = HashMap::new();
-    metadata.insert("ip".to_string(), device.ip);
-    metadata.insert("interface".to_string(), device.interface);
-    if let Some(mac) = device.mac {
-        metadata.insert("mac".to_string(), mac);
-    }
-    if let Some(host) = device.hostname {
-        metadata.insert("hostname".to_string(), host);
-    }
-    if let Some(vendor) = device.vendor {
-        metadata.insert("vendor".to_string(), vendor);
-    }
-    if let Some(title) = device.category_title {
-        metadata.insert("category_title".to_string(), title);
-    }
-    if let Some(icon) = device.category_icon {
-        metadata.insert("category_icon".to_string(), icon);
-    }
-    if let Some(script_id) = device.script_id {
-        metadata.insert("script_id".to_string(), script_id);
-    }
-    if let Some(web_url) = device.web_url {
-        metadata.insert("web_url".to_string(), web_url);
-    }
-    if let Some(product_id) = device.product_id {
-        metadata.insert("product_id".to_string(), product_id);
-    }
-    if let Some(product_name) = device.product_name {
-        metadata.insert("product_name".to_string(), product_name);
-    }
-    if let Some(vendor_id) = device.vendor_id {
-        metadata.insert("vendor_id".to_string(), vendor_id);
-    }
-    if let Some(matter_fabrics) = device.matter_fabrics {
-        metadata.insert("matter_fabrics".to_string(), matter_fabrics);
-    }
-    metadata.insert("category".to_string(), device.kind.clone());
-    metadata.insert("source".to_string(), device.source);
-
-    device_record(
-        module_id,
-        device.device_id,
-        device.display_name,
-        device.kind,
-        device.capabilities,
-        metadata,
-    )
 }
 
 async fn wait_for_client(
