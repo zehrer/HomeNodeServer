@@ -1,0 +1,45 @@
+health_message = "BTHome BLE Gateway receiver active"
+
+# Ingest method:
+# "shelly-gateway" (Recommended): Listens for BLE advertisement events forwarded by Shelly Gen2/Gen3/Pro devices via HTTP Webhooks.
+mode = "shelly-gateway"
+
+# Local HTTP & WebSocket port on HomeNode Server to receive Shelly BLE events
+# Endpoints:
+# - POST /bthome & /api/bthome (HTTP Webhook)
+# - GET  /ws & /rpc (Native Outbound WebSocket)
+listen_port = 8124
+
+# Sliding-window deduplication time in milliseconds.
+# If multiple Shellys pick up the same sensor packet, packets with matching (MAC, packet_id)
+# within this time window are deduplicated and processed exactly once.
+dedup_window_ms = 2500
+
+# Minimum RSSI threshold in dBm to accept packets (filters out noise / marginal signals)
+min_rssi = -90
+
+# Heartbeat & supervisor health reporting interval in seconds
+scan_interval_secs = 10
+
+# Shelly Gateways in your network (Shelly Gen2, Gen3, Pro with Bluetooth)
+# HomeNode will automatically connect to them via local RPC, read their native BTHome cache,
+# and configure their Outbound WebSocket to stream events in real-time (< 5ms).
+shelly_gateways = [
+    "192.168.178.166",
+    "192.168.178.164",
+    "192.168.178.172",
+    "192.168.178.134",
+    "192.168.178.154"
+]
+
+# Automatically tell Shellys on the network to connect their Outbound WebSocket to HomeNode
+auto_connect_shelly_ws = true
+
+# Host IP of this HomeNode Server reachable by Shellys on your LAN
+homenode_host = "192.168.178.46"
+
+# Pre-configured BTHome / Shelly BLU device names & optional bind_keys (for encrypted payloads)
+# Unconfigured devices will be automatically discovered and assigned friendly default names.
+# [[devices]]
+# mac = "f8:44:77:06:50:84"
+# name = "Shelly BLU Button 1"

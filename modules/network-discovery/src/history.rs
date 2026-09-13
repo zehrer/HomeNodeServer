@@ -32,6 +32,8 @@ pub struct DeviceHistoryRecord {
     pub capabilities: Vec<String>,
     pub source: String,
     #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default)]
     pub web_url: Option<String>,
     #[serde(default)]
     pub product_id: Option<String>,
@@ -44,6 +46,8 @@ pub struct DeviceHistoryRecord {
     pub first_seen: String,
     pub last_seen: String,
     pub is_active: bool,
+    #[serde(default)]
+    pub was_ever_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -74,6 +78,21 @@ impl DeviceHistoryStore {
                         path.display()
                     );
                     let mut store = store;
+                    for record in store.records.values_mut() {
+                        if record.sources.is_empty() && !record.source.is_empty() {
+                            record.sources.push(record.source.clone());
+                        }
+                        if record.is_active {
+                            record.was_ever_active = true;
+                        } else if !record.was_ever_active {
+                            let is_pure_tr064 = record.source == "fritzbox-tr064"
+                                && record.sources.iter().all(|s| s == "fritzbox-tr064")
+                                && record.capabilities.iter().all(|c| c == "fritzbox-tr064" || c == "ethernet" || c == "l2" || c == "ip");
+                            if !is_pure_tr064 {
+                                record.was_ever_active = true;
+                            }
+                        }
+                    }
                     store.cleanup_duplicates();
                     store
                 }
@@ -164,6 +183,18 @@ impl DeviceHistoryStore {
     fn merge_records(target: &mut DeviceHistoryRecord, other: DeviceHistoryRecord) {
         if other.is_active {
             target.is_active = true;
+            target.was_ever_active = true;
+        }
+        if other.was_ever_active {
+            target.was_ever_active = true;
+        }
+        for s in other.sources {
+            if !target.sources.contains(&s) {
+                target.sources.push(s);
+            }
+        }
+        if !target.sources.contains(&other.source) && !other.source.is_empty() {
+            target.sources.push(other.source.clone());
         }
         if other.last_seen > target.last_seen {
             target.last_seen = other.last_seen;
@@ -280,6 +311,7 @@ impl DeviceHistoryStore {
                             vendor,
                             capabilities: vec!["configured".to_string()],
                             source: "configuration".to_string(),
+                            sources: vec!["configuration".to_string()],
                             web_url: None,
                             product_id: None,
                             product_name: None,
@@ -288,6 +320,7 @@ impl DeviceHistoryStore {
                             first_seen: now.clone(),
                             last_seen: now.clone(),
                             is_active: false,
+                            was_ever_active: true,
                         };
                         self.records.insert(norm, rec);
                     }
@@ -344,6 +377,7 @@ impl DeviceHistoryStore {
                             vendor,
                             capabilities: vec!["documented".to_string()],
                             source: "documentation".to_string(),
+                            sources: vec!["documentation".to_string()],
                             web_url: None,
                             product_id: None,
                             product_name: None,
@@ -352,6 +386,7 @@ impl DeviceHistoryStore {
                             first_seen: now.clone(),
                             last_seen: now.clone(),
                             is_active: false,
+                            was_ever_active: true,
                         };
                         self.records.insert(norm, rec);
                     }
@@ -411,11 +446,28 @@ impl DeviceHistoryStore {
 
             if let Some(old_key) = matched_key {
                 let mut existing = self.records.remove(&old_key).unwrap();
-                existing.last_seen = now.clone();
-                existing.is_active = true;
+                let is_active = dev.is_active.unwrap_or(true);
+                if is_active {
+                    existing.last_seen = now.clone();
+                    existing.is_active = true;
+                    existing.was_ever_active = true;
+                } else if !existing.is_active {
+                    // Stays inactive, preserve earlier last_seen
+                } else {
+                    existing.is_active = false;
+                }
                 existing.ip = dev.ip.clone();
                 existing.interface = dev.interface.clone();
                 existing.source = dev.source.clone();
+
+                for s in dev.sources {
+                    if !existing.sources.contains(&s) {
+                        existing.sources.push(s);
+                    }
+                }
+                if !existing.sources.contains(&dev.source) && !dev.source.is_empty() {
+                    existing.sources.push(dev.source.clone());
+                }
 
                 if dev.mac.is_some() {
                     existing.mac = dev.mac.clone();
@@ -462,6 +514,12 @@ impl DeviceHistoryStore {
                 }
                 self.records.insert(target_key, existing);
             } else {
+                let is_active = dev.is_active.unwrap_or(true);
+                let was_ever_active = is_active;
+                let mut sources = dev.sources;
+                if sources.is_empty() && !dev.source.is_empty() {
+                    sources.push(dev.source.clone());
+                }
                 let rec = DeviceHistoryRecord {
                     device_id: dev.device_id,
                     display_name: dev.display_name,
@@ -476,6 +534,7 @@ impl DeviceHistoryStore {
                     vendor: dev.vendor,
                     capabilities: dev.capabilities,
                     source: dev.source,
+                    sources,
                     web_url: dev.web_url,
                     product_id: dev.product_id,
                     product_name: dev.product_name,
@@ -483,7 +542,8 @@ impl DeviceHistoryStore {
                     matter_fabrics: dev.matter_fabrics,
                     first_seen: now.clone(),
                     last_seen: now.clone(),
-                    is_active: true,
+                    is_active,
+                    was_ever_active,
                 };
                 self.records.insert(target_key, rec);
             }
@@ -557,12 +617,26 @@ impl DeviceHistoryStore {
         }
         metadata.insert("category".to_string(), r.kind.clone());
         metadata.insert("source".to_string(), r.source.clone());
+        let sources_str = if r.sources.is_empty() {
+            r.source.clone()
+        } else {
+            r.sources.join(",")
+        };
+        metadata.insert("sources".to_string(), sources_str);
 
         // History & Status fields
         metadata.insert("first_seen".to_string(), r.first_seen.clone());
         metadata.insert("last_seen".to_string(), r.last_seen.clone());
-        metadata.insert("status".to_string(), if r.is_active { "active".to_string() } else { "inactive".to_string() });
+        let status = if r.is_active {
+            "active"
+        } else if r.was_ever_active {
+            "inactive"
+        } else {
+            "archive"
+        };
+        metadata.insert("status".to_string(), status.to_string());
         metadata.insert("is_active".to_string(), if r.is_active { "true".to_string() } else { "false".to_string() });
+        metadata.insert("was_ever_active".to_string(), if r.was_ever_active { "true".to_string() } else { "false".to_string() });
 
         device_record(
             module_id,
@@ -594,11 +668,13 @@ mod tests {
             vendor: Some("Apple Inc.".to_string()),
             capabilities: vec!["ip".to_string()],
             source: "arp".to_string(),
+            sources: vec!["arp".to_string()],
             web_url: None,
             product_id: None,
             product_name: None,
             vendor_id: None,
             matter_fabrics: None,
+            is_active: None,
         }
     }
 
@@ -717,5 +793,41 @@ mod tests {
         assert_eq!(preserved.kind, "phone", "Category must not be downgraded to network-device");
         assert_eq!(preserved.category_title.as_deref(), Some("Smartphones"));
         assert_eq!(preserved.category_icon.as_deref(), Some("📱"));
+    }
+
+    #[test]
+    fn reconcile_distinguishes_homenode_history_from_router_archive() {
+        let mut store = DeviceHistoryStore::new();
+
+        // 1. Device A: Active HomeNode device
+        let dev_a = sample_device("192.168.178.10", "aa:bb:cc:dd:ee:01", "MacBook");
+        
+        // 2. Device B: Pure inactive FRITZ!Box TR-064 device
+        let mut dev_b = sample_device("192.168.178.99", "aa:bb:cc:dd:ee:99", "OldGuestPhone");
+        dev_b.source = "fritzbox-tr064".to_string();
+        dev_b.sources = vec!["fritzbox-tr064".to_string()];
+        dev_b.is_active = Some(false);
+
+        let records1 = store.reconcile_sweep("network-discovery", vec![dev_a, dev_b]);
+        assert_eq!(records1.len(), 2);
+
+        let proto_a = records1.iter().find(|r| r.device_id == "net-192-168-178-10").unwrap();
+        let proto_b = records1.iter().find(|r| r.device_id == "net-192-168-178-99").unwrap();
+
+        assert_eq!(proto_a.metadata.get("status").map(|s| s.as_str()), Some("active"));
+        assert_eq!(proto_a.metadata.get("was_ever_active").map(|s| s.as_str()), Some("true"));
+
+        // Pure TR-064 device should have status "archive"
+        assert_eq!(proto_b.metadata.get("status").map(|s| s.as_str()), Some("archive"));
+        assert_eq!(proto_b.metadata.get("was_ever_active").map(|s| s.as_str()), Some("false"));
+        assert_eq!(proto_b.metadata.get("sources").map(|s| s.as_str()), Some("fritzbox-tr064"));
+
+        // Sweep 2: Device A goes offline (HomeNode device disappears)
+        let records2 = store.reconcile_sweep("network-discovery", vec![]);
+        let proto_a_sweep2 = records2.iter().find(|r| r.device_id == "net-192-168-178-10").unwrap();
+
+        // Device A was previously active, so status becomes "inactive" (genuine HomeNode history!)
+        assert_eq!(proto_a_sweep2.metadata.get("status").map(|s| s.as_str()), Some("inactive"));
+        assert_eq!(proto_a_sweep2.metadata.get("was_ever_active").map(|s| s.as_str()), Some("true"));
     }
 }

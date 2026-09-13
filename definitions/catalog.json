@@ -239,6 +239,46 @@
       "oui_prefixes": [],
       "protocols": ["vpn", "wireguard", "ipsec"],
       "description": "Virtual Private Network tunnels connecting remote mobile devices, laptops, and off-site endpoints to the home network."
+    },
+    {
+      "id": "ubiquiti",
+      "name": "Ubiquiti Inc. (UniFi)",
+      "website": "https://ui.com",
+      "support_url": "https://help.ui.com",
+      "icon": "🌐",
+      "oui_prefixes": ["b0:b9:8a", "fc:ec:da", "78:45:58", "04:18:d6", "e0:63:da"],
+      "protocols": ["lan", "snmp", "ssh"],
+      "description": "Enterprise and prosumer network switches, access points, and UniFi network gateways."
+    },
+    {
+      "id": "generic_switch",
+      "name": "Network Switch",
+      "website": null,
+      "support_url": null,
+      "icon": "🔀",
+      "oui_prefixes": ["fa:ce:48", "fa:ce:00"],
+      "protocols": ["lan", "lldp"],
+      "description": "Layer 2 Ethernet switches and Gigabit network distribution hardware."
+    },
+    {
+      "id": "lsc_smart_connect",
+      "name": "LSC Smart Connect (Tuya)",
+      "website": "https://www.lsc-smartconnect.com",
+      "support_url": "https://www.lsc-smartconnect.com/support",
+      "icon": "☀️",
+      "oui_prefixes": [],
+      "protocols": ["wifi", "tuya-local", "cloud"],
+      "description": "Smart home devices and micro solar converters powered by the Tuya IoT ecosystem with local port 6668 protocol support."
+    },
+    {
+      "id": "elegoo",
+      "name": "Elegoo Inc.",
+      "website": "https://www.elegoo.com",
+      "support_url": "https://www.elegoo.com/pages/support",
+      "icon": "🧊",
+      "oui_prefixes": ["a4:e8:8d"],
+      "protocols": ["lan", "wifi", "klipper", "moonraker", "http"],
+      "description": "Manufacturer of high-speed FDM and resin 3D printers, laser engravers, and smart maker hardware."
     }
   ],
   "products": [
@@ -811,6 +851,81 @@
       "documentation_url": "https://avm.de/service/vpn/",
       "specs": "Encrypted remote access tunnel endpoint configured on FRITZ!Box for secure off-site communication.",
       "rhai_script_ref": "vpn_connection.rhai"
+    },
+    {
+      "id": "unmanaged_switch_l2",
+      "vendor_id": "generic_switch",
+      "name": "Unmanaged Gigabit Switch (L2)",
+      "model_number": "Layer 2 Switch",
+      "category": "switch",
+      "category_icon": "🔀",
+      "connectivity": ["lan", "lldp"],
+      "matter_device_type": null,
+      "default_ports": [],
+      "hostname_patterns": ["switch"],
+      "documentation_url": null,
+      "specs": "Unmanaged Layer 2 Ethernet switch forwarding MAC frames without an assigned IP address.",
+      "rhai_script_ref": "network_switch.rhai"
+    },
+    {
+      "id": "managed_network_switch",
+      "vendor_id": "generic_switch",
+      "name": "Managed Network Switch",
+      "model_number": "Managed Switch",
+      "category": "switch",
+      "category_icon": "🔀",
+      "connectivity": ["lan", "http", "snmp"],
+      "matter_device_type": null,
+      "default_ports": [80, 443],
+      "hostname_patterns": ["switch-1", "switch-2"],
+      "documentation_url": null,
+      "specs": "Configurable managed Ethernet switch with VLAN, QoS, and administrative web management interface.",
+      "rhai_script_ref": "network_switch.rhai"
+    },
+    {
+      "id": "unifi_switch_og",
+      "vendor_id": "ubiquiti",
+      "name": "UniFi Switch",
+      "model_number": "UniFi Switch",
+      "category": "switch",
+      "category_icon": "🔀",
+      "connectivity": ["lan", "ssh", "snmp"],
+      "matter_device_type": null,
+      "default_ports": [22, 80],
+      "hostname_patterns": ["switch-og"],
+      "documentation_url": "https://help.ui.com",
+      "specs": "Ubiquiti UniFi managed Gigabit switch with UniFi controller management integration.",
+      "rhai_script_ref": "network_switch.rhai"
+    },
+    {
+      "id": "lsc_micro_solar_inverter",
+      "vendor_id": "lsc_smart_connect",
+      "name": "LSC Smart Connect Solar Converter",
+      "model_number": "LSC-SOLAR-INV",
+      "category": "energy",
+      "category_icon": "☀️",
+      "connectivity": ["wifi", "tuya-local"],
+      "matter_device_type": null,
+      "default_ports": [6668],
+      "hostname_patterns": ["lwip0", "lwip0.fritz.box"],
+      "documentation_url": "https://www.lsc-smartconnect.com",
+      "specs": "Micro solar converter / inverter with Wi-Fi connectivity, Tuya Local protocol (encrypted port 6668) reporting solar wattage and energy yield.",
+      "rhai_script_ref": "lsc_solar_inverter.rhai"
+    },
+    {
+      "id": "elegoo_centauri_carbon",
+      "vendor_id": "elegoo",
+      "name": "Elegoo Centauri Carbon",
+      "model_number": "Centauri Carbon",
+      "category": "3d-printer",
+      "category_icon": "🧊",
+      "connectivity": ["lan", "wifi", "klipper", "moonraker"],
+      "matter_device_type": null,
+      "default_ports": [80, 443, 7125],
+      "hostname_patterns": ["centauri-carbon", "centauri", "carbon"],
+      "documentation_url": "https://www.elegoo.com/products/elegoo-centauri-carbon-3d-printer",
+      "specs": "Enclosed CoreXY high-speed 3D printer with integrated Klipper/Moonraker web management interface, camera monitoring, and hardened steel nozzle.",
+      "rhai_script_ref": "three_d_printer.rhai"
     }
   ]
 }

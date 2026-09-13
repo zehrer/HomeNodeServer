@@ -44,6 +44,8 @@ pub struct DeviceDocumentation {
     pub name: Option<String>,
     pub notes: String,
     #[serde(default)]
+    pub room: Option<String>,
+    #[serde(default)]
     pub manual_url: Option<String>,
     #[serde(default)]
     pub product_id: Option<String>,
@@ -198,9 +200,11 @@ async fn main() -> Result<()> {
         .await?;
 
     let app = Router::new()
-        .route("/", get(devices_handler))
+        .route("/", get(dashboard_handler))
+        .route("/devices", get(devices_handler))
         .route("/energy", get(energy_handler))
         .route("/api/energy/live", get(energy_live_api_handler))
+        .route("/api/events", get(events_api_handler))
         .route("/matter", get(matter_handler))
         .route("/catalog", get(catalog_handler))
         .route("/status", get(status_handler))
@@ -296,12 +300,60 @@ async fn trigger_network_scan(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct VerifiedShellyGateway {
+    pub ip: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub mac: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub gen: i64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub ble_supported: bool,
+    #[serde(default)]
+    pub ble_enabled: bool,
+    #[serde(default)]
+    pub ws_connected: bool,
+    #[serde(default)]
+    pub last_seen: String,
+}
+
+async fn fetch_verified_shelly_gateways() -> Vec<VerifiedShellyGateway> {
+    match energy::http_get_json("127.0.0.1", 8124, "/api/gateways", 400).await {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+async fn dashboard_handler(State(state): State<WebState>) -> Html<String> {
+    let docs = state.docs_store.read().await.clone();
+    let links = state.links_store.read().await.clone();
+    let verified_gws = fetch_verified_shelly_gateways().await;
+    let body = match load_snapshot(&state.socket_path).await {
+        Ok(snapshot) => render_dashboard_page(
+            &state.status_title,
+            &snapshot,
+            &docs,
+            &links,
+            &verified_gws,
+        ),
+        Err(error) => render_error(&state.status_title, "dashboard", &error.to_string()),
+    };
+    Html(body)
+}
+
 async fn devices_handler(State(state): State<WebState>) -> Html<String> {
     let docs = state.docs_store.read().await.clone();
     let links = state.links_store.read().await.clone();
     let catalog = state.catalog_store.read().await.clone();
     let categories = state.categories_store.read().await.clone();
     let matter_fabrics = state.matter_fabrics_store.read().await.clone();
+    let verified_gws = fetch_verified_shelly_gateways().await;
     let body = match load_snapshot(&state.socket_path).await {
         Ok(snapshot) => render_devices_page(
             &state.status_title,
@@ -311,6 +363,7 @@ async fn devices_handler(State(state): State<WebState>) -> Html<String> {
             &catalog,
             &categories,
             &matter_fabrics,
+            &verified_gws,
         ),
         Err(error) => render_error(&state.status_title, "devices", &error.to_string()),
     };
@@ -346,6 +399,113 @@ async fn status_handler(State(state): State<WebState>) -> Html<String> {
         Err(error) => render_error(&state.status_title, "status", &error.to_string()),
     };
     Html(body)
+}
+
+async fn events_api_handler(State(state): State<WebState>) -> impl IntoResponse {
+    let raw = match energy::http_get_json("127.0.0.1", 8124, "/api/events", 800).await {
+        Ok(body) => body,
+        Err(_) => "[]".to_string(),
+    };
+
+    let Ok(mut events) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) else {
+        return (
+            axum::http::StatusCode::OK,
+            [("Content-Type", "application/json")],
+            raw,
+        );
+    };
+
+    let docs = state.docs_store.read().await.clone();
+    let snapshot = load_snapshot(&state.socket_path).await.ok();
+
+    for ev in &mut events {
+        if let Some(obj) = ev.as_object_mut() {
+            let gw_ip = obj.get("gateway_ip").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let gw_id = obj.get("gateway_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let gw_raw = obj.get("gateway").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+            let mut matched_device_name = None;
+            let mut matched_room = None;
+
+            // 1. Search in snapshot devices
+            if let Some(snap) = &snapshot {
+                for dev in &snap.devices {
+                    let dev_ip = dev.metadata.get("ip").map(|s| s.as_str()).unwrap_or("");
+                    let dev_mac = dev.metadata.get("mac").map(|s| s.as_str()).unwrap_or("");
+                    let dev_id = &dev.device_id;
+                    let hostname = dev.metadata.get("hostname").map(|s| s.as_str()).unwrap_or("");
+
+                    let ip_match = gw_ip.as_deref().map(|ip| ip == dev_ip).unwrap_or(false)
+                        || (!gw_raw.is_empty() && dev_ip.len() > 6 && gw_raw.contains(dev_ip));
+
+                    let id_match = gw_id.as_deref().map(|id| {
+                        let id_norm = id.replace(['-', '_', ':'], "").to_lowercase();
+                        let mac_norm = dev_mac.replace(['-', '_', ':'], "").to_lowercase();
+                        !id_norm.is_empty() && (id_norm.contains(&mac_norm) || mac_norm.contains(&id_norm) || dev_id.to_lowercase().contains(&id_norm))
+                    }).unwrap_or(false);
+
+                    if ip_match || id_match {
+                        let doc_entry = docs.get(dev_id).or_else(|| docs.get(dev_mac));
+                        let custom_name = doc_entry.and_then(|d| d.name.clone());
+                        let room_entry = doc_entry.and_then(|d| d.room.clone());
+
+                        matched_device_name = custom_name
+                            .or_else(|| if !dev.display_name.is_empty() { Some(dev.display_name.clone()) } else { None })
+                            .or_else(|| if !hostname.is_empty() { Some(hostname.to_string()) } else { None });
+
+                        if let Some(r) = room_entry {
+                            matched_room = Some(r);
+                        } else {
+                            // Deduce room from name/hostname if possible
+                            let lower = format!("{} {}", dev.display_name, hostname).to_lowercase();
+                            if lower.contains("wohnzimmer") || lower.contains("living") {
+                                matched_room = Some("Wohnzimmer".to_string());
+                            } else if lower.contains("büro") || lower.contains("buero") || lower.contains("office") {
+                                matched_room = Some("Büro".to_string());
+                            } else if lower.contains("küche") || lower.contains("kueche") || lower.contains("kitchen") {
+                                matched_room = Some("Küche".to_string());
+                            } else if lower.contains("schlafzimmer") || lower.contains("bedroom") {
+                                matched_room = Some("Schlafzimmer".to_string());
+                            } else if lower.contains("balkon") || lower.contains("balcony") {
+                                matched_room = Some("Balkon".to_string());
+                            } else if lower.contains("flur") || lower.contains("hall") {
+                                matched_room = Some("Flur".to_string());
+                            } else if lower.contains("keller") || lower.contains("basement") {
+                                matched_room = Some("Keller".to_string());
+                            } else if lower.contains("garage") {
+                                matched_room = Some("Garage".to_string());
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Also check device's own documented room if gateway didn't provide one
+            if matched_room.is_none() {
+                let dev_mac = obj.get("mac").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(doc) = docs.get(dev_mac) {
+                    if let Some(r) = &doc.room {
+                        matched_room = Some(r.clone());
+                    }
+                }
+            }
+
+            if let Some(name) = matched_device_name {
+                obj.insert("gateway_name".to_string(), serde_json::Value::String(name));
+            }
+            if let Some(room) = matched_room {
+                obj.insert("room".to_string(), serde_json::Value::String(room));
+            }
+        }
+    }
+
+    let enriched = serde_json::to_string(&events).unwrap_or(raw);
+    (
+        axum::http::StatusCode::OK,
+        [("Content-Type", "application/json")],
+        enriched,
+    )
 }
 
 async fn energy_handler(State(state): State<WebState>) -> Html<String> {
@@ -419,6 +579,8 @@ struct SaveDocRequest {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    room: Option<String>,
+    #[serde(default)]
     notes: Option<String>,
     #[serde(default)]
     manual_url: Option<String>,
@@ -442,16 +604,18 @@ async fn save_device_doc_handler(
     let now = chrono::Utc::now().to_rfc3339();
     let existing_prod = store.get(&device_id).and_then(|d| d.product_id.clone());
     let clean_name = payload.name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let clean_room = payload.room.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let clean_notes = payload.notes.unwrap_or_default();
     let clean_url = payload.manual_url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
-    let is_empty_doc = clean_name.is_none() && clean_notes.trim().is_empty() && clean_url.is_none() && existing_prod.is_none();
+    let is_empty_doc = clean_name.is_none() && clean_room.is_none() && clean_notes.trim().is_empty() && clean_url.is_none() && existing_prod.is_none();
     if is_empty_doc {
         store.remove(&device_id);
     } else {
         let entry = DeviceDocumentation {
             name: clean_name.clone(),
             notes: clean_notes,
+            room: clean_room,
             manual_url: clean_url,
             product_id: existing_prod,
             updated_at: now,
@@ -1493,6 +1657,7 @@ fn build_unified_devices(
 // ------------------------------------------------------------------------------------------------
 
 fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
+    let dashboard_active = if current_tab == "dashboard" { "class=\"active\"" } else { "" };
     let devices_active = if current_tab == "devices" { "class=\"active\"" } else { "" };
     let energy_active = if current_tab == "energy" { "class=\"active\"" } else { "" };
     let matter_active = if current_tab == "matter" { "class=\"active\"" } else { "" };
@@ -1907,11 +2072,12 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
     <header>
         <h1>{title}</h1>
         <nav>
-            <a href="/" {devices_active}>Detected Devices</a>
+            <a href="/" {dashboard_active}>🏠 Dashboard</a>
+            <a href="/devices" {devices_active}>📱 Devices</a>
             <a href="/energy" {energy_active}>⚡ Energy</a>
             <a href="/matter" {matter_active}>✨ Matter Fabrics</a>
-            <a href="/catalog" {catalog_active}>Hardware Catalog</a>
-            <a href="/status" {status_active}>System Status</a>
+            <a href="/catalog" {catalog_active}>🏢 Hardware Catalog</a>
+            <a href="/status" {status_active}>⚙️ System Status</a>
         </nav>
     </header>
     {content}
@@ -1923,6 +2089,10 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
 
 fn default_category_presentation(key: &str) -> (&'static str, &'static str) {
     match key {
+        "button" => ("Buttons & Remote Controls", "🔘"),
+        "sensor" => ("Sensors & Detectors", "👁️"),
+        "contact-sensor" => ("Doors & Windows", "🚪"),
+        "motion-sensor" => ("Motion Detectors", "🚶"),
         "phone" => ("Smartphones", "📱"),
         "tablet" => ("Tablets", "📟"),
         "voip-phone" => ("VoIP Phones", "☎️"),
@@ -1932,7 +2102,6 @@ fn default_category_presentation(key: &str) -> (&'static str, &'static str) {
         "lighting" => ("Smart Lighting", "💡"),
         "smart-plug" => ("Smart Plugs & Sockets", "🔌"),
         "display" => ("Smart Clocks & Displays", "⏰"),
-        "sensor" => ("Sensors & Detectors", "👁️"),
         "energy" => ("Solar & Energy Systems", "☀️"),
         "appliance" => ("Home Appliances", "🧺"),
         "radio" => ("LoRa & Mesh Radios", "📻"),
@@ -1942,6 +2111,7 @@ fn default_category_presentation(key: &str) -> (&'static str, &'static str) {
         "camera" => ("Cameras", "📷"),
         "audio" => ("Audio & Speakers", "🔊"),
         "printer" => ("Printers", "🖨️"),
+        "3d-printer" => ("3D Printers & Makers", "🧊"),
         "streaming" => ("TV & Streaming", "📺"),
         "vpn" => ("VPN & Virtual Devices", "🛡️"),
         _ => ("Network & Other Devices", "🔌"),
@@ -1950,12 +2120,16 @@ fn default_category_presentation(key: &str) -> (&'static str, &'static str) {
 
 fn canonical_category_key(key: &str, title: &str) -> &'static str {
     match title {
+        "Buttons & Remote Controls" | "Buttons" | "Taster & Schalter" => "button",
+        "Doors & Windows" | "Door & Window" | "Tür & Fenster" => "contact-sensor",
+        "Motion Detectors" | "Motion" | "Bewegungsmelder" => "motion-sensor",
         "Smartphones" => "phone",
         "Tablets" => "tablet",
         "VoIP Phones" => "voip-phone",
         "Computers & Laptops" => "computer",
         "Network Storage & NAS" => "nas",
         "Routers & Gateways" => "router",
+        "Network Switches" | "Switches" | "Netzwerk-Switches" => "switch",
         "Smart Lighting" => "lighting",
         "Smart Plugs & Sockets" => "smart-plug",
         "Smart Clocks & Displays" => "display",
@@ -1969,15 +2143,20 @@ fn canonical_category_key(key: &str, title: &str) -> &'static str {
         "Cameras" => "camera",
         "Audio & Speakers" => "audio",
         "Printers" => "printer",
+        "3D Printers & Makers" | "3D-Drucker" | "3D Drucker" => "3d-printer",
         "TV & Streaming" => "streaming",
         "VPN & Virtual Devices" => "vpn",
         _ => match key {
+            "button" | "buttons" | "remote" => "button",
+            "contact-sensor" | "door" | "window" => "contact-sensor",
+            "motion-sensor" | "motion" => "motion-sensor",
             "phone" | "smartphone" | "smartphones" => "phone",
             "tablet" | "tablets" | "ipad" => "tablet",
             "voip-phone" | "voip" => "voip-phone",
             "computer" | "computers" | "laptop" | "pc" => "computer",
             "nas" => "nas",
             "router" | "gateway" => "router",
+            "switch" | "switches" => "switch",
             "lighting" | "light" => "lighting",
             "smart-plug" | "plug" => "smart-plug",
             "display" => "display",
@@ -1991,6 +2170,7 @@ fn canonical_category_key(key: &str, title: &str) -> &'static str {
             "camera" => "camera",
             "audio" => "audio",
             "printer" => "printer",
+            "3d-printer" | "3d_printer" | "3dprinter" => "3d-printer",
             "streaming" => "streaming",
             "vpn" => "vpn",
             _ => "network-device",
@@ -2000,27 +2180,32 @@ fn canonical_category_key(key: &str, title: &str) -> &'static str {
 
 fn category_sort_order(key: &str) -> u32 {
     match key {
-        "phone" => 1,
-        "tablet" => 2,
-        "voip-phone" => 3,
-        "computer" => 4,
-        "nas" => 5,
-        "router" => 6,
-        "lighting" => 7,
-        "smart-plug" => 8,
-        "display" => 9,
-        "sensor" => 10,
-        "energy" => 11,
-        "appliance" => 12,
-        "radio" => 13,
-        "hub" => 14,
-        "iot" => 15,
-        "wearable" => 16,
-        "camera" => 17,
-        "audio" => 18,
-        "printer" => 19,
-        "streaming" => 20,
-        "vpn" => 21,
+        "button" => 1,
+        "sensor" => 2,
+        "contact-sensor" => 3,
+        "motion-sensor" => 4,
+        "phone" => 5,
+        "tablet" => 6,
+        "voip-phone" => 7,
+        "computer" => 8,
+        "nas" => 9,
+        "router" => 10,
+        "switch" => 11,
+        "lighting" => 12,
+        "smart-plug" => 13,
+        "display" => 14,
+        "energy" => 15,
+        "appliance" => 16,
+        "radio" => 17,
+        "hub" => 18,
+        "iot" => 19,
+        "wearable" => 20,
+        "camera" => 18,
+        "audio" => 19,
+        "printer" => 20,
+        "3d-printer" => 21,
+        "streaming" => 22,
+        "vpn" => 23,
         "network-device" => 99,
         _ => 50,
     }
@@ -2091,7 +2276,17 @@ fn render_devices_page(
     catalog: &homenode_definitions::CatalogDatabase,
     category_overrides: &HashMap<String, String>,
     matter_fabric_metas: &HashMap<String, MatterFabricMeta>,
+    verified_gateways: &[VerifiedShellyGateway],
 ) -> String {
+    let verified_gw_ips: std::collections::HashSet<String> = verified_gateways.iter()
+        .filter(|g| g.ble_supported)
+        .map(|g| g.ip.clone())
+        .collect();
+    let verified_gw_macs: std::collections::HashSet<String> = verified_gateways.iter()
+        .filter(|g| g.ble_supported)
+        .map(|g| g.mac.to_lowercase().replace([':', '-'], ""))
+        .collect();
+
     if snapshot.devices.is_empty() {
         let content = r#"
         <div class="toolbar">
@@ -2110,9 +2305,25 @@ fn render_devices_page(
     let total_count = unified_devices.len();
     let active_count = unified_devices
         .iter()
-        .filter(|u| u.primary.metadata.get("status").map(|s| s.as_str()) != Some("inactive"))
+        .filter(|u| {
+            let s = u.primary.metadata.get("status").map(|s| s.as_str()).unwrap_or("active");
+            s == "active"
+        })
         .count();
-    let inactive_count = total_count.saturating_sub(active_count);
+    let former_count = unified_devices
+        .iter()
+        .filter(|u| {
+            let s = u.primary.metadata.get("status").map(|s| s.as_str()).unwrap_or("active");
+            s == "inactive"
+        })
+        .count();
+    let archive_count = unified_devices
+        .iter()
+        .filter(|u| {
+            let s = u.primary.metadata.get("status").map(|s| s.as_str()).unwrap_or("active");
+            s == "archive"
+        })
+        .count();
 
     let mut category_map: HashMap<String, DynamicCategory> = HashMap::new();
     for udev in &unified_devices {
@@ -2263,9 +2474,19 @@ fn render_devices_page(
 
             let dev_matter_fabrics = extract_device_matter_fabrics(p, &udev.secondary_interfaces, matter_fabric_metas);
             let status = p.metadata.get("status").cloned().unwrap_or_else(|| "active".to_string());
-            let is_active = p.metadata.get("status").map(|s| s.as_str()) != Some("inactive");
+            let is_active = status == "active";
             let first_seen = p.metadata.get("first_seen").cloned().unwrap_or_default();
             let last_seen = p.metadata.get("last_seen").cloned().unwrap_or_default();
+            let sources_str = p.metadata.get("sources").cloned().or_else(|| p.metadata.get("source").cloned()).unwrap_or_default();
+            let norm_mac_p = mac.to_lowercase().replace([':', '-'], "");
+            let is_verified_ble_gw = verified_gw_ips.contains(&ip)
+                || (!norm_mac_p.is_empty() && verified_gw_macs.contains(&norm_mac_p));
+
+            let mut sources: Vec<String> = sources_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            if is_verified_ble_gw && !sources.contains(&"shelly-gateway".to_string()) {
+                sources.push("shelly-gateway".to_string());
+            }
+            let was_ever_active = p.metadata.get("was_ever_active").map(|s| s.as_str()) == Some("true") || is_active;
 
             serde_json::json!({
                 "device_id": p.device_id,
@@ -2282,6 +2503,7 @@ fn render_devices_page(
                 "web_url": web_url,
                 "doc_key": doc_key,
                 "notes": doc.notes,
+                "room": doc.room.unwrap_or_default(),
                 "manual_url": doc.manual_url.unwrap_or_default(),
                 "updated_at": doc.updated_at,
                 "secondaries": secondaries_json,
@@ -2290,8 +2512,11 @@ fn render_devices_page(
                 "matter_fabrics": dev_matter_fabrics,
                 "status": status,
                 "is_active": is_active,
+                "was_ever_active": was_ever_active,
+                "sources": sources,
                 "first_seen": first_seen,
                 "last_seen": last_seen,
+                "metadata": p.metadata.clone(),
             })
         })
         .collect();
@@ -2356,12 +2581,18 @@ fn render_devices_page(
                     ));
                 }
 
-                let network_info = if mac.is_empty() {
-                    format!("<code>{ip}</code>{iface_badges}")
-                } else if vendor.is_empty() {
-                    format!("<code>{ip}</code>{iface_badges}<br><small style=\"color:var(--muted)\">{mac}</small>")
+                let ip_display = if ip.is_empty() || ip == "Layer 2" || ip == "-" {
+                    "Layer 2 (Unmanaged)".to_string()
                 } else {
-                    format!("<code>{ip}</code>{iface_badges}<br><small style=\"color:var(--muted)\">{mac} &bull; {vendor}</small>")
+                    ip.clone()
+                };
+
+                let network_info = if mac.is_empty() {
+                    format!("<code>{ip_display}</code>{iface_badges}")
+                } else if vendor.is_empty() {
+                    format!("<code>{ip_display}</code>{iface_badges}<br><small style=\"color:var(--muted)\">{mac}</small>")
+                } else {
+                    format!("<code>{ip_display}</code>{iface_badges}<br><small style=\"color:var(--muted)\">{mac} &bull; {vendor}</small>")
                 };
 
                 let web_button = if let Some(url) = web_url {
@@ -2370,19 +2601,30 @@ fn render_devices_page(
                     String::new()
                 };
 
-                let is_active = device.metadata.get("status").map(|s| s.as_str()) != Some("inactive");
+                let raw_status = device.metadata.get("status").map(|s| s.as_str()).unwrap_or("active");
+                let is_active = raw_status == "active";
+                let is_archive = raw_status == "archive";
+                let status_val = raw_status;
                 let last_seen = device.metadata.get("last_seen").cloned().unwrap_or_default();
-                let status_val = if is_active { "active" } else { "inactive" };
 
                 let status_dot = if is_active {
                     r#"<span class="status-dot" style="background:#10b981; display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px;" title="Online / Active"></span>"#
+                } else if is_archive {
+                    r#"<span class="status-dot" style="background:#cbd5e1; display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px;" title="Router Archive (FRITZ!Box)"></span>"#
                 } else {
-                    r#"<span class="status-dot" style="background:#94a3b8; display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px;" title="Offline / Former"></span>"#
+                    r#"<span class="status-dot" style="background:#94a3b8; display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px;" title="Offline / Former (HomeNode)"></span>"#
                 };
 
-                let offline_badge = if !is_active {
+                let offline_badge = if is_archive {
                     let ls_hint = if !last_seen.is_empty() {
-                        format!(r#" title="Last seen: {}""#, last_seen)
+                        format!(r#" title="In FRITZ!Box hinterlegt: {}""#, last_seen)
+                    } else {
+                        r#" title="Reines FRITZ!Box Router-Archiv""#.to_string()
+                    };
+                    format!(r#" <span class="badge" style="background:#f8fafc; color:#94a3b8; font-size:10px; border:1px dashed #cbd5e1; padding:1px 5px;"{}>📦 Archiv</span>"#, ls_hint)
+                } else if !is_active {
+                    let ls_hint = if !last_seen.is_empty() {
+                        format!(r#" title="Zuletzt online: {}""#, last_seen)
                     } else {
                         String::new()
                     };
@@ -2391,13 +2633,58 @@ fn render_devices_page(
                     String::new()
                 };
 
+                let mut dev_sources_str = device.metadata.get("sources")
+                    .cloned()
+                    .or_else(|| device.metadata.get("source").cloned())
+                    .unwrap_or_default();
+
+                let dev_ip = device.metadata.get("ip").map(|s| s.as_str()).unwrap_or("");
+                let dev_mac = device.metadata.get("mac").map(|s| s.as_str()).unwrap_or("");
+                let norm_dev_mac = dev_mac.to_lowercase().replace([':', '-'], "");
+                let is_verified_ble_gw = verified_gw_ips.contains(dev_ip)
+                    || (!norm_dev_mac.is_empty() && verified_gw_macs.contains(&norm_dev_mac));
+
+                if is_verified_ble_gw && !dev_sources_str.contains("shelly-gateway") {
+                    if !dev_sources_str.is_empty() {
+                        dev_sources_str.push_str(",shelly-gateway");
+                    } else {
+                        dev_sources_str = "shelly-gateway".to_string();
+                    }
+                }
+
+                let mut scanner_badges = String::new();
+                for s in dev_sources_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    let (badge_text, bg_color) = match s {
+                        "arp" => ("ARP", "#6366f1"),
+                        "ping" | "active-probe" => ("Ping", "#0284c7"),
+                        "http-probe" => ("Web", "#0ea5e9"),
+                        "mdns" => ("mDNS", "#8b5cf6"),
+                        "ssdp" => ("SSDP", "#d97706"),
+                        "fritzbox-tr064" => ("TR-064", "#059669"),
+                        "matter" | "matter-mdns" => ("Matter", "#10b981"),
+                        "home-assistant" | "mdns_homeassistant" => ("HA", "#0284c7"),
+                        "bthome" | "bthome-v2" => ("BTHome", "#3b82f6"),
+                        "shelly-gateway" => ("Shelly BLE", "#0284c7"),
+                        "ble" => ("BLE", "#6366f1"),
+                        _ => (s, "#64748b"),
+                    };
+                    scanner_badges.push_str(&format!(
+                        r#" <span class="badge" style="background:{bg_color}; color:#fff; font-size:9px; padding:1px 4px; border-radius:3px; opacity:0.85; margin-left:3px;" title="Scanner: {s}">{badge_text}</span>"#
+                    ));
+                }
+
                 let doc_icon = if has_docs { r#" <span style="color:var(--status-green); font-size:11px;" title="Documentation / Name saved">📝✓</span>"# } else { "" };
 
+                let has_valid_ip = !ip.is_empty() && ip != "Layer 2" && ip != "-" && ip.parse::<std::net::Ipv4Addr>().is_ok();
                 let action_buttons = if !is_active {
-                    let ping_btn = format!(
-                        r#"<button type="button" class="btn-sm btn-ping" data-ping-id="{}" onclick="event.stopPropagation(); pingDevice('{}', this)" title="Ping device to check reachability">📡 Ping</button>"#,
-                        device.device_id, device.device_id
-                    );
+                    let ping_btn = if has_valid_ip {
+                        format!(
+                            r#"<button type="button" class="btn-sm btn-ping" data-ping-id="{}" onclick="event.stopPropagation(); pingDevice('{}', this)" title="Ping device to check reachability">📡 Ping</button>"#,
+                            device.device_id, device.device_id
+                        )
+                    } else {
+                        r#"<span class="badge" style="background:#f1f5f9; color:#94a3b8; font-size:11px; padding:3px 6px; border:1px solid #e2e8f0;" title="Reines Layer-2-Gerät ohne IP-Adresse">L2 Switch</span>"#.to_string()
+                    };
                     if !web_button.is_empty() {
                         format!(r#"<div style="display:inline-flex; gap:6px; justify-content:flex-end; align-items:center;">{ping_btn}{web_button}</div>"#)
                     } else {
@@ -2408,14 +2695,15 @@ fn render_devices_page(
                 };
 
                 format!(
-                    r#"<tr class="device-item" data-id="{}" data-status="{}" data-active="{}" onclick="selectDevice('{}')">
-                        <td>{}<strong class="dev-display-name">{}</strong>{}{}{}<br><small style="color:var(--muted)">{} &bull; {}</small></td>
+                    r#"<tr class="device-item" data-id="{}" data-status="{}" data-active="{}" data-sources="{}" onclick="selectDevice('{}')">
+                        <td>{}<strong class="dev-display-name">{}</strong>{}{}{}<br><small style="color:var(--muted)">{} &bull; {}</small>{}</td>
                         <td>{}</td>
                         <td style="text-align:right;">{}</td>
                     </tr>"#,
                     device.device_id,
                     status_val,
                     is_active,
+                    dev_sources_str,
                     device.device_id,
                     status_dot,
                     effective_display_name,
@@ -2424,6 +2712,7 @@ fn render_devices_page(
                     matter_badges,
                     device.device_id,
                     device.module_id,
+                    scanner_badges,
                     network_info,
                     action_buttons,
                 )
@@ -2464,6 +2753,7 @@ fn render_devices_page(
     const allProducts = {};
     let currentCategory = 'all';
     let currentStatusFilter = 'all';
+    let currentScannerFilter = 'all';
     let selectedDeviceId = null;
 
     function selectCategory(cat, el) {{
@@ -2477,6 +2767,11 @@ fn render_devices_page(
         currentStatusFilter = status;
         document.querySelectorAll('.status-pill').forEach(p => p.classList.remove('active'));
         el.classList.add('active');
+        filterDevices();
+    }}
+
+    function setScannerFilter(sc) {{
+        currentScannerFilter = sc.toLowerCase();
         filterDevices();
     }}
 
@@ -2524,8 +2819,15 @@ fn render_devices_page(
                 const matchesSearch = !q || text.includes(q);
                 const status = row.getAttribute('data-status') || 'active';
                 const matchesStatus = (currentStatusFilter === 'all' || currentStatusFilter === status);
+                const rowSources = (row.getAttribute('data-sources') || '').toLowerCase();
+                const matchesScanner = (currentScannerFilter === 'all'
+                    || rowSources.includes(currentScannerFilter)
+                    || (currentScannerFilter === 'ping' && rowSources.includes('active-probe'))
+                    || (currentScannerFilter === 'matter' && rowSources.includes('matter-mdns'))
+                    || (currentScannerFilter === 'bthome' && (rowSources.includes('bthome') || rowSources.includes('shelly-gateway')))
+                    || (currentScannerFilter === 'shelly-gateway' && rowSources.includes('shelly-gateway')));
 
-                if (matchesSearch && matchesStatus) {{
+                if (matchesSearch && matchesStatus && matchesScanner) {{
                     row.style.display = '';
                     visibleRows++;
                 }} else {{
@@ -2569,6 +2871,9 @@ fn render_devices_page(
 
         // Category options generator
         const standardCategories = [
+            {{ key: 'button', label: '🔘 Buttons & Remote Controls' }},
+            {{ key: 'contact-sensor', label: '🚪 Doors & Windows' }},
+            {{ key: 'sensor', label: '👁️ Sensors & Detectors' }},
             {{ key: 'phone', label: '📱 Smartphones' }},
             {{ key: 'tablet', label: '📟 Tablets' }},
             {{ key: 'computer', label: '💻 Computers & Laptops' }},
@@ -2587,6 +2892,7 @@ fn render_devices_page(
             {{ key: 'audio', label: '🔊 Audio & Speakers' }},
             {{ key: 'streaming', label: '📺 TV & Streaming' }},
             {{ key: 'printer', label: '🖨️ Printers' }},
+            {{ key: '3d-printer', label: '🧊 3D Printers & Makers' }},
             {{ key: 'vpn', label: '🛡️ VPN & Virtual Devices' }},
             {{ key: 'iot', label: '💡 Smart Home & IoT' }},
             {{ key: 'network-device', label: '🔌 Network & Other Devices' }}
@@ -2695,23 +3001,25 @@ fn render_devices_page(
         `;
 
         // Secondary / Linked Interfaces
+        let primaryIpDisplay = (!dev.ip || dev.ip === 'Layer 2' || dev.ip === '-') ? 'Layer 2 (Unmanaged)' : dev.ip;
         let ifacesHtml = `
             <div class="iface-card">
                 <strong>Primary Interface (LAN/Main)</strong><br>
-                <code>${{dev.ip}}</code> ${{dev.mac ? '&bull; <small>' + dev.mac + '</small>' : ''}}<br>
+                <code>${{primaryIpDisplay}}</code> ${{dev.mac ? '&bull; <small>' + dev.mac + '</small>' : ''}}<br>
                 <small style="color:var(--muted)">${{dev.vendor || 'Unknown Vendor'}} ${{dev.hostname ? '&bull; ' + dev.hostname : ''}}</small>
             </div>
         `;
 
         if (dev.secondaries && dev.secondaries.length > 0) {{
             dev.secondaries.forEach(sec => {{
+                let secIpDisplay = (!sec.ip || sec.ip === 'Layer 2' || sec.ip === '-') ? 'Layer 2 (Unmanaged)' : sec.ip;
                 ifacesHtml += `
                     <div class="iface-card">
                         <div style="display:flex; justify-content:space-between; align-items:center;">
                             <strong>Linked Interface (WLAN/Secondary)</strong>
                             <button class="btn-sm" style="color:var(--status-red); border:none; padding:2px;" onclick="unlinkInterface('${{dev.device_id}}', '${{sec.device_id}}')">Unlink</button>
                         </div>
-                        <code>${{sec.ip}}</code> ${{sec.mac ? '&bull; <small>' + sec.mac + '</small>' : ''}}<br>
+                        <code>${{secIpDisplay}}</code> ${{sec.mac ? '&bull; <small>' + sec.mac + '</small>' : ''}}<br>
                         <small style="color:var(--muted)">${{sec.vendor || 'Unknown Vendor'}} ${{sec.hostname ? '&bull; ' + sec.hostname : ''}}</small>
                     </div>
                 `;
@@ -2743,7 +3051,31 @@ fn render_devices_page(
                     <span style="font-size:11px; color:#047857;" title="${{dev.last_seen || ''}}">Seen: ${{formatRelativeTime(dev.last_seen)}}</span>
                 </div>
             `;
+        }} else if (dev.status === 'archive') {{
+            let hasValidIp = dev.ip && dev.ip !== 'Layer 2' && dev.ip !== '-' && dev.ip.trim() !== '' && !dev.ip.includes('(');
+            let pingBtnHtml = hasValidIp
+                ? `<button type="button" class="btn-sm btn-ping" style="font-size:11px; padding:2px 8px; cursor:pointer;" onclick="pingDevice('${{dev.device_id}}', this)" title="Ping device to check reachability">📡 Ping</button>`
+                : `<span class="badge" style="background:#f1f5f9; color:#94a3b8; font-size:10px; padding:2px 6px; border:1px solid #e2e8f0;" title="Reines Layer-2-Gerät ohne IP">L2 Switch</span>`;
+            statusBadge = `
+                <div style="display:flex; align-items:center; justify-content:space-between; margin-top:8px; padding:6px 10px; background:#f8fafc; border:1px dashed #cbd5e1; border-radius:6px;">
+                    <div style="display:flex; align-items:center; gap:6px;">
+                        <span style="font-size:13px;">📦</span>
+                        <div>
+                            <span style="font-weight:600; font-size:12px; color:#64748b;">Router-Archiv (FRITZ!Box)</span><br>
+                            <span style="font-size:10px; color:var(--muted);">Nur in FRITZ!Box Historie registriert</span>
+                        </div>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <span style="font-size:11px; color:#94a3b8;" title="${{dev.last_seen || ''}}">${{formatRelativeTime(dev.last_seen)}}</span>
+                        ${{pingBtnHtml}}
+                    </div>
+                </div>
+            `;
         }} else {{
+            let hasValidIp = dev.ip && dev.ip !== 'Layer 2' && dev.ip !== '-' && dev.ip.trim() !== '' && !dev.ip.includes('(');
+            let pingBtnHtml = hasValidIp
+                ? `<button type="button" class="btn-sm btn-ping" style="font-size:11px; padding:2px 8px; cursor:pointer;" onclick="pingDevice('${{dev.device_id}}', this)" title="Ping device to check reachability">📡 Ping</button>`
+                : `<span class="badge" style="background:#f1f5f9; color:#94a3b8; font-size:10px; padding:2px 6px; border:1px solid #e2e8f0;" title="Reines Layer-2-Gerät ohne IP">L2 Switch</span>`;
             statusBadge = `
                 <div style="display:flex; align-items:center; justify-content:space-between; margin-top:8px; padding:6px 10px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:6px;">
                     <div style="display:flex; align-items:center; gap:6px;">
@@ -2752,7 +3084,7 @@ fn render_devices_page(
                     </div>
                     <div style="display:flex; align-items:center; gap:8px;">
                         <span style="font-size:11px; color:#64748b;" title="${{dev.last_seen || ''}}">Last seen: ${{formatRelativeTime(dev.last_seen)}}</span>
-                        <button type="button" class="btn-sm btn-ping" style="font-size:11px; padding:2px 8px; cursor:pointer;" onclick="pingDevice('${{dev.device_id}}', this)" title="Ping device to check reachability">📡 Ping</button>
+                        ${{pingBtnHtml}}
                     </div>
                 </div>
             `;
@@ -2775,6 +3107,99 @@ fn render_devices_page(
             </div>
         `;
 
+        const sourceMap = {{
+            'bthome': {{ name: 'BTHome BLE Sensor', icon: '📶', desc: 'Bluetooth Low Energy V2 Sensor-Protokoll' }},
+            'shelly-gateway': {{ name: 'Shelly BLE Gateway', icon: '📡', desc: 'Lokales Shelly Gen3/Gen2 Outbound WebSocket Gateway' }},
+            'bthome-v2': {{ name: 'BTHome V2', icon: '📶', desc: 'BTHome Version 2 BLE Broadcast' }},
+            'ble': {{ name: 'Bluetooth LE', icon: '🔵', desc: 'Bluetooth Low Energy Advertisement' }},
+            'arp': {{ name: 'ARP Scanner', icon: '📡', desc: 'MAC-Adresse & IP-Zuordnung über Layer-2 ARP' }},
+            'ping': {{ name: 'ICMP/TCP Ping', icon: '⚡', desc: 'Aktive IP-Erreichbarkeit' }},
+            'mdns': {{ name: 'mDNS / Bonjour', icon: '🔍', desc: 'Hostname & lokale Netzwerkdienste' }},
+            'ssdp': {{ name: 'SSDP / UPnP', icon: '🌐', desc: 'UPnP Device Description & Hersteller-Information' }},
+            'fritzbox-tr064': {{ name: 'FRITZ!Box TR-064', icon: '🔀', desc: 'Router-Topologie, L2-Switch & DHCP-Eintrag' }},
+            'matter': {{ name: 'Matter Operational', icon: '✨', desc: 'Matter Node & Fabric-Information' }},
+            'matter-mdns': {{ name: 'Matter DNS-SD', icon: '✨', desc: 'Matter Operational Discovery' }},
+            'home-assistant': {{ name: 'Home Assistant', icon: '🏠', desc: 'Home Assistant Hub / API' }},
+            'mdns_homeassistant': {{ name: 'Home Assistant mDNS', icon: '🏠', desc: 'Home Assistant Service Discovery' }},
+            'http-probe': {{ name: 'HTTP Web Probe', icon: '🌐', desc: 'Weboberfläche auf Standardports' }},
+            'configuration': {{ name: 'Konfiguration', icon: '⚙️', desc: 'Statisch konfigurierter Eintrag' }},
+            'documentation': {{ name: 'Benutzer-Notiz', icon: '📝', desc: 'Dokumentierter Geräteeintrag' }}
+        }};
+
+        let devSources = (dev.sources && dev.sources.length > 0) ? dev.sources : (dev.source ? [dev.source] : ['unknown']);
+        let sourcesItems = devSources.map(s => {{
+            const info = sourceMap[s] || {{ name: s, icon: '🔌', desc: 'Netzwerkbeobachtung' }};
+            return `
+                <div style="display:flex; align-items:flex-start; gap:8px; padding:4px 0; border-bottom:1px solid var(--border);">
+                    <span style="font-size:14px; line-height:1.2;">${{info.icon}}</span>
+                    <div style="flex:1;">
+                        <div style="font-weight:600; font-size:11px;">${{info.name}}</div>
+                        <div style="font-size:10px; color:var(--muted);">${{info.desc}}</div>
+                    </div>
+                </div>
+            `;
+        }}).join('');
+
+        let scannerBox = `
+            <div class="inspector-sec" style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:8px 10px; margin-top:8px;">
+                <div style="font-size:11px; font-weight:600; color:var(--muted); margin-bottom:4px;">📡 Entdeckt durch Scanner (${{devSources.length}})</div>
+                ${{sourcesItems}}
+            </div>
+        `;
+
+        let telemetryBox = '';
+        if (dev.metadata && (dev.metadata.battery || dev.metadata.button_event || dev.metadata.gateway || dev.metadata.shelly_gateway || dev.metadata.protocol || dev.metadata.temperature_c || dev.metadata.contact_state || dev.metadata.rssi)) {{
+            let rows = [];
+            if (dev.metadata.button_event) {{
+                let btnName = dev.metadata.button_event;
+                if (btnName === 'press') btnName = 'Single Press (Einfachklick)';
+                else if (btnName === 'double_press') btnName = 'Double Press (Doppelklick)';
+                else if (btnName === 'triple_press') btnName = 'Triple Press (Dreifachklick)';
+                else if (btnName === 'long_press') btnName = 'Long Press (Langer Druck)';
+                else if (btnName === 'hold') btnName = 'Hold (Gehalten)';
+                rows.push(`<div><span style="color:var(--muted);">Letzte Aktion:</span> <strong style="color:var(--primary); font-size:12px;">🔘 ${{btnName}}</strong></div>`);
+            }}
+            if (dev.metadata.battery) {{
+                let bat = parseInt(dev.metadata.battery, 10) || 0;
+                let batColor = bat > 50 ? 'var(--status-green)' : (bat > 20 ? 'var(--status-yellow)' : 'var(--status-red)');
+                rows.push(`<div><span style="color:var(--muted);">Batterie:</span> <strong style="color:${{batColor}};">🔋 ${{bat}}%</strong></div>`);
+            }}
+            if (dev.metadata.contact_state) {{
+                let open = dev.metadata.contact_state === 'open';
+                rows.push(`<div><span style="color:var(--muted);">Kontakt:</span> <strong>${{open ? '🚪 Offen' : '🚪 Geschlossen'}}</strong></div>`);
+            }}
+            if (dev.metadata.temperature_c) {{
+                rows.push(`<div><span style="color:var(--muted);">Temperatur:</span> <strong>🌡️ ${{dev.metadata.temperature_c}} °C</strong></div>`);
+            }}
+            if (dev.metadata.humidity_pct) {{
+                rows.push(`<div><span style="color:var(--muted);">Luftfeuchtigkeit:</span> <strong>💧 ${{dev.metadata.humidity_pct}} %</strong></div>`);
+            }}
+            if (dev.metadata.illuminance_lux) {{
+                rows.push(`<div><span style="color:var(--muted);">Helligkeit:</span> <strong>☀️ ${{dev.metadata.illuminance_lux}} Lux</strong></div>`);
+            }}
+            if (dev.metadata.rssi) {{
+                rows.push(`<div><span style="color:var(--muted);">Signalstärke:</span> <strong>📶 ${{dev.metadata.rssi}} dBm</strong></div>`);
+            }}
+            if (dev.metadata.shelly_gateway || dev.metadata.gateway) {{
+                let gw = dev.metadata.shelly_gateway || dev.metadata.gateway;
+                rows.push(`<div><span style="color:var(--muted);">Shelly Gateway:</span> <code>${{gw}}</code></div>`);
+            }}
+            if (dev.metadata.protocol) {{
+                rows.push(`<div><span style="color:var(--muted);">Protokoll:</span> <span class="badge" style="background:#e2e8f0; color:#334155; font-size:10px; padding:1px 5px; border-radius:3px;">${{dev.metadata.protocol}}</span></div>`);
+            }}
+
+            telemetryBox = `
+                <div class="inspector-sec" style="background:var(--bg); border:1px solid var(--border); border-left:3px solid var(--primary); border-radius:6px; padding:8px 10px; margin-top:8px;">
+                    <div style="font-size:11px; font-weight:700; color:var(--primary); margin-bottom:6px; display:flex; align-items:center; gap:6px;">
+                        <span>📶 BTHome Live Telemetrie</span>
+                    </div>
+                    <div style="display:flex; flex-direction:column; gap:4px; font-size:11px;">
+                        ${{rows.join('')}}
+                    </div>
+                </div>
+            `;
+        }}
+
         panel.innerHTML = `
             <div>
                 <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
@@ -2785,7 +3210,9 @@ fn render_devices_page(
                     </div>
                 </div>
                 ${{statusBadge}}
+                ${{telemetryBox}}
                 ${{historyBox}}
+                ${{scannerBox}}
                 ${{categorySelectorBox}}
                 ${{webBtn}}
                 ${{productCard}}
@@ -2811,6 +3238,10 @@ fn render_devices_page(
                 <div style="margin-bottom:8px;">
                     <label style="font-size:11px; color:var(--muted); font-weight:600;">Device Name (Optional override)</label>
                     <input type="text" id="insp-name" class="form-control" value="${{escapeAttr(dev.custom_name || '')}}" placeholder="${{escapeAttr(dev.display_name)}}" />
+                </div>
+                <div style="margin-bottom:8px;">
+                    <label style="font-size:11px; color:var(--muted); font-weight:600;">Raum / Standort (Room / Location)</label>
+                    <input type="text" id="insp-room" class="form-control" value="${{escapeAttr(dev.room || '')}}" placeholder="z.B. Wohnzimmer, Büro, Küche, Flur, Keller..." />
                 </div>
                 <div style="margin-bottom:8px;">
                     <label style="font-size:11px; color:var(--muted); font-weight:600;">Manual / Documentation URL (Optional)</label>
@@ -2886,6 +3317,8 @@ fn render_devices_page(
     async function saveInspectorNotes(docKey) {{
         const nameInput = document.getElementById('insp-name');
         const customName = nameInput ? nameInput.value.trim() : '';
+        const roomInput = document.getElementById('insp-room');
+        const room = roomInput ? roomInput.value.trim() : '';
         const notes = document.getElementById('insp-notes').value;
         const manualUrl = document.getElementById('insp-manual-url').value;
         const statusEl = document.getElementById('doc-status');
@@ -2896,7 +3329,7 @@ fn render_devices_page(
             const res = await fetch('/api/devices/' + encodeURIComponent(docKey) + '/documentation', {{
                 method: 'POST',
                 headers: {{ 'Content-Type': 'application/json' }},
-                body: JSON.stringify({{ name: customName, notes: notes, manual_url: manualUrl }})
+                body: JSON.stringify({{ name: customName, room: room, notes: notes, manual_url: manualUrl }})
             }});
             if (res.ok) {{
                 statusEl.innerText = 'Saved!';
@@ -2904,6 +3337,7 @@ fn render_devices_page(
                 const dev = allDevices.find(d => d.doc_key === docKey || d.device_id === docKey);
                 if (dev) {{
                     dev.custom_name = customName;
+                    dev.room = room;
                     dev.display_name = customName || dev.original_name || dev.display_name;
                     dev.notes = notes;
                     dev.manual_url = manualUrl;
@@ -3211,13 +3645,35 @@ fn render_devices_page(
                 </form>
             </div>
         </div>
-        <div class="status-pills">
-            <span style="font-size:12px; font-weight:600; color:var(--muted); margin-right:4px;">Filter:</span>
+        <div class="status-pills" style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px;">
+            <span style="font-size:12px; font-weight:600; color:var(--muted); margin-right:4px;">Status:</span>
             <button type="button" class="status-pill active" id="filter-status-all" onclick="setStatusFilter('all', this)">All ({})</button>
             <button type="button" class="status-pill" id="filter-status-active" onclick="setStatusFilter('active', this)">🟢 Active ({})</button>
-            <button type="button" class="status-pill" id="filter-status-inactive" onclick="setStatusFilter('inactive', this)">⚪ Former / Offline ({})</button>
+            <button type="button" class="status-pill" id="filter-status-inactive" onclick="setStatusFilter('inactive', this)" title="Geräte, die HomeNode Server zuvor aktiv erkannt hat, aktuell offline">⚪ Former ({})</button>
+            <button type="button" class="status-pill" id="filter-status-archive" onclick="setStatusFilter('archive', this)" title="Reine inaktive Alt-Leases / Geräte im FRITZ!Box Router-Archiv">📦 Router Archive ({})</button>
+
+            <span style="font-size:12px; font-weight:600; color:var(--muted); margin-left:12px; margin-right:4px;">Scanner:</span>
+            <select id="scanner-filter" onchange="setScannerFilter(this.value)" style="background:var(--bg-card); color:var(--text); border:1px solid var(--border); border-radius:6px; font-size:12px; padding:3px 8px; cursor:pointer;">
+                <option value="all">All Scanners</option>
+                <option value="arp">📡 ARP</option>
+                <option value="ping">⚡ Ping / ICMP</option>
+                <option value="mdns">🔍 mDNS / Bonjour</option>
+                <option value="ssdp">🌐 SSDP / UPnP</option>
+                <option value="fritzbox-tr064">🔀 FRITZ!Box TR-064</option>
+                <option value="matter">✨ Matter</option>
+                <option value="bthome">📶 BTHome (BLE Sensors & Buttons)</option>
+                <option value="shelly-gateway">📡 Shelly BLE Gateways</option>
+            </select>
         </div>
         <div class="pills">{}</div>
+
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; padding:8px 14px; background:var(--surface); border:1px solid var(--border); border-radius:8px; font-size:12px;">
+            <div style="display:flex; align-items:center; gap:8px;">
+                <span>💡</span>
+                <span style="color:var(--muted);">Echtzeit BLE-Events, Raumanwesenheit und Stromfluss findest du auf dem <a href="/" style="color:var(--primary); font-weight:600; text-decoration:none;">🏠 Dashboard</a>.</span>
+            </div>
+            <a href="/" class="btn btn-sm" style="font-size:11px; text-decoration:none; padding:3px 10px;">Zum Dashboard ↗</a>
+        </div>
         
         <div class="workspace-grid">
             <!-- Left Inspector Panel -->
@@ -3241,13 +3697,440 @@ fn render_devices_page(
         unified_devices.len(),
         total_count,
         active_count,
-        inactive_count,
+        former_count,
+        archive_count,
         pills_html,
         group_cards_html,
         script
     );
 
     page_layout(title, "devices", &content)
+}
+
+#[allow(dead_code)]
+fn escape_html_str(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn render_dashboard_page(
+    title: &str,
+    snapshot: &RuntimeSnapshot,
+    _docs: &HashMap<String, DeviceDocumentation>,
+    _links: &HashMap<String, Vec<String>>,
+    _verified_gateways: &[VerifiedShellyGateway],
+) -> String {
+    let total_devices = snapshot.devices.len();
+    let active_devices = snapshot
+        .devices
+        .iter()
+        .filter(|d| d.metadata.get("status").map(|s| s.as_str()).unwrap_or("active") == "active")
+        .count();
+
+    let content = format!(
+        r#"
+        <div style="margin-bottom:20px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+            <div>
+                <h2 style="font-size:22px; font-weight:700; display:flex; align-items:center; gap:8px;">
+                    <span>🏠 HomeNode Live Dashboard</span>
+                    <span class="badge" style="background:#dcfce7; color:#166534; font-size:11px; font-weight:600; padding:3px 8px; border-radius:12px;">
+                        <span class="status-dot status-ready" style="width:8px; height:8px; margin-right:4px;"></span>Live System Active
+                    </span>
+                </h2>
+                <div style="font-size:12px; color:var(--muted); margin-top:3px;">
+                    Zentrale Übersicht: Echtzeit-Energiefluss, BTHome BLE-Sensoren und Live-Ereignisse
+                </div>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center;">
+                <span id="dash-last-updated" style="font-size:11px; color:var(--muted);">Connecting...</span>
+                <form action="/scan" method="POST" style="margin:0;">
+                    <button type="submit" class="btn btn-sm btn-primary">🔄 Scan Network</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Energy KPI Cards Grid -->
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:16px; margin-bottom:20px;">
+            <!-- ☀️ Solar Generation -->
+            <div class="card" style="margin-bottom:0; border-top:4px solid #f59e0b;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                    <span style="font-weight:600; font-size:12px; color:var(--muted);">☀️ SOLAR-ERZEUGUNG</span>
+                    <span class="badge" style="font-size:10px;">Fronius</span>
+                </div>
+                <div style="display:flex; align-items:baseline; gap:6px; margin-bottom:10px;">
+                    <span id="dash-solar-power-val" style="font-size:30px; font-weight:800; color:#d97706; font-family:monospace;">--</span>
+                    <span style="font-size:15px; font-weight:600; color:var(--muted);">W</span>
+                </div>
+                <div style="border-top:1px solid var(--border); padding-top:8px; display:flex; justify-content:space-between; font-size:11px; color:var(--muted);">
+                    <span>Heute: <strong id="dash-solar-day-val" style="color:var(--text);">-- kWh</strong></span>
+                    <span>Jahr: <strong id="dash-solar-year-val" style="color:var(--text);">-- kWh</strong></span>
+                </div>
+            </div>
+
+            <!-- 🌐 Grid Net Flow -->
+            <div class="card" style="margin-bottom:0; border-top:4px solid #2563eb;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                    <span style="font-weight:600; font-size:12px; color:var(--muted);">🌐 NETZBEZUG / EINSPEISUNG</span>
+                    <span class="badge" style="font-size:10px;">Shelly Pro 3EM</span>
+                </div>
+                <div style="display:flex; align-items:baseline; gap:6px; margin-bottom:10px;">
+                    <span id="dash-grid-power-val" style="font-size:30px; font-weight:800; font-family:monospace;">--</span>
+                    <span style="font-size:15px; font-weight:600; color:var(--muted);">W</span>
+                    <span id="dash-grid-dir-badge" class="badge" style="margin-left:auto; font-size:10px; font-weight:600;">--</span>
+                </div>
+                <div style="border-top:1px solid var(--border); padding-top:8px; display:flex; justify-content:space-between; font-size:11px; color:var(--muted);">
+                    <span>Import: <strong id="dash-grid-import-val" style="color:var(--text);">-- kWh</strong></span>
+                    <span>Export: <strong id="dash-grid-export-val" style="color:var(--text);">-- kWh</strong></span>
+                </div>
+            </div>
+
+            <!-- 🏠 House Load -->
+            <div class="card" style="margin-bottom:0; border-top:4px solid #10b981;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                    <span style="font-weight:600; font-size:12px; color:var(--muted);">🏠 HAUSVERBRAUCH</span>
+                    <span class="badge" style="font-size:10px;">Berechnet</span>
+                </div>
+                <div style="display:flex; align-items:baseline; gap:6px; margin-bottom:10px;">
+                    <span id="dash-house-power-val" style="font-size:30px; font-weight:800; color:#059669; font-family:monospace;">--</span>
+                    <span style="font-size:15px; font-weight:600; color:var(--muted);">W</span>
+                </div>
+                <div style="border-top:1px solid var(--border); padding-top:8px; display:flex; justify-content:space-between; font-size:11px; color:var(--muted);">
+                    <span>Autarkie: <strong id="dash-autarky-val" style="color:var(--status-green);">-- %</strong></span>
+                    <span>Eigenverbrauch: <strong id="dash-self-val" style="color:var(--text);">-- %</strong></span>
+                </div>
+            </div>
+
+            <!-- 🔋 Balcony Storage -->
+            <div class="card" style="margin-bottom:0; border-top:4px solid #8b5cf6;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                    <span style="font-weight:600; font-size:12px; color:var(--muted);">🔋 SPEICHER & BALKON</span>
+                    <span class="badge" style="font-size:10px;">EcoFlow</span>
+                </div>
+                <div style="margin-bottom:10px;">
+                    <div style="font-size:13px; font-weight:700;">2 Wechselrichter im LAN</div>
+                    <div style="font-size:11px; color:var(--muted); margin-top:2px;">ecoflow1 (.96) & ecoflow2 (.105)</div>
+                </div>
+                <div style="border-top:1px solid var(--border); padding-top:8px; font-size:11px; color:var(--muted); display:flex; justify-content:space-between;">
+                    <span>Status: <strong style="color:var(--status-green);">Verbunden</strong></span>
+                    <a href="/energy" style="color:var(--primary); text-decoration:none; font-weight:600;">Details ↗</a>
+                </div>
+            </div>
+        </div>
+
+        <!-- Power Flow Diagram (Compact) -->
+        <div class="card" style="padding:16px 20px; margin-bottom:20px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                <h3 style="font-size:14px; font-weight:600;">⚡ Live Energiefluss</h3>
+                <a href="/energy" style="font-size:11px; color:var(--primary); text-decoration:none; font-weight:600;">Ausführliche 3-Phasen Analyse ↗</a>
+            </div>
+            <div style="display:flex; justify-content:space-around; align-items:center; flex-wrap:wrap; gap:14px;">
+                <div style="text-align:center; min-width:120px; padding:12px; background:var(--bg); border:2px solid #f59e0b; border-radius:10px;">
+                    <div style="font-size:26px;">☀️</div>
+                    <div style="font-weight:700; font-size:12px; margin-top:2px;">Solar PV</div>
+                    <div id="dash-flow-solar" style="font-weight:700; font-size:15px; color:#d97706; margin-top:1px;">-- W</div>
+                </div>
+
+                <div style="display:flex; flex-direction:column; align-items:center; min-width:70px;">
+                    <span style="font-size:18px;">➡️</span>
+                    <span id="dash-flow-solar-text" style="font-size:10px; font-weight:600; color:var(--muted);">-- W</span>
+                </div>
+
+                <div style="text-align:center; min-width:140px; padding:14px; background:var(--bg); border:2px solid #10b981; border-radius:10px; box-shadow:0 2px 6px rgba(0,0,0,0.04);">
+                    <div style="font-size:28px;">🏠</div>
+                    <div style="font-weight:700; font-size:13px; margin-top:2px;">Hausverbrauch</div>
+                    <div id="dash-flow-house" style="font-weight:800; font-size:18px; color:#059669; margin-top:1px;">-- W</div>
+                </div>
+
+                <div style="display:flex; flex-direction:column; align-items:center; min-width:70px;">
+                    <span style="font-size:18px;" id="dash-arrow-grid">⬅️</span>
+                    <span id="dash-flow-grid-text" style="font-size:10px; font-weight:600; color:var(--muted);">-- W</span>
+                </div>
+
+                <div style="text-align:center; min-width:120px; padding:12px; background:var(--bg); border:2px solid #2563eb; border-radius:10px;">
+                    <div style="font-size:26px;">🌐</div>
+                    <div style="font-weight:700; font-size:12px; margin-top:2px;">Stromnetz</div>
+                    <div id="dash-flow-grid" style="font-weight:700; font-size:15px; margin-top:1px;">-- W</div>
+                    <div id="dash-flow-grid-dir" style="font-size:10px; color:var(--muted);">--</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- BLE Sensors & Live Event Log -->
+        <div style="display:grid; grid-template-columns: 320px 1fr; gap:20px; align-items:start; margin-bottom:20px;">
+            <!-- Left column: Active BLE Sensors -->
+            <div>
+                <div class="card" style="margin-bottom:0;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                        <h3 style="font-size:14px; font-weight:700; display:flex; align-items:center; gap:6px; margin:0;">
+                            <span>🔘 BLE Sensoren & Taster</span>
+                        </h3>
+                        <a href="/devices" style="font-size:11px; color:var(--primary); text-decoration:none;">Alle Geräte ↗</a>
+                    </div>
+                    <div style="font-size:11px; color:var(--muted); margin-bottom:12px;">
+                        Erkannte BTHome Taster & Sensoren mit aktuellem Batteriestand und Standort.
+                    </div>
+                    <div id="dash-sensor-chips" style="display:flex; flex-direction:column; gap:8px;">
+                        <span style="font-size:11px; color:var(--muted); text-align:center; padding:16px 0;">Warte auf Sensor-Meldungen...</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right column: Live Event Feed -->
+            <div class="card" style="margin-bottom:0; border-left:4px solid #2563eb; min-height:360px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:12px; border-bottom:1px solid var(--border); padding-bottom:10px;">
+                    <div>
+                        <div style="font-weight:700; font-size:14px; display:flex; align-items:center; gap:6px;">
+                            <span>⚡ Echtzeit Event-Log & Raum-Tracking</span>
+                            <span id="dash-event-count" class="badge" style="background:#2563eb; color:#fff; font-size:10px; padding:1px 6px; border-radius:10px;">0 Events</span>
+                        </div>
+                        <div style="font-size:11px; color:var(--muted); margin-top:2px;">
+                            Live-Meldungen von Buttons, Sensoren und Gateways inklusive Raumerkennung
+                        </div>
+                    </div>
+                    <div style="display:flex; gap:6px; align-items:center;">
+                        <button type="button" class="btn btn-sm" onclick="clearDashboardEvents()" style="background:var(--bg); border:1px solid var(--border); font-size:11px;">Clear Log</button>
+                    </div>
+                </div>
+
+                <!-- Event feed items list -->
+                <div id="dash-log-container" style="max-height:420px; overflow-y:auto; background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:8px 12px; font-family:monospace; font-size:11px; line-height:1.7;">
+                    <div id="dash-log-empty" style="color:var(--muted); text-align:center; padding:30px 0; font-size:12px;">
+                        Warte auf BLE Events (drücke z.B. den Shelly BLU Button)...
+                    </div>
+                    <div id="dash-log-items"></div>
+                </div>
+            </div>
+        </div>
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:12px; border-bottom:1px solid var(--border); padding-bottom:10px;">
+                    <div>
+                        <div style="font-weight:700; font-size:14px; display:flex; align-items:center; gap:6px;">
+                            <span>⚡ Echtzeit Event-Log & Raum-Tracking</span>
+                            <span id="dash-event-count" class="badge" style="background:#2563eb; color:#fff; font-size:10px; padding:1px 6px; border-radius:10px;">0 Events</span>
+                        </div>
+                        <div style="font-size:11px; color:var(--muted); margin-top:2px;">
+                            Live-Meldungen von Buttons, Sensoren und Gateways inklusive Raumerkennung
+                        </div>
+                    </div>
+                    <div style="display:flex; gap:6px; align-items:center;">
+                        <button type="button" class="btn btn-sm" onclick="clearDashboardEvents()" style="background:var(--bg); border:1px solid var(--border); font-size:11px;">Clear Log</button>
+                    </div>
+                </div>
+
+                <!-- Event feed items list -->
+                <div id="dash-log-container" style="max-height:420px; overflow-y:auto; background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:8px 12px; font-family:monospace; font-size:11px; line-height:1.7;">
+                    <div id="dash-log-empty" style="color:var(--muted); text-align:center; padding:30px 0; font-size:12px;">
+                        Warte auf BLE Events (drücke z.B. den Shelly BLU Button)...
+                    </div>
+                    <div id="dash-log-items"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Bottom Navigation Quick Jump -->
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:14px;">
+            <a href="/devices" class="card" style="text-decoration:none; color:inherit; margin-bottom:0; transition:border-color 0.15s; display:flex; align-items:center; gap:12px;">
+                <span style="font-size:24px;">📱</span>
+                <div>
+                    <div style="font-weight:700; font-size:13px; color:var(--primary);">Geräteinventar ({} Geräte)</div>
+                    <div style="font-size:11px; color:var(--muted);">Filter, Dokumentation & Port-Scanner ({} aktiv)</div>
+                </div>
+            </a>
+            <a href="/energy" class="card" style="text-decoration:none; color:inherit; margin-bottom:0; transition:border-color 0.15s; display:flex; align-items:center; gap:12px;">
+                <span style="font-size:24px;">⚡</span>
+                <div>
+                    <div style="font-weight:700; font-size:13px; color:var(--primary);">Energie & 3-Phasen</div>
+                    <div style="font-size:11px; color:var(--muted);">Fronius Inverter & Shelly Pro 3EM Phasen</div>
+                </div>
+            </a>
+            <a href="/matter" class="card" style="text-decoration:none; color:inherit; margin-bottom:0; transition:border-color 0.15s; display:flex; align-items:center; gap:12px;">
+                <span style="font-size:24px;">✨</span>
+                <div>
+                    <div style="font-weight:700; font-size:13px; color:var(--primary);">Matter Fabrics</div>
+                    <div style="font-size:11px; color:var(--muted);">Apple Home, Google, Alexa & Multi-Admin</div>
+                </div>
+            </a>
+            <a href="/catalog" class="card" style="text-decoration:none; color:inherit; margin-bottom:0; transition:border-color 0.15s; display:flex; align-items:center; gap:12px;">
+                <span style="font-size:24px;">🏢</span>
+                <div>
+                    <div style="font-weight:700; font-size:13px; color:var(--primary);">Hardware Katalog</div>
+                    <div style="font-size:11px; color:var(--muted);">Modelle, Handbücher & Rhai-Treiber</div>
+                </div>
+            </a>
+        </div>
+
+        <script>
+        function escapeHtml(text) {{
+            return (text || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        }}
+        function escapeAttr(text) {{
+            return (text || '').replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+        }}
+
+        function clearDashboardEvents() {{
+            const items = document.getElementById('dash-log-items');
+            if (items) items.innerHTML = '';
+            const empty = document.getElementById('dash-log-empty');
+            if (empty) empty.style.display = 'block';
+            const count = document.getElementById('dash-event-count');
+            if (count) count.innerText = '0 Events';
+        }}
+
+        async function fetchDashboardEnergy() {{
+            try {{
+                const res = await fetch('/api/energy/live');
+                if (!res.ok) return;
+                const data = await res.json();
+
+                document.getElementById('dash-solar-power-val').innerText = Math.round(data.solar_power_w).toLocaleString();
+                document.getElementById('dash-solar-day-val').innerText = (data.solar_day_kwh || 0).toFixed(2) + ' kWh';
+                document.getElementById('dash-solar-year-val').innerText = Math.round(data.solar_year_kwh || 0).toLocaleString() + ' kWh';
+
+                const gridVal = Math.round(data.grid_power_w);
+                const absGrid = Math.abs(gridVal);
+                document.getElementById('dash-grid-power-val').innerText = absGrid.toLocaleString();
+                const gridBadge = document.getElementById('dash-grid-dir-badge');
+                if (gridVal < -1) {{
+                    gridBadge.innerText = '🟢 EINSPEISUNG';
+                    gridBadge.style.background = '#dcfce7';
+                    gridBadge.style.color = '#166534';
+                }} else {{
+                    gridBadge.innerText = '🟠 NETZBEZUG';
+                    gridBadge.style.background = '#ffedd5';
+                    gridBadge.style.color = '#9a3412';
+                }}
+                document.getElementById('dash-grid-import-val').innerText = (data.grid_import_kwh || 0).toLocaleString() + ' kWh';
+                document.getElementById('dash-grid-export-val').innerText = (data.grid_export_kwh || 0).toLocaleString() + ' kWh';
+
+                document.getElementById('dash-house-power-val').innerText = Math.round(data.house_consumption_w).toLocaleString();
+                document.getElementById('dash-autarky-val').innerText = (data.autarky_pct || 0).toFixed(1) + ' %';
+                document.getElementById('dash-self-val').innerText = (data.self_consumption_pct || 0).toFixed(1) + ' %';
+
+                document.getElementById('dash-flow-solar').innerText = Math.round(data.solar_power_w).toLocaleString() + ' W';
+                document.getElementById('dash-flow-solar-text').innerText = Math.round(data.solar_power_w) + ' W';
+                document.getElementById('dash-flow-house').innerText = Math.round(data.house_consumption_w).toLocaleString() + ' W';
+                document.getElementById('dash-flow-grid').innerText = absGrid.toLocaleString() + ' W';
+                document.getElementById('dash-flow-grid-dir').innerText = (gridVal < -1) ? 'Einspeisung ins Netz' : 'Netzbezug';
+
+                if (gridVal < -1) {{
+                    document.getElementById('dash-arrow-grid').innerText = '➡️';
+                    document.getElementById('dash-flow-grid-text').innerText = 'Export ' + absGrid + ' W';
+                }} else {{
+                    document.getElementById('dash-arrow-grid').innerText = '⬅️';
+                    document.getElementById('dash-flow-grid-text').innerText = 'Import ' + absGrid + ' W';
+                }}
+
+                const updatedEl = document.getElementById('dash-last-updated');
+                if (updatedEl) updatedEl.innerText = 'Aktualisiert: ' + new Date().toLocaleTimeString();
+            }} catch (e) {{
+                console.debug('Dashboard energy error:', e);
+            }}
+        }}
+
+        async function fetchDashboardEvents() {{
+            try {{
+                const res = await fetch('/api/events');
+                if (!res.ok) return;
+                const events = await res.json();
+                if (!Array.isArray(events)) return;
+
+                const countEl = document.getElementById('dash-event-count');
+                if (countEl) countEl.innerText = `${{events.length}} Event${{events.length === 1 ? '' : 's'}}`;
+
+                const container = document.getElementById('dash-log-items');
+                const emptyEl = document.getElementById('dash-log-empty');
+                if (container) {{
+                    if (events.length === 0) {{
+                        if (emptyEl) emptyEl.style.display = 'block';
+                        container.innerHTML = '';
+                    }} else {{
+                        if (emptyEl) emptyEl.style.display = 'none';
+                        container.innerHTML = events.slice(0, 40).map(ev => {{
+                            const time = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString() : '';
+                            let badgeBg = '#2563eb';
+                            if (ev.event_type.includes('press') || ev.event_type.includes('push')) badgeBg = '#d97706';
+                            if (ev.event_type.includes('door') || ev.event_type.includes('open')) badgeBg = '#059669';
+                            if (ev.event_type.includes('battery')) badgeBg = '#10b981';
+
+                            const gwLabel = ev.gateway_name || ev.gateway_ip || ev.gateway || 'Shelly Gateway';
+                            let locationBadge = '';
+                            if (ev.room) {{
+                                locationBadge = `<span class="badge" style="background:#fef3c7; color:#92400e; font-size:10px; font-weight:700; padding:1px 6px; border-radius:4px; display:inline-flex; align-items:center; gap:3px;">📍 ${{escapeHtml(ev.room)}} <small style="opacity:0.8; font-weight:normal;">(${{escapeHtml(gwLabel)}})</small></span>`;
+                            }} else {{
+                                locationBadge = `<span class="badge" style="background:#f1f5f9; color:#475569; font-size:10px; padding:1px 6px; border-radius:4px;">📡 ${{escapeHtml(gwLabel)}}</span>`;
+                            }}
+
+                            return `
+                                <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; padding:4px 0; border-bottom:1px solid rgba(148,163,184,0.15);">
+                                    <div style="display:flex; align-items:center; gap:6px; overflow:hidden;">
+                                        <span style="color:var(--muted); font-size:10px;">[${{time}}]</span>
+                                        <span>${{ev.icon || '🔘'}}</span>
+                                        <strong style="color:var(--text);">${{escapeHtml(ev.device_name)}}</strong>
+                                        <span class="badge" style="background:${{badgeBg}}; color:#fff; font-size:10px; padding:1px 6px; border-radius:3px;">${{escapeHtml(ev.description)}}</span>
+                                        ${{locationBadge}}
+                                    </div>
+                                    <div style="display:flex; align-items:center; gap:8px; font-size:10px; color:var(--muted); flex-shrink:0;">
+                                        <span>📶 ${{ev.rssi}} dBm</span>
+                                        <a href="/devices#bthome-${{escapeAttr(ev.mac.replace(/[:\-]/g, ''))}}" style="color:var(--primary); text-decoration:none; font-weight:600;">Inspect ↗</a>
+                                    </div>
+                                </div>
+                            `;
+                        }}).join('');
+                    }}
+                }}
+
+                // Sensor cards update
+                const chipsEl = document.getElementById('dash-sensor-chips');
+                if (chipsEl) {{
+                    const seenMacs = new Map();
+                    events.forEach(ev => {{
+                        if (!seenMacs.has(ev.mac)) {{
+                            seenMacs.set(ev.mac, ev);
+                        }}
+                    }});
+
+                    if (seenMacs.size === 0) {{
+                        chipsEl.innerHTML = '<span style="font-size:11px; color:var(--muted);">Keine aktiven Sensoren empfangen.</span>';
+                    }} else {{
+                        chipsEl.innerHTML = Array.from(seenMacs.values()).map(ev => {{
+                            const bat = ev.battery ? `🔋 ${{ev.battery}}%` : '';
+                            const roomTag = ev.room ? `📍 ${{escapeHtml(ev.room)}}` : (ev.gateway_name || 'Standort offen');
+                            return `
+                                <div style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:8px 10px; display:flex; justify-content:space-between; align-items:center;">
+                                    <div style="display:flex; align-items:center; gap:6px;">
+                                        <span>${{ev.icon || '🔘'}}</span>
+                                        <div>
+                                            <div style="font-weight:600; font-size:12px;">${{escapeHtml(ev.device_name)}}</div>
+                                            <div style="font-size:10px; color:var(--muted);">${{bat}} &bull; 📶 ${{ev.rssi}} dBm</div>
+                                        </div>
+                                    </div>
+                                    <div style="text-align:right;">
+                                        <span class="badge" style="background:#fef3c7; color:#92400e; font-size:10px; font-weight:600;">${{roomTag}}</span>
+                                    </div>
+                                </div>
+                            `;
+                        }}).join('');
+                    }}
+                }}
+            }} catch (e) {{
+                console.debug('Dashboard events error:', e);
+            }}
+        }}
+
+        window.addEventListener('DOMContentLoaded', () => {{
+            fetchDashboardEnergy();
+            fetchDashboardEvents();
+            setInterval(fetchDashboardEnergy, 2500);
+            setInterval(fetchDashboardEvents, 1200);
+        }});
+        </script>
+        "#,
+        total_devices,
+        active_devices
+    );
+
+    page_layout(title, "dashboard", &content)
 }
 
 fn render_energy_page(title: &str) -> String {

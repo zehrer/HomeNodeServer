@@ -17,6 +17,7 @@ pub const IMPLEMENTED_MODULE_IDS: &[&str] = &[
     "matter-controller",
     "matter-bridge",
     "network-discovery",
+    "bthome",
 ];
 
 pub const RESERVED_MODULE_IDS: &[&str] = &[
@@ -24,6 +25,8 @@ pub const RESERVED_MODULE_IDS: &[&str] = &[
     "matter-controller",
     "matter-bridge",
     "network-discovery",
+    "bthome",
+    "tuya",
     "shelly",
     "govee",
     "zigbee",

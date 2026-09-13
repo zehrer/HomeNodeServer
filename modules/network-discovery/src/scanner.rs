@@ -15,7 +15,8 @@ use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::{debug, info};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredDevice {
@@ -32,6 +33,8 @@ pub struct DiscoveredDevice {
     pub vendor: Option<String>,
     pub capabilities: Vec<String>,
     pub source: String,
+    #[serde(default)]
+    pub sources: Vec<String>,
     pub web_url: Option<String>,
     #[serde(default)]
     pub product_id: Option<String>,
@@ -41,6 +44,8 @@ pub struct DiscoveredDevice {
     pub vendor_id: Option<String>,
     #[serde(default)]
     pub matter_fabrics: Option<String>,
+    #[serde(default)]
+    pub is_active: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +82,7 @@ pub struct RawObservation {
     pub interface: String,
     pub hostname: Option<String>,
     pub source: String,
+    pub is_active_hint: Option<bool>,
 }
 
 pub struct NetworkScanner {
@@ -120,10 +126,13 @@ impl NetworkScanner {
         // 4. mDNS hints (avahi-browse or dns-sd)
         observations.extend(collect_from_mdns().await);
 
-        // 5. Reverse DNS hostname enrichment
+        // 5. Query FRITZ!Box TR-064 router host & switch topology
+        observations.extend(collect_from_fritzbox(&interfaces).await);
+
+        // 6. Reverse DNS hostname enrichment
         enrich_hostnames(&mut observations).await;
 
-        // 6. Aggregate by IP/MAC and classify devices using Rhai engine & Hardware Catalog
+        // 7. Aggregate by IP/MAC and classify devices using Rhai engine & Hardware Catalog
         let mut devices = aggregate_and_classify(observations, &self.definitions_engine, &self.catalog);
 
         // 7. Matter operational discovery and fabrics enrichment
@@ -244,6 +253,7 @@ impl NetworkScanner {
                     interface: "lan".to_string(),
                     hostname: None,
                     source: "active-probe".to_string(),
+                    is_active_hint: None,
                 });
             }
         }
@@ -272,6 +282,7 @@ fn collect_from_arp() -> Vec<RawObservation> {
                             interface: iface.to_string(),
                             hostname: None,
                             source: "arp".to_string(),
+                            is_active_hint: None,
                         });
                     }
                 }
@@ -326,6 +337,7 @@ pub fn parse_macos_arp(output: &str) -> Vec<RawObservation> {
                 interface: iface.to_string(),
                 hostname: None,
                 source: "arp".to_string(),
+                is_active_hint: None,
             });
         }
     }
@@ -370,6 +382,7 @@ async fn collect_from_ip_neigh() -> Vec<RawObservation> {
                 interface: iface,
                 hostname: None,
                 source: "neigh".to_string(),
+                is_active_hint: None,
             });
         }
     }
@@ -405,6 +418,7 @@ async fn collect_from_mdns() -> Vec<RawObservation> {
                             interface: iface,
                             hostname,
                             source: "mdns".to_string(),
+                            is_active_hint: None,
                         });
                     }
                 }
@@ -413,6 +427,174 @@ async fn collect_from_mdns() -> Vec<RawObservation> {
     }
 
     out
+}
+
+pub fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open_tag = format!("<{tag}>");
+    let close_tag = format!("</{tag}>");
+    let start = xml.find(&open_tag)? + open_tag.len();
+    let end = xml[start..].find(&close_tag)? + start;
+    Some(xml[start..end].trim())
+}
+
+async fn call_tr064_hosts(addr: SocketAddr, action: &str, inner_xml: &str) -> Option<String> {
+    let envelope = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+<s:Body>{inner_xml}</s:Body>\
+</s:Envelope>"
+    );
+
+    let req = format!(
+        "POST /upnp/control/hosts HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Content-Type: text/xml; charset=\"utf-8\"\r\n\
+SoapAction: urn:dslforum-org:service:Hosts:1#{action}\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n\
+{envelope}",
+        envelope.len()
+    );
+
+    let mut stream = tokio::time::timeout(Duration::from_millis(800), TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+
+    tokio::time::timeout(Duration::from_millis(800), stream.write_all(req.as_bytes()))
+        .await
+        .ok()?
+        .ok()?;
+
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 4096];
+    let read_fut = async {
+        loop {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            resp.extend_from_slice(&buf[..n]);
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    tokio::time::timeout(Duration::from_millis(1500), read_fut)
+        .await
+        .ok()?
+        .ok()?;
+
+    String::from_utf8(resp).ok()
+}
+
+async fn collect_from_fritzbox(interfaces: &[NetworkInterface]) -> Vec<RawObservation> {
+    let mut candidates = Vec::new();
+    candidates.push(Ipv4Addr::new(192, 168, 178, 1));
+
+    for iface in interfaces {
+        for net in &iface.ipv4_subnets {
+            let oct = net.network().octets();
+            let gw = Ipv4Addr::new(oct[0], oct[1], oct[2], 1);
+            if !candidates.contains(&gw) {
+                candidates.push(gw);
+            }
+        }
+    }
+
+    let mut target_addr = None;
+    for ip in candidates {
+        let addr = SocketAddr::new(IpAddr::V4(ip), 49000);
+        if tokio::time::timeout(Duration::from_millis(300), TcpStream::connect(addr))
+            .await
+            .is_ok_and(|r| r.is_ok())
+        {
+            target_addr = Some(addr);
+            break;
+        }
+    }
+
+    let Some(addr) = target_addr else {
+        debug!("No FRITZ!Box / TR-064 router found on port 49000");
+        return Vec::new();
+    };
+
+    info!("Discovered FRITZ!Box TR-064 router at {addr}");
+
+    let count_body = "<u:GetHostNumberOfEntries xmlns:u=\"urn:dslforum-org:service:Hosts:1\"></u:GetHostNumberOfEntries>";
+    let Some(count_resp) = call_tr064_hosts(addr, "GetHostNumberOfEntries", count_body).await else {
+        warn!("Failed to retrieve host count from FRITZ!Box at {addr}");
+        return Vec::new();
+    };
+
+    let total_hosts: usize = extract_xml_tag(&count_resp, "NewHostNumberOfEntries")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    info!("FRITZ!Box reports {total_hosts} registered host entries");
+    if total_hosts == 0 {
+        return Vec::new();
+    }
+
+    let mut join_set = JoinSet::new();
+    let sem = Arc::new(Semaphore::new(8));
+
+    for index in 0..total_hosts {
+        let permit_sem = sem.clone();
+        join_set.spawn(async move {
+            let _permit = permit_sem.acquire().await;
+            let body = format!("<u:GetGenericHostEntry xmlns:u=\"urn:dslforum-org:service:Hosts:1\"><NewIndex>{index}</NewIndex></u:GetGenericHostEntry>");
+            let resp = call_tr064_hosts(addr, "GetGenericHostEntry", &body).await;
+            (index, resp)
+        });
+    }
+
+    let mut observations = Vec::new();
+    while let Some(res) = join_set.join_next().await {
+        if let Ok((_idx, Some(xml))) = res {
+            let mac = extract_xml_tag(&xml, "NewMACAddress").unwrap_or("").to_string();
+            let ip = extract_xml_tag(&xml, "NewIPAddress").unwrap_or("").to_string();
+            let name = extract_xml_tag(&xml, "NewHostName").unwrap_or("").to_string();
+            let active_str = extract_xml_tag(&xml, "NewActive").unwrap_or("0");
+            let iface = extract_xml_tag(&xml, "NewInterfaceType").unwrap_or("Ethernet").to_string();
+
+            let is_active = active_str == "1";
+            let norm_mac = mac.trim().to_uppercase();
+            let norm_name = name.trim().to_string();
+            let lower_name = norm_name.to_lowercase();
+
+            let is_l2_switch = ip.is_empty() && (!norm_mac.is_empty() || lower_name == "switch");
+            let is_switch_name = (!lower_name.contains("switchbot") && !lower_name.contains("nintendo"))
+                && (lower_name == "switch" || lower_name.starts_with("switch-") || lower_name.starts_with("switch_") || lower_name.ends_with("-switch"));
+            let is_face_mac = norm_mac.starts_with("FA:CE:");
+
+            if is_l2_switch || is_switch_name || is_face_mac {
+                info!(
+                    "Discovered Switch via FRITZ!Box: MAC={}, IP='{}', Name='{}', Active={}",
+                    norm_mac, ip, norm_name, is_active
+                );
+                observations.push(RawObservation {
+                    ip: ip.clone(),
+                    mac: if norm_mac.is_empty() { None } else { Some(norm_mac) },
+                    interface: if iface.is_empty() { "lan".to_string() } else { iface.to_lowercase() },
+                    hostname: if norm_name.is_empty() { None } else { Some(norm_name) },
+                    source: "fritzbox-tr064".to_string(),
+                    is_active_hint: Some(is_active),
+                });
+            } else if !ip.is_empty() && !norm_name.is_empty() {
+                observations.push(RawObservation {
+                    ip: ip.clone(),
+                    mac: if norm_mac.is_empty() { None } else { Some(norm_mac) },
+                    interface: if iface.is_empty() { "lan".to_string() } else { iface.to_lowercase() },
+                    hostname: Some(norm_name),
+                    source: "fritzbox-tr064".to_string(),
+                    is_active_hint: Some(is_active),
+                });
+            }
+        }
+    }
+
+    info!("FRITZ!Box TR-064 collection completed with {} observations", observations.len());
+    observations
 }
 
 async fn enrich_hostnames(observations: &mut [RawObservation]) {
@@ -509,16 +691,38 @@ fn aggregate_and_classify(
     engine: &homenode_definitions::RhaiDeviceEngine,
     catalog: &homenode_definitions::CatalogDatabase,
 ) -> Vec<DiscoveredDevice> {
-    let mut by_ip: HashMap<String, DiscoveredDevice> = HashMap::new();
+    let mut by_key: HashMap<String, DiscoveredDevice> = HashMap::new();
 
     for obs in observations {
         let (vendor_id, vendor_name) = resolve_vendor(obs.mac.as_deref(), catalog);
-        let entry = by_ip.entry(obs.ip.clone()).or_insert_with(|| {
-            let device_id = format!("net-{}", obs.ip.replace('.', "-"));
+        let key = if !obs.ip.is_empty() && obs.ip != "0.0.0.0" {
+            obs.ip.clone()
+        } else if let Some(ref m) = obs.mac {
+            format!("mac:{}", m.to_lowercase())
+        } else {
+            format!("raw:{}", obs.source)
+        };
+
+        let entry = by_key.entry(key).or_insert_with(|| {
+            let device_id = if !obs.ip.is_empty() && obs.ip != "0.0.0.0" {
+                format!("net-{}", obs.ip.replace('.', "-"))
+            } else if let Some(ref m) = obs.mac {
+                format!("net-{}", m.to_lowercase().replace(':', "-"))
+            } else {
+                format!("net-{}", obs.source)
+            };
             let display_name = obs
                 .hostname
                 .clone()
-                .unwrap_or_else(|| format!("Host {}", obs.ip));
+                .unwrap_or_else(|| {
+                    if !obs.ip.is_empty() && obs.ip != "0.0.0.0" {
+                        format!("Host {}", obs.ip)
+                    } else if let Some(ref m) = obs.mac {
+                        format!("Switch ({m})")
+                    } else {
+                        "Network Switch".to_string()
+                    }
+                });
             let (mut kind, category_title, mut category_icon, script_id) = classify_with_engine(
                 engine,
                 &display_name,
@@ -543,6 +747,12 @@ fn aggregate_and_classify(
                 (None, None)
             };
 
+            let capabilities = if !obs.ip.is_empty() && obs.ip != "0.0.0.0" {
+                vec!["ip".to_string()]
+            } else {
+                vec!["ethernet".to_string(), "l2".to_string()]
+            };
+
             DiscoveredDevice {
                 device_id,
                 display_name,
@@ -555,13 +765,15 @@ fn aggregate_and_classify(
                 hostname: obs.hostname.clone(),
                 interface: obs.interface.clone(),
                 vendor: vendor_name.clone(),
-                capabilities: vec!["ip".to_string()],
+                capabilities,
                 source: obs.source.clone(),
+                sources: vec![obs.source.clone()],
                 web_url: None,
                 product_id,
                 product_name,
                 vendor_id: vendor_id.clone(),
                 matter_fabrics: None,
+                is_active: obs.is_active_hint,
             }
         });
 
@@ -641,12 +853,22 @@ fn aggregate_and_classify(
             }
         }
 
+        if obs.is_active_hint == Some(true) {
+            entry.is_active = Some(true);
+        } else if entry.is_active.is_none() && obs.is_active_hint.is_some() {
+            entry.is_active = obs.is_active_hint;
+        }
+
+        if !entry.sources.contains(&obs.source) {
+            entry.sources.push(obs.source.clone());
+        }
+
         if !entry.capabilities.contains(&obs.source) {
             entry.capabilities.push(obs.source);
         }
     }
 
-    let mut devices: Vec<_> = by_ip.into_values().collect();
+    let mut devices: Vec<_> = by_key.into_values().collect();
 
     // Detect router gateway MAC (e.g. 192.168.178.1 or fritz.box)
     let gateway_mac = devices
@@ -699,7 +921,12 @@ fn aggregate_and_classify(
     devices.sort_by(|a, b| {
         let ip_a: Option<Ipv4Addr> = a.ip.parse().ok();
         let ip_b: Option<Ipv4Addr> = b.ip.parse().ok();
-        ip_a.cmp(&ip_b)
+        match (ip_a, ip_b) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.display_name.cmp(&b.display_name),
+        }
     });
 
     devices
@@ -719,8 +946,31 @@ fn classify_device_full(
         .or_else(|| mac.and_then(guess_vendor).map(|v| v.to_lowercase()))
         .unwrap_or_default();
 
+    let mac_str = mac.unwrap_or("").to_lowercase();
+    if mac_str.starts_with("fa:ce:")
+        || (!lower.contains("switchbot")
+            && !host.contains("switchbot")
+            && !lower.contains("nintendo")
+            && !host.contains("nintendo")
+            && (lower == "switch"
+                || host == "switch"
+                || lower.starts_with("switch-")
+                || lower.starts_with("switch_")
+                || host.starts_with("switch-")
+                || host.starts_with("switch_")
+                || host.ends_with("-switch")
+                || lower.contains("network switch")
+                || lower.contains("managed switch")))
+    {
+        return "switch".to_string();
+    }
+
     if lower.contains("vpn") || host.contains("vpn") || lower.contains("wireguard") || host.contains("wireguard") || lower.contains("ipsec") || host.contains("ipsec") || lower.contains("iphonestephan") || host.contains("iphonestephan") {
         return "vpn".to_string();
+    }
+
+    if lower.contains("3d") || host.contains("3d") || lower.contains("centauri") || host.contains("centauri") || lower.contains("carbon") || host.contains("carbon") || lower.contains("elegoo") || host.contains("elegoo") || lower.contains("bambu") || host.contains("bambu") || lower.contains("creality") || host.contains("creality") || lower.contains("voron") || host.contains("voron") {
+        return "3d-printer".to_string();
     }
 
     if lower.contains("printer") || host.contains("printer") || lower.contains("epson") || host.contains("epson") || lower.contains("canon") || host.contains("canon") || lower.contains("brother") || host.contains("brother") || lower.contains("hp-") || host.contains("hp-") {
@@ -741,7 +991,7 @@ fn classify_device_full(
     if lower.contains("everything-presence") || host.contains("everything-presence") || lower.contains("ep1-") || host.contains("ep1-") || lower.contains("epl-") || host.contains("epl-") {
         return "sensor".to_string();
     }
-    if lower.contains("fronius") || host.contains("fronius") || vend.contains("fronius") || lower.contains("symo") || host.contains("symo") || lower.contains("gen24") || host.contains("gen24") {
+    if lower.contains("fronius") || host.contains("fronius") || vend.contains("fronius") || lower.contains("symo") || host.contains("symo") || lower.contains("gen24") || host.contains("gen24") || lower.starts_with("lwip0") || host.starts_with("lwip0") || mac_str == "4c:a9:19:39:b9:3e" || lower.contains("solar") || host.contains("solar") || lower.contains("inverter") || host.contains("inverter") {
         return "energy".to_string();
     }
     if lower.contains("miele") || host.contains("miele") || vend.contains("miele") {
@@ -799,6 +1049,7 @@ fn classify_device_full(
     "network-device".to_string()
 }
 
+#[allow(dead_code)]
 fn classify_device(name: &str, ip: &str, mac: Option<&str>) -> String {
     classify_device_full(name, ip, mac, None, None)
 }
@@ -1084,6 +1335,9 @@ async fn enrich_matter_fabrics(devices: &mut Vec<DiscoveredDevice>) {
             if !dev.capabilities.contains(&"matter".to_string()) {
                 dev.capabilities.push("matter".to_string());
             }
+            if !dev.sources.contains(&"matter-mdns".to_string()) {
+                dev.sources.push("matter-mdns".to_string());
+            }
             dev.matter_fabrics = serde_json::to_string(&fabrics).ok();
         }
     }
@@ -1134,11 +1388,13 @@ async fn enrich_matter_fabrics(devices: &mut Vec<DiscoveredDevice>) {
             vendor: None,
             capabilities: vec!["thread".to_string(), "matter".to_string()],
             source: "matter-mdns".to_string(),
+            sources: vec!["matter-mdns".to_string()],
             web_url: None,
             product_id: None,
             product_name: None,
             vendor_id: None,
             matter_fabrics: serde_json::to_string(&fabrics).ok(),
+            is_active: None,
         });
     }
 }
@@ -1244,6 +1500,7 @@ async fn discover_home_assistant(devices: &mut Vec<DiscoveredDevice>) {
                 "virtual_machine".to_string(),
             ],
             source: "mdns_homeassistant".to_string(),
+            sources: vec!["mdns_homeassistant".to_string()],
             web_url: Some(web_url),
             product_id: Some("home_assistant_os".to_string()),
             product_name: Some("Home Assistant OS / VM".to_string()),
@@ -1256,6 +1513,7 @@ async fn discover_home_assistant(devices: &mut Vec<DiscoveredDevice>) {
                 }])
                 .unwrap_or_default(),
             ),
+            is_active: None,
         });
     }
 }
@@ -1458,6 +1716,9 @@ async fn enrich_web_urls(devices: &mut [DiscoveredDevice]) {
         if let Ok((idx, Some(url))) = res {
             if idx < devices.len() {
                 devices[idx].web_url = Some(url);
+                if !devices[idx].sources.contains(&"http-probe".to_string()) {
+                    devices[idx].sources.push("http-probe".to_string());
+                }
             }
         }
     }
@@ -1639,6 +1900,8 @@ mod tests {
             ("ipadm5.fritz.box", "tablet", "Tablets", "📟"),
             ("hensoldt-steffi.fritz.box", "computer", "Computers & Laptops", "💻"),
             ("edgy0020071074.fritz.box", "energy", "Solar & Energy Systems", "☀️"),
+            ("lwip0.fritz.box", "energy", "Solar & Energy Systems", "☀️"),
+            ("Centauri-Carbon.fritz.box", "3d-printer", "3D Printers & Makers", "🧊"),
             ("iphonestephan.fritz.box", "vpn", "VPN & Virtual Devices", "🛡️"),
             ("wireguard-client.fritz.box", "vpn", "VPN & Virtual Devices", "🛡️"),
         ];
@@ -1696,6 +1959,7 @@ mod tests {
                 interface: "en0".to_string(),
                 hostname: Some("fritz.box".to_string()),
                 source: "arp".to_string(),
+                is_active_hint: None,
             },
             RawObservation {
                 ip: "192.168.178.202".to_string(),
@@ -1703,6 +1967,7 @@ mod tests {
                 interface: "en0".to_string(),
                 hostname: None,
                 source: "arp".to_string(),
+                is_active_hint: None,
             },
         ];
 
@@ -1738,6 +2003,7 @@ mod tests {
                 interface: "en0".to_string(),
                 hostname: Some("shellypro3em.fritz.box".to_string()),
                 source: "arp".to_string(),
+                is_active_hint: None,
             },
             RawObservation {
                 ip: "192.168.178.153".to_string(),
@@ -1745,6 +2011,7 @@ mod tests {
                 interface: "en0".to_string(),
                 hostname: Some("hensoldt-steffi.fritz.box".to_string()),
                 source: "arp".to_string(),
+                is_active_hint: None,
             },
             RawObservation {
                 ip: "192.168.178.154".to_string(),
@@ -1752,6 +2019,7 @@ mod tests {
                 interface: "en0".to_string(),
                 hostname: Some("ipadair.fritz.box".to_string()),
                 source: "arp".to_string(),
+                is_active_hint: None,
             },
         ];
 
@@ -1774,5 +2042,62 @@ mod tests {
         assert_eq!(dev2.vendor_id.as_deref(), Some("apple"));
         assert_eq!(dev2.product_id.as_deref(), Some("apple_ipad_air"));
         assert_eq!(dev2.product_name.as_deref(), Some("Apple iPad Air"));
+    }
+
+    #[test]
+    fn classifies_l2_and_managed_switches() {
+        let catalog = homenode_definitions::CatalogDatabase::load_from_path("../../definitions/catalog.json")
+            .expect("bundle catalog");
+        let mut engine = homenode_definitions::RhaiDeviceEngine::new();
+        let _ = engine.load_from_dir("../../definitions/devices");
+
+        let obs = vec![
+            RawObservation {
+                ip: "".to_string(),
+                mac: Some("FA:CE:48:D1:6F:B1".to_string()),
+                interface: "lan".to_string(),
+                hostname: Some("Switch".to_string()),
+                source: "fritzbox-tr064".to_string(),
+                is_active_hint: Some(false),
+            },
+            RawObservation {
+                ip: "".to_string(),
+                mac: Some("FA:CE:00:B9:8C:9E".to_string()),
+                interface: "lan".to_string(),
+                hostname: Some("Switch".to_string()),
+                source: "fritzbox-tr064".to_string(),
+                is_active_hint: Some(true),
+            },
+            RawObservation {
+                ip: "192.168.178.4".to_string(),
+                mac: Some("b0:b9:8a:6f:b3:2e".to_string()),
+                interface: "en0".to_string(),
+                hostname: Some("switch-og".to_string()),
+                source: "fritzbox-tr064".to_string(),
+                is_active_hint: Some(true),
+            },
+        ];
+
+        let devices = aggregate_and_classify(obs, &engine, &catalog);
+        assert_eq!(devices.len(), 3);
+
+        let sw_managed = &devices[0]; // 192.168.178.4 comes first in IP sorting
+        assert_eq!(sw_managed.kind, "switch");
+        assert_eq!(sw_managed.category_title.as_deref(), Some("Network Switches"));
+        assert_eq!(sw_managed.category_icon.as_deref(), Some("🔀"));
+        assert_eq!(sw_managed.display_name, "switch-og");
+        assert_eq!(sw_managed.vendor_id.as_deref(), Some("ubiquiti"));
+
+        let sw_l2_1 = devices.iter().find(|d| d.mac.as_deref() == Some("FA:CE:48:D1:6F:B1")).unwrap();
+        assert_eq!(sw_l2_1.kind, "switch");
+        assert_eq!(sw_l2_1.category_title.as_deref(), Some("Network Switches"));
+        assert_eq!(sw_l2_1.category_icon.as_deref(), Some("🔀"));
+        assert_eq!(sw_l2_1.is_active, Some(false));
+
+        let sw_l2_2 = devices.iter().find(|d| d.mac.as_deref() == Some("FA:CE:00:B9:8C:9E")).unwrap();
+        assert_eq!(sw_l2_2.kind, "switch");
+        assert_eq!(sw_l2_2.category_title.as_deref(), Some("Network Switches"));
+        assert_eq!(sw_l2_2.category_icon.as_deref(), Some("🔀"));
+        assert_eq!(sw_l2_2.is_active, Some(true));
     }
 }

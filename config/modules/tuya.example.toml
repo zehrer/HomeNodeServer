@@ -1,0 +1,13 @@
+health_message = "Tuya Local / Cloud gateway standby"
+
+# Tuya Cloud OpenAPI settings (optional, used to auto-download keys if configured)
+# client_id = "your_access_id"
+# secret = "your_access_secret"
+# endpoint = "https://openapi.tuyaeu.com"
+
+# Registered local Tuya devices (Port 6668)
+# [[devices]]
+# device_id = "bf7c33018f254e236fdyve"
+# name = "LSC Solar Converter"
+# ip = "192.168.178.187"
+# local_key = "16_char_local_key"

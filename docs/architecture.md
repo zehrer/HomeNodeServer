@@ -12,9 +12,11 @@ The current module classes are:
 - `matter-controller`: placeholder for future controller features
 - `matter-bridge`: placeholder for future bridge features
 - `network-discovery`: placeholder for network inventory and standard discovery
+- `bthome`: passive BLE advertisement receiver and decoder for BTHome V1/V2 sensors (Shelly BLU, beacons)
 
 Reserved module IDs for later phases:
 
+- `tuya`
 - `shelly`
 - `govee`
 - `zigbee`
