@@ -32,6 +32,12 @@ module_id = "bthome"
 program = "homenode-module-bthome"
 config = "modules/bthome.example.toml"
 
+[modules.philips_hue]
+enabled = true
+module_id = "philips-hue"
+program = "homenode-module-philips-hue"
+config = "modules/philips-hue.example.toml"
+
 [modules.tuya]
 enabled = false
 module_id = "tuya"

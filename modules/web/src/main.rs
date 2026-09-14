@@ -227,6 +227,9 @@ async fn main() -> Result<()> {
         .route("/api/devices/unlink", post(unlink_devices_handler))
         .route("/api/devices/:id/forget", post(forget_device_handler))
         .route("/api/definitions/save", post(save_definition_handler))
+        .route("/api/hue/status", get(hue_status_api_handler))
+        .route("/api/hue/pair", post(hue_pair_api_handler))
+        .route("/api/hue/lights/:id/toggle", post(hue_toggle_api_handler))
         .with_state(WebState {
             socket_path: env.socket_path,
             status_title: config.status_title,
@@ -775,6 +778,69 @@ async fn forget_device_handler(
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// Philips Hue API Handlers
+// ------------------------------------------------------------------------------------------------
+
+async fn hue_status_api_handler() -> Response {
+    match energy::http_get_json("127.0.0.1", 8125, "/api/status", 500).await {
+        Ok(raw) => (
+            axum::http::StatusCode::OK,
+            [("content-type", "application/json")],
+            raw,
+        )
+            .into_response(),
+        Err(err) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({
+                "paired": false,
+                "error": err,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn hue_pair_api_handler() -> Response {
+    match energy::http_post_json("127.0.0.1", 8125, "/api/pair", "{}", 6000).await {
+        Ok(raw) => (
+            axum::http::StatusCode::OK,
+            [("content-type", "application/json")],
+            raw,
+        )
+            .into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Hue Modul nicht erreichbar: {err}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn hue_toggle_api_handler(
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let path = format!("/api/lights/{id}/toggle");
+    match energy::http_post_json("127.0.0.1", 8125, &path, "{}", 3000).await {
+        Ok(raw) => (
+            axum::http::StatusCode::OK,
+            [("content-type", "application/json")],
+            raw,
+        )
+            .into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Fehler beim Schalten: {err}"),
+            })),
+        )
+            .into_response(),
+    }
+}
 
 // ------------------------------------------------------------------------------------------------
 // Matter Fabrics API Handlers
@@ -2665,6 +2731,7 @@ fn render_devices_page(
                         "home-assistant" | "mdns_homeassistant" => ("HA", "#0284c7"),
                         "bthome" | "bthome-v2" => ("BTHome", "#3b82f6"),
                         "shelly-gateway" => ("Shelly BLE", "#0284c7"),
+                        "philips-hue" | "hue" => ("Hue", "#eab308"),
                         "ble" => ("BLE", "#6366f1"),
                         _ => (s, "#64748b"),
                     };
@@ -2825,7 +2892,8 @@ fn render_devices_page(
                     || (currentScannerFilter === 'ping' && rowSources.includes('active-probe'))
                     || (currentScannerFilter === 'matter' && rowSources.includes('matter-mdns'))
                     || (currentScannerFilter === 'bthome' && (rowSources.includes('bthome') || rowSources.includes('shelly-gateway')))
-                    || (currentScannerFilter === 'shelly-gateway' && rowSources.includes('shelly-gateway')));
+                    || (currentScannerFilter === 'shelly-gateway' && rowSources.includes('shelly-gateway'))
+                    || (currentScannerFilter === 'philips-hue' && (rowSources.includes('philips-hue') || rowSources.includes('hue'))));
 
                 if (matchesSearch && matchesStatus && matchesScanner) {{
                     row.style.display = '';
@@ -3123,6 +3191,8 @@ fn render_devices_page(
             'mdns_homeassistant': {{ name: 'Home Assistant mDNS', icon: '🏠', desc: 'Home Assistant Service Discovery' }},
             'http-probe': {{ name: 'HTTP Web Probe', icon: '🌐', desc: 'Weboberfläche auf Standardports' }},
             'configuration': {{ name: 'Konfiguration', icon: '⚙️', desc: 'Statisch konfigurierter Eintrag' }},
+            'philips-hue': {{ name: 'Philips Hue', icon: '💡', desc: 'Philips Hue Zigbee Bridge Leuchte / Sensor' }},
+            'hue': {{ name: 'Philips Hue', icon: '💡', desc: 'Philips Hue Zigbee Bridge Leuchte / Sensor' }},
             'documentation': {{ name: 'Benutzer-Notiz', icon: '📝', desc: 'Dokumentierter Geräteeintrag' }}
         }};
 
@@ -3200,6 +3270,32 @@ fn render_devices_page(
             `;
         }}
 
+        let hueControlCard = '';
+        const isHueDevice = (dev.category === 'lighting' || dev.kind === 'lighting' || devSources.includes('philips-hue') || devSources.includes('hue') || (dev.metadata && dev.metadata.source === 'philips-hue'));
+        if (isHueDevice && dev.metadata && (dev.metadata.hue_light_id || dev.device_id.startsWith('hue-light-') || dev.metadata.on !== undefined)) {{
+            const lightId = dev.metadata.hue_light_id || dev.device_id.replace('hue-light-', '');
+            const isOn = dev.metadata.on === 'true';
+            const bri = dev.metadata.brightness ? `${{Math.round(parseInt(dev.metadata.brightness, 10) / 254 * 100)}}%` : '';
+            const reachable = dev.metadata.reachable !== 'false';
+            hueControlCard = `
+                <div class="inspector-sec" style="background:linear-gradient(135deg, rgba(234,179,8,0.12) 0%, rgba(245,158,11,0.05) 100%); border:1px solid rgba(234,179,8,0.35); border-radius:8px; padding:10px; margin-top:8px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <div>
+                            <div style="font-weight:700; font-size:13px; color:#b45309; display:flex; align-items:center; gap:6px;">
+                                <span>💡</span> Philips Hue Lampe
+                            </div>
+                            <div style="font-size:11px; color:var(--muted); margin-top:2px;">
+                                Zustand: <strong>${{isOn ? '🟢 Eingeschaltet' : '⚪ Ausgeschaltet'}}</strong> ${{bri ? '&bull; ' + bri : ''}} ${{!reachable ? '&bull; ⚠️ Offline' : ''}}
+                            </div>
+                        </div>
+                        <button type="button" class="btn btn-sm ${{isOn ? '' : 'btn-primary'}}" style="font-size:11px; padding:4px 10px; cursor:pointer;" onclick="toggleHueLight('${{lightId}}')">
+                            ${{isOn ? 'Ausschalten 🔌' : 'Einschalten 💡'}}
+                        </button>
+                    </div>
+                </div>
+            `;
+        }}
+
         panel.innerHTML = `
             <div>
                 <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
@@ -3210,6 +3306,7 @@ fn render_devices_page(
                     </div>
                 </div>
                 ${{statusBadge}}
+                ${{hueControlCard}}
                 ${{telemetryBox}}
                 ${{historyBox}}
                 ${{scannerBox}}
@@ -3617,6 +3714,20 @@ fn render_devices_page(
         }}
     }}
 
+    async function toggleHueLight(lightId) {{
+        try {{
+            const res = await fetch('/api/hue/lights/' + encodeURIComponent(lightId) + '/toggle', {{ method: 'POST' }});
+            const json = await res.json();
+            if (res.ok && json.status === 'ok') {{
+                setTimeout(() => window.location.reload(), 250);
+            }} else {{
+                alert('Hue Fehler: ' + (json.message || json.error || 'Schalten fehlgeschlagen'));
+            }}
+        }} catch(e) {{
+            alert('Netzwerkfehler: ' + e);
+        }}
+    }}
+
     // Initial load: select device from hash or first available device
     window.addEventListener('DOMContentLoaded', () => {{
         const hash = (window.location.hash || '').replace('#', '');
@@ -3663,6 +3774,7 @@ fn render_devices_page(
                 <option value="matter">✨ Matter</option>
                 <option value="bthome">📶 BTHome (BLE Sensors & Buttons)</option>
                 <option value="shelly-gateway">📡 Shelly BLE Gateways</option>
+                <option value="philips-hue">💡 Philips Hue</option>
             </select>
         </div>
         <div class="pills">{}</div>
@@ -4476,10 +4588,71 @@ fn render_status_page(title: &str, snapshot: &RuntimeSnapshot) -> String {
         .collect::<Vec<_>>()
         .join("");
 
+    let has_hue = snapshot
+        .modules
+        .iter()
+        .any(|m| m.manifest.as_ref().map(|man| man.id == "philips-hue").unwrap_or(false));
+
+    let hue_card = if has_hue {
+        r#"
+        <div class="card" style="margin-top:20px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                <div style="display:flex; align-items:center; gap:8px;">
+                    <span style="font-size:22px;">💡</span>
+                    <h3 style="margin:0;">Philips Hue Bridge Integration</h3>
+                </div>
+                <span class="badge" style="background:#eab308; color:#000; font-weight:700; padding:3px 8px; border-radius:4px;">Hue Zigbee Gateway</span>
+            </div>
+            <p style="color:var(--muted); font-size:13px; line-height:1.5; margin-bottom:14px;">
+                Verbindung zur Philips Hue Bridge (<code>192.168.178.12</code>). Um HomeNode mit deiner Hue Bridge zu verbinden: drücke den runden Knopf oben auf der Bridge und klicke anschließend auf <strong>"Jetzt koppeln"</strong>.
+            </p>
+            <div style="display:flex; align-items:center; gap:12px;">
+                <button type="button" class="btn btn-primary" id="hue-pair-btn" onclick="triggerHuePairing()">
+                    🔗 Philips Hue Bridge jetzt koppeln
+                </button>
+                <span id="hue-pair-msg" style="font-size:13px; font-weight:600;"></span>
+            </div>
+            <script>
+            async function triggerHuePairing() {
+                const btn = document.getElementById('hue-pair-btn');
+                const msg = document.getElementById('hue-pair-msg');
+                btn.disabled = true;
+                msg.innerText = 'Kopplung wird angefragt...';
+                msg.style.color = '#0284c7';
+                try {
+                    const res = await fetch('/api/hue/pair', { method: 'POST' });
+                    const data = await res.json();
+                    if (res.ok && data.status === 'ok') {
+                        msg.innerText = '🎉 ' + (data.message || 'Erfolgreich gekoppelt!');
+                        msg.style.color = 'var(--status-green)';
+                        setTimeout(() => window.location.reload(), 1500);
+                    } else if (data.status === 'waiting_for_button') {
+                        msg.innerText = '🔘 ' + data.message;
+                        msg.style.color = '#f59e0b';
+                        btn.disabled = false;
+                    } else {
+                        msg.innerText = '⚠️ ' + (data.message || data.error || 'Fehler');
+                        msg.style.color = 'var(--status-red)';
+                        btn.disabled = false;
+                    }
+                } catch(e) {
+                    msg.innerText = 'Netzwerkfehler: ' + e;
+                    msg.style.color = 'var(--status-red)';
+                    btn.disabled = false;
+                }
+            }
+            </script>
+        </div>
+        "#
+    } else {
+        ""
+    };
+
     let content = format!(
-        r#"<div class="card"><h2>Integration Modules ({})</h2><div style="overflow-x:auto"><table><thead><tr><th>Module</th><th>Status</th><th>Version</th><th>Health / Details</th></tr></thead><tbody>{}</tbody></table></div></div>"#,
+        r#"<div class="card"><h2>Integration Modules ({})</h2><div style="overflow-x:auto"><table><thead><tr><th>Module</th><th>Status</th><th>Version</th><th>Health / Details</th></tr></thead><tbody>{}</tbody></table></div></div>{}"#,
         snapshot.modules.len(),
-        rows
+        rows,
+        hue_card
     );
 
     page_layout(title, "status", &content)

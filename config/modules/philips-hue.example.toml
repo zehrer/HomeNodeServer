@@ -1,0 +1,6 @@
+# Philips Hue Integration Module Configuration
+health_message = "Philips Hue Bridge Ready"
+scan_interval_secs = 10
+bridge_ip = "192.168.178.12"
+api_port = 80
+username = ""

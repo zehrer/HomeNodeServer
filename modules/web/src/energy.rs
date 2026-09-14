@@ -123,6 +123,58 @@ pub async fn http_get_json(host_or_ip: &str, port: u16, path: &str, timeout_ms: 
     }
 }
 
+/// Generic lightweight HTTP/1.1 POST helper over async TcpStream
+pub async fn http_post_json(host_or_ip: &str, port: u16, path: &str, post_body: &str, timeout_ms: u64) -> Result<String, String> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{}:{}", host_or_ip, port))
+        .await
+        .map_err(|e| format!("DNS lookup failed for {host_or_ip}: {e}"))?
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(format!("No address found for {host_or_ip}"));
+    }
+
+    let addr = addrs[0];
+    let mut stream = tokio::time::timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr))
+        .await
+        .map_err(|_| format!("Connection timeout to {host_or_ip}:{port}"))?
+        .map_err(|e| format!("Connect error to {host_or_ip}:{port}: {e}"))?;
+
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_or_ip}\r\nUser-Agent: HomeNodeWeb/1.0\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{post_body}",
+        post_body.len()
+    );
+
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| format!("Failed to write request to {host_or_ip}: {e}"))?;
+
+    let mut response_bytes = Vec::with_capacity(16384);
+    let mut buf = [0u8; 4096];
+
+    loop {
+        let read_result = tokio::time::timeout(Duration::from_millis(timeout_ms), stream.read(&mut buf)).await;
+        match read_result {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => response_bytes.extend_from_slice(&buf[..n]),
+            Ok(Err(e)) => return Err(format!("Read error from {host_or_ip}: {e}")),
+            Err(_) => return Err(format!("Read timeout from {host_or_ip}")),
+        }
+    }
+
+    let text = String::from_utf8_lossy(&response_bytes).to_string();
+    if let Some(pos) = text.find("\r\n\r\n") {
+        let body = &text[pos + 4..];
+        Ok(body.to_string())
+    } else if let Some(pos) = text.find("\n\n") {
+        let body = &text[pos + 2..];
+        Ok(body.to_string())
+    } else {
+        Ok(text)
+    }
+}
+
 /// Fetch real-time solar generation from Fronius Inverter
 pub async fn fetch_fronius_live(host: &str) -> FroniusSolarData {
     let path = "/solar_api/v1/GetPowerFlowRealtimeData.fcgi";
