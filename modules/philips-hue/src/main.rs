@@ -266,18 +266,27 @@ async fn fetch_and_sync_devices(state: &AppState) -> Result<()> {
         });
 
         let mut meta = HashMap::new();
-        meta.insert("ip".to_string(), ip.clone());
+        // Hue lights communicate via Zigbee through the bridge, NOT as standalone IP devices
+        if !uniqueid.is_empty() {
+            let zigbee_mac = uniqueid.split('-').next().unwrap_or(&uniqueid).to_string();
+            meta.insert("mac".to_string(), zigbee_mac);
+        }
         meta.insert("bridge_ip".to_string(), ip.clone());
+        meta.insert("gateway".to_string(), ip.clone());
+        meta.insert("protocol".to_string(), "zigbee".to_string());
         meta.insert("light_id".to_string(), id_str.clone());
+        meta.insert("hue_light_id".to_string(), id_str.clone());
         meta.insert("uniqueid".to_string(), uniqueid.clone());
         meta.insert("model".to_string(), modelid.clone());
         meta.insert("vendor".to_string(), "Philips Hue (Signify)".to_string());
         meta.insert("source".to_string(), "philips-hue".to_string());
         meta.insert("sources".to_string(), "philips-hue".to_string());
         meta.insert("status".to_string(), if reachable { "active".to_string() } else { "inactive".to_string() });
+        meta.insert("is_active".to_string(), if reachable { "true".to_string() } else { "false".to_string() });
         meta.insert("category".to_string(), "lighting".to_string());
         meta.insert("category_title".to_string(), "Lighting & Lamps".to_string());
         meta.insert("category_icon".to_string(), "💡".to_string());
+        meta.insert("on".to_string(), on.to_string());
         meta.insert("power_state".to_string(), if on { "on".to_string() } else { "off".to_string() });
         meta.insert("brightness".to_string(), bri.to_string());
         if let Some(cm) = &colormode {
@@ -322,13 +331,21 @@ async fn fetch_and_sync_devices(state: &AppState) -> Result<()> {
                         let battery = config_obj.and_then(|c| c.get("battery")).and_then(|v| v.as_u64());
 
                         let mut meta = HashMap::new();
-                        meta.insert("ip".to_string(), ip.clone());
+                        // Hue sensors communicate via Zigbee through the bridge
+                        if !uniqueid.is_empty() {
+                            let zigbee_mac = uniqueid.split('-').next().unwrap_or(&uniqueid).to_string();
+                            meta.insert("mac".to_string(), zigbee_mac);
+                        }
+                        meta.insert("bridge_ip".to_string(), ip.clone());
+                        meta.insert("gateway".to_string(), ip.clone());
+                        meta.insert("protocol".to_string(), "zigbee".to_string());
                         meta.insert("sensor_id".to_string(), id_str.clone());
                         meta.insert("uniqueid".to_string(), uniqueid.clone());
                         meta.insert("vendor".to_string(), "Philips Hue (Signify)".to_string());
                         meta.insert("source".to_string(), "philips-hue".to_string());
                         meta.insert("sources".to_string(), "philips-hue".to_string());
                         meta.insert("status".to_string(), "active".to_string());
+                        meta.insert("is_active".to_string(), "true".to_string());
                         if let Some(bat) = battery {
                             meta.insert("battery".to_string(), bat.to_string());
                         }
@@ -376,12 +393,16 @@ async fn fetch_and_sync_devices(state: &AppState) -> Result<()> {
 
     if !device_records.is_empty() {
         let mut client_guard = state.client.lock().await;
-        let _ = client_guard
+        match client_guard
             .upsert_devices(UpsertDevicesRequest {
                 module_id: state.module_id.clone(),
                 devices: device_records,
             })
-            .await;
+            .await
+        {
+            Ok(_) => info!("Successfully synced {} Hue devices to supervisor", total_count),
+            Err(e) => error!("Failed to upsert Hue devices to supervisor: {}", e),
+        }
     }
 
     let status_msg = format!("Verbunden mit Hue Bridge ({}: {}) - {} Lampen, {} Geräte aktiv", ip, username, light_count, total_count);

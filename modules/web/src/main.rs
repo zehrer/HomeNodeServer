@@ -2647,8 +2647,16 @@ fn render_devices_page(
                     ));
                 }
 
+                let is_zigbee = device.metadata.get("protocol").map(|s| s.as_str()) == Some("zigbee")
+                    || device.module_id == "philips-hue"
+                    || device.metadata.get("source").map(|s| s.as_str()) == Some("philips-hue");
                 let ip_display = if ip.is_empty() || ip == "Layer 2" || ip == "-" {
-                    "Layer 2 (Unmanaged)".to_string()
+                    if is_zigbee {
+                        let gw = device.metadata.get("bridge_ip").or_else(|| device.metadata.get("gateway")).map(|s| s.as_str()).unwrap_or("Hue Bridge");
+                        format!("Zigbee (via {gw})")
+                    } else {
+                        "Layer 2 (Unmanaged)".to_string()
+                    }
                 } else {
                     ip.clone()
                 };
@@ -2732,6 +2740,7 @@ fn render_devices_page(
                         "bthome" | "bthome-v2" => ("BTHome", "#3b82f6"),
                         "shelly-gateway" => ("Shelly BLE", "#0284c7"),
                         "philips-hue" | "hue" => ("Hue", "#eab308"),
+                        "zigbee" => ("Zigbee", "#eab308"),
                         "ble" => ("BLE", "#6366f1"),
                         _ => (s, "#64748b"),
                     };
@@ -2743,20 +2752,39 @@ fn render_devices_page(
                 let doc_icon = if has_docs { r#" <span style="color:var(--status-green); font-size:11px;" title="Documentation / Name saved">📝✓</span>"# } else { "" };
 
                 let has_valid_ip = !ip.is_empty() && ip != "Layer 2" && ip != "-" && ip.parse::<std::net::Ipv4Addr>().is_ok();
+                let light_toggle_btn = if dev_sources_str.contains("philips-hue") && device.kind == "lighting" {
+                    let light_id = device.metadata.get("light_id").cloned().unwrap_or_else(|| device.device_id.replace("hue-light-", ""));
+                    let is_on = device.metadata.get("power_state").map(|s| s == "on").unwrap_or(false);
+                    let btn_label = if is_on { "💡 An" } else { "🔌 Aus" };
+                    let btn_bg = if is_on { "rgba(234,179,8,0.2)" } else { "var(--surface)" };
+                    let btn_border = if is_on { "#eab308" } else { "var(--border)" };
+                    format!(
+                        r#"<button type="button" class="btn-sm" style="background:{btn_bg}; border:1px solid {btn_border}; font-weight:600; font-size:11px; padding:2px 8px; border-radius:4px; cursor:pointer;" onclick="event.stopPropagation(); toggleHueLight('{light_id}')" title="Licht umschalten">{btn_label}</button>"#
+                    )
+                } else {
+                    String::new()
+                };
+
                 let action_buttons = if !is_active {
                     let ping_btn = if has_valid_ip {
                         format!(
                             r#"<button type="button" class="btn-sm btn-ping" data-ping-id="{}" onclick="event.stopPropagation(); pingDevice('{}', this)" title="Ping device to check reachability">📡 Ping</button>"#,
                             device.device_id, device.device_id
                         )
+                    } else if is_zigbee {
+                        r#"<span class="badge" style="background:#fef3c7; color:#92400e; font-size:10px; padding:2px 6px; border:1px solid #fde68a;" title="Zigbee Gerät nicht erreichbar">Offline</span>"#.to_string()
                     } else {
                         r#"<span class="badge" style="background:#f1f5f9; color:#94a3b8; font-size:11px; padding:3px 6px; border:1px solid #e2e8f0;" title="Reines Layer-2-Gerät ohne IP-Adresse">L2 Switch</span>"#.to_string()
                     };
-                    if !web_button.is_empty() {
+                    if !light_toggle_btn.is_empty() {
+                        format!(r#"<div style="display:inline-flex; gap:6px; justify-content:flex-end; align-items:center;">{light_toggle_btn}{ping_btn}</div>"#)
+                    } else if !web_button.is_empty() {
                         format!(r#"<div style="display:inline-flex; gap:6px; justify-content:flex-end; align-items:center;">{ping_btn}{web_button}</div>"#)
                     } else {
                         ping_btn
                     }
+                } else if !light_toggle_btn.is_empty() {
+                    light_toggle_btn
                 } else {
                     web_button
                 };
