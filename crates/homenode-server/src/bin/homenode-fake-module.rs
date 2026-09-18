@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -33,9 +32,10 @@ async fn main() -> Result<()> {
                 "fake-device-01",
                 "Fake Device",
                 "test-device",
-                ["test"],
-                HashMap::<String, String>::new(),
+                ["health"],
+                [("role".to_string(), "stub".to_string())],
             )],
+            replace_all: false,
         })
         .await?;
     client

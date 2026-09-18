@@ -109,7 +109,12 @@ fn normalize_paths(config: &mut HomeNodeConfig, base_dir: &Path) {
         config.server.socket_path = base_dir.join(&config.server.socket_path);
     }
 
-    for module in config.modules.values_mut() {
+    for (alias, module) in config.modules.iter_mut() {
+        let mod_id = module.module_id.as_deref().unwrap_or(alias.as_str()).replace('_', "-");
+        if module.program.is_none() {
+            module.program = Some(format!("homenode-module-{mod_id}"));
+        }
+
         if let Some(path) = &module.config {
             if path.is_relative() {
                 let candidate = base_dir.join(path);
@@ -118,8 +123,27 @@ fn normalize_paths(config: &mut HomeNodeConfig, base_dir: &Path) {
                 } else if path.exists() {
                     module.config = Some(path.clone());
                 } else {
+                    let path_str = path.to_string_lossy();
+                    if !path_str.ends_with(".example.toml") {
+                        let example_name = path_str.replace(".toml", ".example.toml");
+                        let example_candidate = base_dir.join(&example_name);
+                        if example_candidate.exists() {
+                            module.config = Some(example_candidate);
+                            continue;
+                        }
+                    }
                     module.config = Some(candidate);
                 }
+            }
+        } else {
+            let candidate_toml = base_dir.join(format!("modules/{mod_id}.toml"));
+            let candidate_example = base_dir.join(format!("modules/{mod_id}.example.toml"));
+            if candidate_toml.exists() {
+                module.config = Some(candidate_toml);
+            } else if candidate_example.exists() {
+                module.config = Some(candidate_example);
+            } else {
+                module.config = Some(candidate_toml);
             }
         }
     }

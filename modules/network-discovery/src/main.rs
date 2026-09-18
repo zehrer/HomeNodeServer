@@ -83,6 +83,7 @@ async fn main() -> Result<()> {
             .upsert_devices(UpsertDevicesRequest {
                 module_id: env.module_id.clone(),
                 devices: initial_demo,
+                replace_all: false,
             })
             .await;
     }
@@ -190,6 +191,7 @@ async fn main() -> Result<()> {
         .upsert_devices(UpsertDevicesRequest {
             module_id: env.module_id.clone(),
             devices,
+            replace_all: true,
         })
         .await?;
 
@@ -308,6 +310,7 @@ async fn main() -> Result<()> {
                         .upsert_devices(UpsertDevicesRequest {
                             module_id: module_id.clone(),
                             devices: updated,
+                            replace_all: true,
                         })
                         .await
                     {

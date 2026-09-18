@@ -77,8 +77,10 @@ impl RuntimeState {
             return Err(Status::not_found("module is not registered"));
         }
 
-        self.devices
-            .retain(|(module_id, _), _| module_id != &request.module_id);
+        if request.replace_all {
+            self.devices
+                .retain(|(module_id, _), _| module_id != &request.module_id);
+        }
 
         for device in request.devices {
             if device.module_id != request.module_id {

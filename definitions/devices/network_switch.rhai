@@ -14,8 +14,16 @@ fn identify(obs) {
     let host = obs.hostname.to_lower();
     let mac = obs.mac.to_lower();
 
-    // Do not match SwitchBot or Nintendo Switch
-    if name.contains("switchbot") || host.contains("switchbot") || name.contains("nintendo") || host.contains("nintendo") {
+    let vendor = obs.vendor.to_lower();
+    let iface = obs.interface.to_lower();
+
+    // Do not match SwitchBot, Nintendo Switch, Philips Hue, Zigbee/BLE devices, smart home wall switches or dimmers
+    if name.contains("switchbot") || host.contains("switchbot")
+        || name.contains("nintendo") || host.contains("nintendo")
+        || name.contains("hue") || host.contains("hue")
+        || vendor.contains("philips") || vendor.contains("signify")
+        || name.contains("wall switch") || name.contains("dimmer") || name.contains("wandschalter") || name.contains("taster") || name.contains("schalter")
+        || iface == "zigbee" || iface == "ble" || iface == "bthome" {
         return false;
     }
 

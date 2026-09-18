@@ -35,8 +35,9 @@ shelly_gateways = [
 # Automatically tell Shellys on the network to connect their Outbound WebSocket to HomeNode
 auto_connect_shelly_ws = true
 
-# Host IP of this HomeNode Server reachable by Shellys on your LAN
-homenode_host = "192.168.178.46"
+# Host IP of this HomeNode Server reachable by Shellys on your LAN.
+# Leave commented out or set to "auto" to automatically detect your local network IP (e.g. 192.168.178.160).
+# homenode_host = "auto"
 
 # Pre-configured BTHome / Shelly BLU device names & optional bind_keys (for encrypted payloads)
 # Unconfigured devices will be automatically discovered and assigned friendly default names.

@@ -44,6 +44,7 @@ message ModuleRegistration {
 message UpsertDevicesRequest {
   string module_id = 1;
   repeated DeviceRecord devices = 2;
+  bool replace_all = 3;
 }
 
 message ModuleRuntime {

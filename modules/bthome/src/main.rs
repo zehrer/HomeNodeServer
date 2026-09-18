@@ -3,11 +3,12 @@ mod parser;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use homenode_definitions::IgnoredDevicesStore;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
@@ -182,6 +183,7 @@ struct AppState {
     device_telemetry: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
     recent_events: Arc<Mutex<VecDeque<BthomeLiveEvent>>>,
     verified_gateways: Arc<Mutex<HashMap<String, VerifiedShellyGateway>>>,
+    ignored_devices: IgnoredDevicesStore,
 }
 
 fn decode_hex_payload(s: &str) -> Option<Vec<u8>> {
@@ -388,12 +390,14 @@ fn extract_ingest_items_with_fallback(val: &Value, fallback_gw: Option<&str>) ->
     if let Some(raw_str) = obj
         .get("data")
         .or_else(|| obj.get("payload"))
+        .or_else(|| obj.get("payload_bytes"))
         .and_then(|v| v.as_str())
     {
         payload_bytes = decode_raw_payload(raw_str);
     } else if let Some(arr) = obj
         .get("data")
         .or_else(|| obj.get("payload"))
+        .or_else(|| obj.get("payload_bytes"))
         .and_then(|v| v.as_array())
     {
         let bytes: Option<Vec<u8>> = arr.iter().map(|n| n.as_u64().map(|b| b as u8)).collect();
@@ -453,6 +457,11 @@ async fn process_ingest_items(state: &AppState, items: Vec<IngestItem>) -> (usiz
             &mac_clean
         };
         let dev_id = format!("bthome-{}", mac_clean);
+
+        if state.ignored_devices.is_ignored(&norm_mac) || state.ignored_devices.is_ignored(&dev_id) {
+            debug!("Ignoring packet from blocklisted device: {} ({})", item.mac, dev_id);
+            continue;
+        }
 
         // Handle synthetic button event (e.g. from native Shelly RPC bthomedevice.single_push)
         if let Some(btn) = item.synthetic_button {
@@ -580,6 +589,7 @@ async fn process_ingest_items(state: &AppState, items: Vec<IngestItem>) -> (usiz
                 .upsert_devices(UpsertDevicesRequest {
                     module_id: state.module_id.clone(),
                     devices: vec![dev],
+                    replace_all: false,
                 })
                 .await;
             continue;
@@ -810,6 +820,7 @@ async fn process_ingest_items(state: &AppState, items: Vec<IngestItem>) -> (usiz
             .upsert_devices(UpsertDevicesRequest {
                 module_id: state.module_id.clone(),
                 devices: vec![dev],
+                replace_all: false,
             })
             .await
         {
@@ -1233,6 +1244,7 @@ async fn main() -> Result<()> {
             .upsert_devices(UpsertDevicesRequest {
                 module_id: env.module_id.clone(),
                 devices: initial_devices,
+                replace_all: false,
             })
             .await?;
     }
@@ -1253,6 +1265,15 @@ async fn main() -> Result<()> {
             .await?;
     }
 
+    let workspace_root = env
+        .server_config_path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let ignored_path = workspace_root.join("data").join("ignored_devices.json");
+    let ignored_devices = IgnoredDevicesStore::load_or_create(&ignored_path);
+
     let app_state = AppState {
         dedup: Arc::new(BTHomeDedup::new(Duration::from_millis(
             config.dedup_window_ms,
@@ -1269,6 +1290,7 @@ async fn main() -> Result<()> {
         device_telemetry: Arc::new(Mutex::new(HashMap::new())),
         recent_events: Arc::new(Mutex::new(VecDeque::new())),
         verified_gateways: Arc::new(Mutex::new(HashMap::new())),
+        ignored_devices,
     };
 
     // Build Axum HTTP & WebSocket Router
@@ -1305,10 +1327,19 @@ async fn main() -> Result<()> {
         config.listen_port
     );
 
-    // Auto-detect local host IP for Shelly Outbound WebSocket target if not provided
-    let host_ip = config.homenode_host.unwrap_or_else(|| {
-        "192.168.178.46".to_string()
-    });
+    // Auto-detect local host IP for Shelly Outbound WebSocket target if not provided or set to "auto"
+    let host_ip = config
+        .homenode_host
+        .filter(|h| !h.trim().is_empty() && h != "auto")
+        .or_else(|| env.local_ip.clone())
+        .or_else(|| std::env::var("HOMENODE_LOCAL_IP").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| homenode_sdk::detect_local_network_ip())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    info!(
+        "Configured target HomeNode host IP for Shelly Gateway WebSocket registrations: {}",
+        host_ip
+    );
 
     let gateways = config.shelly_gateways.clone();
     let state_clone = app_state.clone();

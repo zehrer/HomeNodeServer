@@ -1,4 +1,6 @@
 mod energy;
+mod govee;
+mod rooms;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -9,13 +11,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::extract::{Path as AxumPath, State};
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
+use homenode_definitions::{deduce_floor_from_name, slugify_room_id, RoomRecord};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use homenode_sdk::proto::{DeviceRecord, Empty, HealthState, ModuleRegistration, RuntimeSnapshot};
@@ -89,6 +92,16 @@ struct WebState {
     categories_store: Arc<RwLock<HashMap<String, String>>>,
     matter_fabrics_store: Arc<RwLock<HashMap<String, MatterFabricMeta>>>,
     catalog_store: Arc<RwLock<homenode_definitions::CatalogDatabase>>,
+    ignored_store: homenode_definitions::IgnoredDevicesStore,
+    rooms_path: PathBuf,
+    rooms_store: homenode_definitions::RoomsStore,
+    #[allow(dead_code)]
+    light_groups_path: PathBuf,
+    light_groups_store: homenode_definitions::LightGroupsStore,
+    mobile_ble_path: PathBuf,
+    mobile_ble_store: Arc<RwLock<HashMap<String, MobileBleScanItem>>>,
+    govee_manager: govee::GoveeManager,
+    started_at: std::time::Instant,
 }
 
 #[tokio::main]
@@ -130,8 +143,67 @@ async fn main() -> Result<()> {
     let definitions_dir = workspace_root.join("definitions").join("devices");
     let catalog_path = workspace_root.join("definitions").join("catalog.json");
     let catalog_overrides_path = data_dir.join("catalog_overrides.json");
+    let ignored_path = data_dir.join("ignored_devices.json");
+    let ignored_store = homenode_definitions::IgnoredDevicesStore::load_or_create(&ignored_path);
+    let rooms_path = data_dir.join("rooms.json");
+    let rooms_store = homenode_definitions::RoomsStore::load_or_create(&rooms_path);
+    let light_groups_path = data_dir.join("light_groups.json");
+    let light_groups_store = homenode_definitions::LightGroupsStore::new(&light_groups_path);
+    if light_groups_store.list().is_empty() {
+        let default_group = homenode_definitions::LightGroup::new(
+            "group-wohnzimmer-vorhaenge",
+            "Wohnzimmer Vorhänge",
+            "Wohnzimmer",
+            vec!["net-192-168-178-42".to_string(), "net-192-168-178-43".to_string()],
+            Some("✨".to_string()),
+        );
+        let _ = light_groups_store.upsert(default_group);
+    }
+    let started_at = std::time::Instant::now();
 
-    let initial_docs = load_json_map(&docs_path);
+    let mobile_ble_path = data_dir.join("mobile_ble_devices.json");
+    let initial_mobile_ble: HashMap<String, MobileBleScanItem> = load_json_map(&mobile_ble_path);
+    let mobile_ble_store = Arc::new(RwLock::new(initial_mobile_ble.clone()));
+
+    let mut initial_docs: HashMap<String, DeviceDocumentation> = load_json_map(&docs_path);
+    let govee_defaults = [
+        ("d0:c9:07:3c:1b:5c", "192.168.178.40", "Govee LED Sophie", "Sophie Zimmer"),
+        ("d0:c9:07:a4:c0:dc", "192.168.178.41", "Govee LED Dachgeschoss", "Dachgeschoss"),
+        ("d0:c9:07:39:f4:4c", "192.168.178.42", "Govee LED EG Links", "Wohnzimmer"),
+        ("d0:c9:07:3c:3a:d4", "192.168.178.43", "Govee LED EG Rechts", "Wohnzimmer"),
+    ];
+    let mut modified_docs = false;
+    for (mac, ip, default_name, default_room) in govee_defaults {
+        let doc_key = mac.to_lowercase();
+        let ip_key = format!("net-{}", ip.replace('.', "-"));
+        if !initial_docs.contains_key(&doc_key) && !initial_docs.contains_key(&ip_key) {
+            initial_docs.insert(
+                doc_key,
+                DeviceDocumentation {
+                    name: Some(default_name.to_string()),
+                    room: Some(default_room.to_string()),
+                    notes: "Govee RGBIC Smart Light (UDP LAN Steuerung)".to_string(),
+                    manual_url: Some("https://www.govee.com".to_string()),
+                    product_id: Some("govee_rgbic_light".to_string()),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                },
+            );
+            modified_docs = true;
+        }
+    }
+    if modified_docs {
+        let _ = persist_json(&docs_path, &initial_docs);
+    }
+
+    let govee_manager = govee::GoveeManager::new().await?;
+    let govee_candidates = vec![
+        "192.168.178.40".to_string(),
+        "192.168.178.41".to_string(),
+        "192.168.178.42".to_string(),
+        "192.168.178.43".to_string(),
+    ];
+    govee_manager.scan(&govee_candidates).await;
+
     let initial_links = load_json_map(&links_path);
     let initial_categories = load_json_map(&categories_path);
     let mut initial_fabrics: HashMap<String, MatterFabricMeta> = load_json_map(&matter_fabrics_path);
@@ -191,11 +263,31 @@ async fn main() -> Result<()> {
     let catalog_store = Arc::new(RwLock::new(initial_catalog));
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
+    let local_ip = env.local_ip.clone().unwrap_or_else(|| {
+        homenode_sdk::detect_local_network_ip().unwrap_or_else(|| "127.0.0.1".to_string())
+    });
+    let port_str = config.listen_addr.split(':').nth(1).unwrap_or("8080");
+    info!(
+        "HomeNode Web Server bound on http://{} (Local LAN URL: http://{}:{})",
+        config.listen_addr, local_ip, port_str
+    );
+    let startup_mobile_records: Vec<_> = initial_mobile_ble.values()
+        .filter_map(mobile_ble_item_to_record)
+        .collect();
+    if !startup_mobile_records.is_empty() {
+        info!("Restoring {} persisted mobile BLE devices to supervisor", startup_mobile_records.len());
+        let _ = client.upsert_devices(homenode_sdk::proto::UpsertDevicesRequest {
+            module_id: env.module_id.clone(),
+            devices: startup_mobile_records,
+            replace_all: false,
+        }).await;
+    }
+
     client
         .report_health(module_health(
             env.module_id,
             HealthState::Ready,
-            format!("Serving status page on {}", config.listen_addr),
+            format!("Serving status page on {} (http://{}:{})", config.listen_addr, local_ip, port_str),
         ))
         .await?;
 
@@ -230,6 +322,32 @@ async fn main() -> Result<()> {
         .route("/api/hue/status", get(hue_status_api_handler))
         .route("/api/hue/pair", post(hue_pair_api_handler))
         .route("/api/hue/lights/:id/toggle", post(hue_toggle_api_handler))
+        .route("/api/v1/health", get(v1_health_api_handler))
+        .route("/api/v1/info", get(v1_info_api_handler))
+        .route("/api/v1/mobile/ble", post(v1_mobile_ble_ingest_handler))
+        .route("/api/v1/devices/claim", post(v1_claim_device_handler))
+        .route("/api/ignored-devices", get(get_ignored_devices_handler))
+        .route("/api/devices/:id/ignore", post(ignore_device_handler))
+        .route("/api/devices/:id/unignore", post(unignore_device_handler))
+        .route("/api/rooms", get(get_rooms_handler).post(save_room_handler))
+        .route("/api/rooms/:id", delete(delete_room_handler))
+        .route("/api/floors", get(get_floors_handler))
+        .route("/api/rooms/import-hue", post(import_hue_rooms_handler))
+        .route("/rooms", get(rooms_page_handler))
+        .route("/api/light-groups", get(list_light_groups_handler).post(create_light_group_handler))
+        .route("/api/light-groups/:id", delete(delete_light_group_handler))
+        .route("/api/light-groups/:id/power", post(light_group_power_handler))
+        .route("/api/light-groups/:id/brightness", post(light_group_brightness_handler))
+        .route("/api/light-groups/:id/color", post(light_group_color_handler))
+        .route("/api/light-groups/:id/temperature", post(light_group_temperature_handler))
+        .route("/api/rooms/:name/scene", post(room_scene_handler))
+        .route("/api/govee/lights", get(get_govee_lights_handler))
+        .route("/api/govee/lights/:ip/toggle", post(toggle_govee_light_handler))
+        .route("/api/govee/lights/:ip/power", post(set_govee_power_handler))
+        .route("/api/govee/lights/:ip/brightness", post(set_govee_brightness_handler))
+        .route("/api/govee/lights/:ip/color", post(set_govee_color_handler))
+        .route("/api/govee/lights/:ip/temperature", post(set_govee_temperature_handler))
+        .route("/api/govee/lights/:ip/status", get(get_govee_status_handler))
         .with_state(WebState {
             socket_path: env.socket_path,
             status_title: config.status_title,
@@ -245,7 +363,29 @@ async fn main() -> Result<()> {
             categories_store,
             matter_fabrics_store,
             catalog_store,
+            ignored_store,
+            rooms_path,
+            rooms_store,
+            light_groups_path,
+            light_groups_store,
+            mobile_ble_path,
+            mobile_ble_store,
+            govee_manager,
+            started_at,
         });
+
+    #[cfg(target_os = "macos")]
+    {
+        let port_str = config.listen_addr.split(':').nth(1).unwrap_or("8080").to_string();
+        tokio::spawn(async move {
+            info!("Broadcasting HomeNode Server via mDNS/Bonjour on port {}...", port_str);
+            let mut cmd = tokio::process::Command::new("dns-sd");
+            cmd.args(["-R", "HomeNode Server", "_homenode._tcp", "local", &port_str]);
+            if let Ok(mut child) = cmd.spawn() {
+                let _ = child.wait().await;
+            }
+        });
+    }
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -352,22 +492,40 @@ async fn dashboard_handler(State(state): State<WebState>) -> Html<String> {
 
 async fn devices_handler(State(state): State<WebState>) -> Html<String> {
     let docs = state.docs_store.read().await.clone();
-    let links = state.links_store.read().await.clone();
+    let mut links = state.links_store.read().await.clone();
     let catalog = state.catalog_store.read().await.clone();
     let categories = state.categories_store.read().await.clone();
     let matter_fabrics = state.matter_fabrics_store.read().await.clone();
     let verified_gws = fetch_verified_shelly_gateways().await;
+    let rooms = state.rooms_store.list();
+    let govee_states: HashMap<String, govee::GoveeDeviceState> = state
+        .govee_manager
+        .list_devices()
+        .await
+        .into_iter()
+        .map(|d| (d.ip.clone(), d))
+        .collect();
     let body = match load_snapshot(&state.socket_path).await {
-        Ok(snapshot) => render_devices_page(
-            &state.status_title,
-            &snapshot,
-            &docs,
-            &links,
-            &catalog,
-            &categories,
-            &matter_fabrics,
-            &verified_gws,
-        ),
+        Ok(snapshot) => {
+            if auto_link_deterministic_devices(&snapshot.devices, &mut links) {
+                let mut store = state.links_store.write().await;
+                *store = links.clone();
+                let _ = persist_json(&state.links_path, &*store);
+            }
+            render_devices_page(
+                &state.status_title,
+                &snapshot,
+                &docs,
+                &links,
+                &catalog,
+                &categories,
+                &matter_fabrics,
+                &verified_gws,
+                &state.ignored_store,
+                &rooms,
+                &govee_states,
+            )
+        }
         Err(error) => render_error(&state.status_title, "devices", &error.to_string()),
     };
     Html(body)
@@ -618,12 +776,18 @@ async fn save_device_doc_handler(
         let entry = DeviceDocumentation {
             name: clean_name.clone(),
             notes: clean_notes,
-            room: clean_room,
+            room: clean_room.clone(),
             manual_url: clean_url,
             product_id: existing_prod,
             updated_at: now,
         };
         store.insert(device_id.clone(), entry);
+    }
+    if let Some(ref r_name) = clean_room {
+        if state.rooms_store.find_by_name(r_name).is_none() {
+            let rec = RoomRecord::new(slugify_room_id(r_name), r_name, None, None, None);
+            let _ = state.rooms_store.upsert(rec);
+        }
     }
     if let Err(err) = persist_json(&state.docs_path, &*store) {
         error!("Failed to persist device documentation: {err}");
@@ -682,10 +846,20 @@ async fn link_devices_handler(
     State(state): State<WebState>,
     Json(payload): Json<LinkRequest>,
 ) -> Response {
+    // If primary is BLE and linked is network (or primary is secondary WLAN),
+    // normalize so the primary device is the main network interface.
+    let (primary_id, linked_id) = if (payload.primary_id.starts_with("mobile-ble-") || payload.primary_id.starts_with("bthome-"))
+        && (!payload.linked_id.starts_with("mobile-ble-") && !payload.linked_id.starts_with("bthome-"))
+    {
+        (payload.linked_id, payload.primary_id)
+    } else {
+        (payload.primary_id, payload.linked_id)
+    };
+
     let mut links = state.links_store.write().await;
-    let list = links.entry(payload.primary_id.clone()).or_default();
-    if !list.contains(&payload.linked_id) {
-        list.push(payload.linked_id);
+    let list = links.entry(primary_id).or_default();
+    if !list.contains(&linked_id) {
+        list.push(linked_id);
     }
     if let Err(err) = persist_json(&state.links_path, &*links) {
         error!("Failed to persist device links: {err}");
@@ -705,6 +879,9 @@ async fn unlink_devices_handler(
     let mut links = state.links_store.write().await;
     if let Some(list) = links.get_mut(&payload.primary_id) {
         list.retain(|id| id != &payload.linked_id);
+    }
+    if let Some(list) = links.get_mut(&payload.linked_id) {
+        list.retain(|id| id != &payload.primary_id);
     }
     if let Err(err) = persist_json(&state.links_path, &*links) {
         error!("Failed to persist device links: {err}");
@@ -759,6 +936,22 @@ async fn forget_device_handler(
                 .into_response();
         }
     };
+    if id.starts_with("mobile-ble-") {
+        let norm_target = id.trim_start_matches("mobile-ble-");
+        let mut store = state.mobile_ble_store.write().await;
+        store.retain(|k, _| {
+            homenode_definitions::normalize_identifier(k) != norm_target
+        });
+        let _ = persist_json(&state.mobile_ble_path, &*store);
+        let remaining: Vec<_> = store.values().filter_map(mobile_ble_item_to_record).collect();
+        let _ = client.upsert_devices(homenode_sdk::proto::UpsertDevicesRequest {
+            module_id: "web".to_string(),
+            devices: remaining,
+            replace_all: true,
+        }).await;
+        return Json(serde_json::json!({"status": "forgotten"})).into_response();
+    }
+
     let mut params = std::collections::HashMap::new();
     params.insert("device_id".to_string(), id);
     match client
@@ -840,6 +1033,1121 @@ async fn hue_toggle_api_handler(
         )
             .into_response(),
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Mobile & Ignore API Handlers (mHomeNode Client & Neighbor Device Blocklist)
+// ------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HealthResponse {
+    version: String,
+    uptime_seconds: u64,
+    active_matter_nodes: usize,
+    active_ble_gateways: usize,
+    active_devices: usize,
+}
+
+async fn v1_health_api_handler(State(state): State<WebState>) -> Response {
+    let uptime_seconds = state.started_at.elapsed().as_secs();
+    let mut active_devices = 0;
+    let mut active_matter_nodes = 0;
+
+    if let Ok(snapshot) = load_snapshot(&state.socket_path).await {
+        for dev in &snapshot.devices {
+            let status = dev.metadata.get("status").map(|s| s.as_str()).unwrap_or("active");
+            if status == "active" {
+                active_devices += 1;
+            }
+            let sources = dev.metadata.get("sources").map(|s| s.as_str()).unwrap_or("");
+            let source = dev.metadata.get("source").map(|s| s.as_str()).unwrap_or("");
+            if sources.contains("matter") || source == "matter" || dev.metadata.contains_key("matter_endpoint") {
+                active_matter_nodes += 1;
+            }
+        }
+    }
+
+    let verified_gws = fetch_verified_shelly_gateways().await;
+    let active_ble_gateways = verified_gws.iter().filter(|g| g.ble_supported).count();
+
+    Json(HealthResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_seconds,
+        active_matter_nodes,
+        active_ble_gateways,
+        active_devices,
+    })
+    .into_response()
+}
+
+async fn v1_info_api_handler(State(state): State<WebState>) -> Response {
+    Json(serde_json::json!({
+        "server": "HomeNode Server",
+        "version": env!("CARGO_PKG_VERSION"),
+        "title": state.status_title,
+        "mdns_service": "_homenode._tcp.local",
+        "uptime_seconds": state.started_at.elapsed().as_secs(),
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MobileBleScanItem {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub rssi: Option<i16>,
+    #[serde(default)]
+    pub service_uuids: Vec<String>,
+    #[serde(default)]
+    pub manufacturer_data_hex: Option<String>,
+    #[serde(default)]
+    pub family: Option<String>,
+    #[serde(default)]
+    pub assigned_room: Option<String>,
+    #[serde(default)]
+    pub scout_name: Option<String>,
+    #[serde(default)]
+    pub bthome_version: Option<u8>,
+    #[serde(default)]
+    pub battery: Option<u8>,
+    #[serde(default)]
+    pub temperature_c: Option<f32>,
+    #[serde(default)]
+    pub humidity_pct: Option<f32>,
+    #[serde(default)]
+    pub illuminance_lux: Option<f32>,
+    #[serde(default)]
+    pub pressure_hpa: Option<f32>,
+    #[serde(default)]
+    pub contact_open: Option<bool>,
+    #[serde(default)]
+    pub motion_detected: Option<bool>,
+    #[serde(default)]
+    pub button_event: Option<String>,
+}
+
+pub fn mobile_ble_item_to_record(item: &MobileBleScanItem) -> Option<homenode_sdk::proto::DeviceRecord> {
+    let norm_id = homenode_definitions::normalize_identifier(&item.id);
+    if norm_id.is_empty() {
+        return None;
+    }
+
+    let scout_label = item.scout_name.clone().unwrap_or_else(|| "iPhone".to_string());
+    let dev_id = format!("mobile-ble-{}", norm_id);
+    let display_name = item.name.clone().unwrap_or_else(|| {
+        let prefix_len = item.id.len().min(8);
+        format!("BLE {}", &item.id[..prefix_len])
+    });
+    let family_str = item.family.clone().unwrap_or_else(|| "Bluetooth LE".to_string());
+
+    let mut meta = HashMap::new();
+    meta.insert("source".to_string(), "mobile-scout".to_string());
+    meta.insert("sources".to_string(), "mobile-scout,ble".to_string());
+    meta.insert("scout".to_string(), scout_label);
+    meta.insert("family".to_string(), family_str);
+    meta.insert("status".to_string(), "active".to_string());
+    meta.insert("protocol".to_string(), "ble".to_string());
+    meta.insert("mac".to_string(), item.id.clone());
+
+    if let Some(r) = item.rssi {
+        meta.insert("rssi".to_string(), r.to_string());
+    }
+    if let Some(ref room) = item.assigned_room {
+        meta.insert("room".to_string(), room.clone());
+    }
+    if let Some(bat) = item.battery {
+        meta.insert("battery".to_string(), bat.to_string());
+    }
+    if let Some(temp) = item.temperature_c {
+        meta.insert("temperature_c".to_string(), format!("{:.2}", temp));
+    }
+    if let Some(hum) = item.humidity_pct {
+        meta.insert("humidity_pct".to_string(), format!("{:.1}", hum));
+    }
+    if let Some(lux) = item.illuminance_lux {
+        meta.insert("illuminance_lux".to_string(), format!("{:.1}", lux));
+    }
+    if let Some(open) = item.contact_open {
+        meta.insert("contact_state".to_string(), if open { "open".to_string() } else { "closed".to_string() });
+    }
+    if let Some(ref btn) = item.button_event {
+        meta.insert("button_event".to_string(), btn.clone());
+    }
+
+    let kind = if item.contact_open.is_some() {
+        "contact-sensor"
+    } else if item.motion_detected.is_some() {
+        "motion-sensor"
+    } else if item.button_event.is_some() {
+        "button"
+    } else {
+        "sensor"
+    };
+
+    Some(homenode_sdk::device_record(
+        "web",
+        dev_id,
+        display_name,
+        kind,
+        ["ble", "mobile-scout"],
+        meta,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum MobileBleScanPayload {
+    Batch(Vec<MobileBleScanItem>),
+    Single(MobileBleScanItem),
+}
+
+async fn v1_mobile_ble_ingest_handler(
+    State(state): State<WebState>,
+    Json(payload): Json<MobileBleScanPayload>,
+) -> Response {
+    let items = match payload {
+        MobileBleScanPayload::Batch(list) => list,
+        MobileBleScanPayload::Single(item) => vec![item],
+    };
+
+    let mut ingested_count = 0;
+    let mut ignored_count = 0;
+    let mut bthome_forward_items = Vec::new();
+    let mut dev_records = Vec::new();
+    let mut valid_items = Vec::new();
+
+    for item in items {
+        let norm_id = homenode_definitions::normalize_identifier(&item.id);
+        if norm_id.is_empty() {
+            continue;
+        }
+        let name_clean = item.name.as_deref().unwrap_or("");
+
+        if state.ignored_store.is_ignored(&item.id)
+            || state.ignored_store.is_ignored(&norm_id)
+            || (!name_clean.is_empty() && state.ignored_store.is_ignored(name_clean))
+        {
+            debug!("Mobile BLE scan item ignored (neighbor blocklist): {} ({})", item.id, name_clean);
+            ignored_count += 1;
+            continue;
+        }
+
+        if let Some(ref mfg_hex) = item.manufacturer_data_hex {
+            let scout = item.scout_name.clone().unwrap_or_else(|| "iPhone (Mobile Scout)".to_string());
+            bthome_forward_items.push(serde_json::json!({
+                "mac": item.id,
+                "rssi": item.rssi.unwrap_or(-70),
+                "gateway": scout,
+                "payload": mfg_hex,
+                "data": mfg_hex,
+                "payload_bytes": mfg_hex,
+            }));
+        }
+
+        if let Some(record) = mobile_ble_item_to_record(&item) {
+            dev_records.push(record);
+            valid_items.push(item);
+            ingested_count += 1;
+        }
+    }
+
+    if !dev_records.is_empty() {
+        {
+            let mut store = state.mobile_ble_store.write().await;
+            for it in valid_items {
+                store.insert(it.id.clone(), it);
+            }
+            let _ = persist_json(&state.mobile_ble_path, &*store);
+        }
+
+        if let Ok(mut client) = connect_control_client(&state.socket_path).await {
+            let _ = client.upsert_devices(homenode_sdk::proto::UpsertDevicesRequest {
+                module_id: "web".to_string(),
+                devices: dev_records,
+                replace_all: false,
+            }).await;
+
+            if let Ok(snapshot) = load_snapshot(&state.socket_path).await {
+                let mut links = state.links_store.read().await.clone();
+                if auto_link_deterministic_devices(&snapshot.devices, &mut links) {
+                    let mut store = state.links_store.write().await;
+                    *store = links.clone();
+                    let _ = persist_json(&state.links_path, &*store);
+                }
+            }
+        }
+    }
+
+    if !bthome_forward_items.is_empty() {
+        tokio::spawn(async move {
+            for f_item in bthome_forward_items {
+                let _ = energy::http_post_json("127.0.0.1", 8124, "/api/bthome", &f_item.to_string(), 1000).await;
+            }
+        });
+    }
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "ingested": ingested_count,
+        "ignored": ignored_count,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClaimDevicePayload {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub family: Option<String>,
+    #[serde(default)]
+    pub assigned_room: Option<String>,
+}
+
+async fn v1_claim_device_handler(
+    State(state): State<WebState>,
+    Json(payload): Json<ClaimDevicePayload>,
+) -> Response {
+    let mut docs = state.docs_store.write().await;
+    let entry = docs.entry(payload.id.clone()).or_default();
+    if let Some(n) = payload.name {
+        if !n.trim().is_empty() {
+            entry.name = Some(n);
+        }
+    }
+    if let Some(r) = payload.assigned_room {
+        if !r.trim().is_empty() {
+            entry.room = Some(r);
+        }
+    }
+    entry.updated_at = chrono::Utc::now().to_rfc3339();
+
+    let _ = persist_json(&state.docs_path, &*docs);
+
+    Json(serde_json::json!({
+        "status": "claimed",
+        "id": payload.id,
+    }))
+    .into_response()
+}
+
+async fn get_ignored_devices_handler(State(state): State<WebState>) -> Response {
+    let list = state.ignored_store.list();
+    Json(list).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IgnoreDeviceRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+async fn ignore_device_handler(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<WebState>,
+    body: Option<Json<IgnoreDeviceRequest>>,
+) -> Response {
+    let (name, reason) = if let Some(Json(b)) = body {
+        (b.name, b.reason)
+    } else {
+        (None, None)
+    };
+
+    let record = homenode_definitions::IgnoredDeviceRecord::new(id.clone(), name, reason);
+    match state.ignored_store.ignore(record) {
+        Ok(_) => {
+            info!("Device {} added to ignored devices blocklist", id);
+            Json(serde_json::json!({"status": "ok", "ignored": true, "id": id})).into_response()
+        }
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn unignore_device_handler(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<WebState>,
+) -> Response {
+    match state.ignored_store.unignore(&id) {
+        Ok(removed) => {
+            info!("Device {} removed from ignored devices blocklist (removed={})", id, removed);
+            Json(serde_json::json!({"status": "ok", "unignored": true, "removed": removed, "id": id})).into_response()
+        }
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Room & Location Management API Handlers (Matter 1.3+ & Apple Home Compatible)
+// ------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct RoomWithCount {
+    #[serde(flatten)]
+    pub room: RoomRecord,
+    pub device_count: usize,
+}
+
+async fn get_rooms_handler(State(state): State<WebState>) -> Response {
+    let rooms = state.rooms_store.list();
+    let docs = state.docs_store.read().await;
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for doc in docs.values() {
+        if let Some(ref r) = doc.room {
+            let key = r.trim().to_lowercase();
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let response: Vec<RoomWithCount> = rooms
+        .into_iter()
+        .map(|r| {
+            let count = *counts.get(&r.name.trim().to_lowercase()).unwrap_or(&0);
+            RoomWithCount {
+                room: r,
+                device_count: count,
+            }
+        })
+        .collect();
+
+    Json(response).into_response()
+}
+
+async fn save_room_handler(
+    State(state): State<WebState>,
+    Json(mut payload): Json<RoomRecord>,
+) -> Response {
+    let old_room = if !payload.id.trim().is_empty() {
+        state.rooms_store.get(&payload.id)
+    } else {
+        None
+    };
+
+    let old_name = old_room.as_ref().map(|r| r.name.clone());
+    let old_hue_group_id = old_room.as_ref().and_then(|r| r.hue_group_id.clone());
+
+    if payload.hue_group_id.is_none() {
+        payload.hue_group_id = old_hue_group_id.clone();
+    }
+
+    match state.rooms_store.upsert(payload) {
+        Ok(saved) => {
+            // 1. If name changed, propagate to docs and light_groups
+            if let Some(old_n) = old_name {
+                if old_n.to_lowercase() != saved.name.to_lowercase() {
+                    info!("Room renamed from '{}' to '{}'. Propagating to device documentation and light groups...", old_n, saved.name);
+                    // Update device documentation
+                    let mut docs_guard = state.docs_store.write().await;
+                    let mut docs_changed = false;
+                    for doc in docs_guard.values_mut() {
+                        if doc.room.as_deref().map(|s| s.to_lowercase()) == Some(old_n.to_lowercase()) {
+                            doc.room = Some(saved.name.clone());
+                            doc.updated_at = chrono::Utc::now().to_rfc3339();
+                            docs_changed = true;
+                        }
+                    }
+                    if docs_changed {
+                        let _ = persist_json(&state.docs_path, &*docs_guard);
+                    }
+
+                    // Update light groups
+                    let groups = state.light_groups_store.list();
+                    for mut g in groups {
+                        if g.room.to_lowercase() == old_n.to_lowercase() {
+                            g.room = saved.name.clone();
+                            let _ = state.light_groups_store.upsert(g);
+                        }
+                    }
+                }
+            }
+
+            // 2. If hue_group_id is present, sync with Hue Bridge
+            if let Some(ref gid) = saved.hue_group_id {
+                let creds_path = state.rooms_path.parent().unwrap_or(Path::new(".")).join("hue_credentials.json");
+                if creds_path.exists() {
+                    if let Ok(creds_data) = std::fs::read_to_string(&creds_path) {
+                        if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&creds_data) {
+                            let bridge_ip = creds.get("bridge_ip").and_then(|v| v.as_str()).unwrap_or("192.168.178.12");
+                            let username = creds.get("username").and_then(|v| v.as_str()).unwrap_or("");
+                            if !username.is_empty() {
+                                let client = reqwest::Client::builder()
+                                    .timeout(Duration::from_secs(4))
+                                    .build()
+                                    .unwrap_or_default();
+                                let hue_class = saved.hue_class.clone().unwrap_or_else(|| {
+                                    match saved.archetype.as_deref() {
+                                        Some("living_room") => "Living room".to_string(),
+                                        Some("kitchen") => "Kitchen".to_string(),
+                                        Some("dining_room") => "Dining".to_string(),
+                                        Some("bedroom") => "Bedroom".to_string(),
+                                        Some("kids_room") => "Kids bedroom".to_string(),
+                                        Some("bathroom") => "Bathroom".to_string(),
+                                        Some("office") => "Home office".to_string(),
+                                        Some("hallway") => "Hallway".to_string(),
+                                        Some("outdoor") => "Garden".to_string(),
+                                        Some("garage") => "Garage".to_string(),
+                                        _ => "Other".to_string(),
+                                    }
+                                });
+                                let hue_payload = serde_json::json!({
+                                    "name": saved.name,
+                                    "class": hue_class
+                                });
+                                let url = format!("http://{}/api/{}/groups/{}", bridge_ip, username, gid);
+                                tokio::spawn(async move {
+                                    match client.put(&url).json(&hue_payload).send().await {
+                                        Ok(resp) => {
+                                            let text = resp.text().await.unwrap_or_default();
+                                            info!("Synced room update to Hue Bridge {}: {}", url, text);
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to sync room update to Hue Bridge: {}", e);
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            info!("Room {} ('{}') saved successfully", saved.id, saved.name);
+            Json(serde_json::json!({
+                "status": "ok",
+                "room": saved
+            }))
+            .into_response()
+        }
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_room_handler(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<WebState>,
+) -> Response {
+    match state.rooms_store.delete(&id) {
+        Ok(deleted) => {
+            info!("Room {} deleted (found: {})", id, deleted);
+            Json(serde_json::json!({
+                "status": "ok",
+                "deleted": deleted,
+                "id": id
+            }))
+            .into_response()
+        }
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_floors_handler(State(state): State<WebState>) -> Response {
+    let floors = state.rooms_store.distinct_floors();
+    Json(floors).into_response()
+}
+
+async fn import_hue_rooms_handler(State(state): State<WebState>) -> Response {
+    let mut imported_count = 0;
+    let mut assigned_devices = 0;
+
+    // 1. Try reading groups directly from Hue Bridge using saved credentials
+    let creds_path = state.rooms_path.parent().unwrap_or(Path::new(".")).join("hue_credentials.json");
+    let mut bridge_success = false;
+
+    if creds_path.exists() {
+        if let Ok(creds_data) = std::fs::read_to_string(&creds_path) {
+            if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&creds_data) {
+                let bridge_ip = creds.get("bridge_ip").and_then(|v| v.as_str()).unwrap_or("192.168.178.12");
+                let username = creds.get("username").and_then(|v| v.as_str()).unwrap_or("");
+                if !username.is_empty() {
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(5))
+                        .build()
+                        .unwrap_or_default();
+                    let url = format!("http://{}/api/{}/groups", bridge_ip, username);
+                    if let Ok(resp) = client.get(&url).send().await {
+                        if let Ok(groups) = resp.json::<HashMap<String, serde_json::Value>>().await {
+                            bridge_success = true;
+                            let mut docs_guard = state.docs_store.write().await;
+                            let mut docs_changed = false;
+
+                            for (group_id, g) in &groups {
+                                let g_type = g.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                if g_type == "Room" || g_type == "Zone" {
+                                    let name = g.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+                                    if name.is_empty() { continue; }
+                                    let g_class = g.get("class").and_then(|v| v.as_str()).unwrap_or("");
+                                    let room_id = slugify_room_id(name);
+
+                                    let mut rec = RoomRecord::new(
+                                        room_id.clone(),
+                                        name.to_string(),
+                                        None,
+                                        None,
+                                        Some(g_class.to_string()),
+                                    );
+                                    rec.hue_group_id = Some(group_id.clone());
+                                    rec.hue_class = Some(g_class.to_string());
+                                    if let Ok(_) = state.rooms_store.upsert(rec) {
+                                        imported_count += 1;
+                                    }
+
+                                    // Assign lights
+                                    if let Some(lights) = g.get("lights").and_then(|v| v.as_array()) {
+                                        for lid in lights {
+                                            if let Some(lid_str) = lid.as_str() {
+                                                let dev_key = format!("hue-light-{}", lid_str);
+                                                let entry = docs_guard.entry(dev_key).or_insert_with(|| DeviceDocumentation {
+                                                    updated_at: chrono::Utc::now().to_rfc3339(),
+                                                    ..Default::default()
+                                                });
+                                                if entry.room.as_deref() != Some(name) {
+                                                    entry.room = Some(name.to_string());
+                                                    entry.updated_at = chrono::Utc::now().to_rfc3339();
+                                                    docs_changed = true;
+                                                    assigned_devices += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Assign sensors
+                                    if let Some(sensors) = g.get("sensors").and_then(|v| v.as_array()) {
+                                        for sid in sensors {
+                                            if let Some(sid_str) = sid.as_str() {
+                                                let dev_key = format!("hue-sensor-{}", sid_str);
+                                                let entry = docs_guard.entry(dev_key).or_insert_with(|| DeviceDocumentation {
+                                                    updated_at: chrono::Utc::now().to_rfc3339(),
+                                                    ..Default::default()
+                                                });
+                                                if entry.room.as_deref() != Some(name) {
+                                                    entry.room = Some(name.to_string());
+                                                    entry.updated_at = chrono::Utc::now().to_rfc3339();
+                                                    docs_changed = true;
+                                                    assigned_devices += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if docs_changed {
+                                let _ = persist_json(&state.docs_path, &*docs_guard);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback to querying the Hue module on port 8125 if direct bridge failed
+    if !bridge_success {
+        if let Ok(raw_rooms) = energy::http_get_json("127.0.0.1", 8125, "/api/rooms", 3000).await {
+            if let Ok(hue_rooms) = serde_json::from_str::<Vec<RoomRecord>>(&raw_rooms) {
+                for r in hue_rooms {
+                    if let Ok(_) = state.rooms_store.upsert(r) {
+                        imported_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    info!("Imported {} room(s) and assigned {} device(s) from Hue", imported_count, assigned_devices);
+    Json(serde_json::json!({
+        "status": "ok",
+        "imported_rooms": imported_count,
+        "assigned_devices": assigned_devices,
+        "message": format!("{} Räume importiert und {} Geräte zugeordnet.", imported_count, assigned_devices)
+    })).into_response()
+}
+
+// ------------------------------------------------------------------------------------------------
+// Govee Local UDP API & Rooms Page Handlers
+// ------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct SetGoveePowerPayload {
+    on: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetGoveeBrightnessPayload {
+    brightness: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetGoveeColorPayload {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetGoveeTempPayload {
+    kelvin: u32,
+}
+
+async fn get_govee_lights_handler(State(state): State<WebState>) -> Response {
+    let devs = state.govee_manager.list_devices().await;
+    Json(devs).into_response()
+}
+
+async fn toggle_govee_light_handler(
+    AxumPath(ip): AxumPath<String>,
+    State(state): State<WebState>,
+) -> Response {
+    let current = state.govee_manager.get_device(&ip).await;
+    let next_state = current.map(|s| !s.on_off).unwrap_or(true);
+    match state.govee_manager.set_power(&ip, next_state).await {
+        Ok(_) => Json(serde_json::json!({ "status": "ok", "on": next_state })).into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn set_govee_power_handler(
+    AxumPath(ip): AxumPath<String>,
+    State(state): State<WebState>,
+    Json(payload): Json<SetGoveePowerPayload>,
+) -> Response {
+    match state.govee_manager.set_power(&ip, payload.on).await {
+        Ok(_) => Json(serde_json::json!({ "status": "ok", "on": payload.on })).into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn set_govee_brightness_handler(
+    AxumPath(ip): AxumPath<String>,
+    State(state): State<WebState>,
+    Json(payload): Json<SetGoveeBrightnessPayload>,
+) -> Response {
+    match state.govee_manager.set_brightness(&ip, payload.brightness).await {
+        Ok(_) => Json(serde_json::json!({ "status": "ok", "brightness": payload.brightness })).into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn set_govee_color_handler(
+    AxumPath(ip): AxumPath<String>,
+    State(state): State<WebState>,
+    Json(payload): Json<SetGoveeColorPayload>,
+) -> Response {
+    match state.govee_manager.set_color(&ip, payload.r, payload.g, payload.b).await {
+        Ok(_) => Json(serde_json::json!({ "status": "ok", "r": payload.r, "g": payload.g, "b": payload.b })).into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn set_govee_temperature_handler(
+    AxumPath(ip): AxumPath<String>,
+    State(state): State<WebState>,
+    Json(payload): Json<SetGoveeTempPayload>,
+) -> Response {
+    match state.govee_manager.set_color_temp(&ip, payload.kelvin).await {
+        Ok(_) => Json(serde_json::json!({ "status": "ok", "kelvin": payload.kelvin })).into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_govee_status_handler(
+    AxumPath(ip): AxumPath<String>,
+    State(state): State<WebState>,
+) -> Response {
+    let _ = state.govee_manager.query_status(&ip).await;
+    let dev = state.govee_manager.get_device(&ip).await;
+    Json(dev).into_response()
+}
+
+async fn rooms_page_handler(State(state): State<WebState>) -> Html<String> {
+    let docs = state.docs_store.read().await.clone();
+    let mut links = state.links_store.read().await.clone();
+    let matter_fabrics = state.matter_fabrics_store.read().await.clone();
+    let rooms = state.rooms_store.list();
+    let light_groups = state.light_groups_store.list();
+    let govee_list = state.govee_manager.list_devices().await;
+    let govee_states: HashMap<String, govee::GoveeDeviceState> = govee_list.into_iter().map(|d| (d.ip.clone(), d)).collect();
+
+    let body = match load_snapshot(&state.socket_path).await {
+        Ok(snapshot) => {
+            let _ = auto_link_deterministic_devices(&snapshot.devices, &mut links);
+            let unified_devices = build_unified_devices(&snapshot.devices, &links);
+            rooms::render_rooms_page(
+                &state.status_title,
+                &rooms,
+                &unified_devices,
+                &docs,
+                &govee_states,
+                &matter_fabrics,
+                &light_groups,
+            )
+        }
+        Err(error) => render_error(&state.status_title, "rooms", &error.to_string()),
+    };
+    Html(body)
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateLightGroupPayload {
+    name: String,
+    room: String,
+    device_ids: Vec<String>,
+    #[serde(default)]
+    icon: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupPowerPayload {
+    on: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupBrightnessPayload {
+    brightness: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupColorPayload {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupTempPayload {
+    kelvin: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoomScenePayload {
+    scene: String,
+}
+
+async fn list_light_groups_handler(State(state): State<WebState>) -> Json<Vec<homenode_definitions::LightGroup>> {
+    Json(state.light_groups_store.list())
+}
+
+async fn create_light_group_handler(
+    State(state): State<WebState>,
+    Json(payload): Json<CreateLightGroupPayload>,
+) -> Response {
+    let id = format!("group-{}", homenode_definitions::slugify_room_id(&payload.name));
+    let group = homenode_definitions::LightGroup::new(
+        id,
+        payload.name,
+        payload.room,
+        payload.device_ids,
+        payload.icon.or_else(|| Some("✨".to_string())),
+    );
+    match state.light_groups_store.upsert(group.clone()) {
+        Ok(_) => (axum::http::StatusCode::CREATED, Json(serde_json::json!({ "status": "ok", "group": group }))).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "status": "error", "message": e.to_string() }))).into_response(),
+    }
+}
+
+async fn delete_light_group_handler(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<WebState>,
+) -> Response {
+    match state.light_groups_store.delete(&id) {
+        Ok(true) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Ok(false) => (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({ "status": "not_found" }))).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "status": "error", "message": e.to_string() }))).into_response(),
+    }
+}
+
+async fn control_devices_power(
+    state: &WebState,
+    device_ids: &[String],
+    on: bool,
+) {
+    let snapshot = load_snapshot(&state.socket_path).await.ok();
+    for dev_id in device_ids {
+        if let Some(ref snap) = snapshot {
+            if let Some(dev) = snap.devices.iter().find(|d| d.device_id == *dev_id) {
+                if let Some(ip) = dev.metadata.get("ip") {
+                    if !ip.is_empty() && ip != "-" && !ip.contains('(') {
+                        let _ = state.govee_manager.set_power(ip, on).await;
+                    }
+                }
+                if dev.module_id == "philips-hue" || dev.metadata.get("source").map(|s| s.as_str()) == Some("philips-hue") {
+                    let hue_id = dev.metadata.get("hue_light_id").cloned()
+                        .unwrap_or_else(|| dev.device_id.replace("hue-light-", ""));
+                    let path = format!("/api/lights/{hue_id}/state");
+                    let _ = energy::http_post_json("127.0.0.1", 8125, &path, &format!(r#"{{"on":{on}}}"#), 2000).await;
+                }
+            }
+        }
+        if dev_id.starts_with("net-") {
+            let ip = dev_id.trim_start_matches("net-").replace('-', ".");
+            let _ = state.govee_manager.set_power(&ip, on).await;
+        }
+    }
+}
+
+async fn control_devices_brightness(
+    state: &WebState,
+    device_ids: &[String],
+    brightness: u8,
+) {
+    let snapshot = load_snapshot(&state.socket_path).await.ok();
+    let hue_bri = ((brightness as f32 / 100.0) * 254.0).round() as u8;
+    for dev_id in device_ids {
+        if let Some(ref snap) = snapshot {
+            if let Some(dev) = snap.devices.iter().find(|d| d.device_id == *dev_id) {
+                if let Some(ip) = dev.metadata.get("ip") {
+                    if !ip.is_empty() && ip != "-" && !ip.contains('(') {
+                        let _ = state.govee_manager.set_brightness(ip, brightness).await;
+                    }
+                }
+                if dev.module_id == "philips-hue" || dev.metadata.get("source").map(|s| s.as_str()) == Some("philips-hue") {
+                    let hue_id = dev.metadata.get("hue_light_id").cloned()
+                        .unwrap_or_else(|| dev.device_id.replace("hue-light-", ""));
+                    let path = format!("/api/lights/{hue_id}/state");
+                    let _ = energy::http_post_json("127.0.0.1", 8125, &path, &format!(r#"{{"on":true,"bri":{hue_bri}}}"#), 2000).await;
+                }
+            }
+        }
+        if dev_id.starts_with("net-") {
+            let ip = dev_id.trim_start_matches("net-").replace('-', ".");
+            let _ = state.govee_manager.set_brightness(&ip, brightness).await;
+        }
+    }
+}
+
+async fn control_devices_color(
+    state: &WebState,
+    device_ids: &[String],
+    r: u8,
+    g: u8,
+    b: u8,
+) {
+    let snapshot = load_snapshot(&state.socket_path).await.ok();
+    for dev_id in device_ids {
+        if let Some(ref snap) = snapshot {
+            if let Some(dev) = snap.devices.iter().find(|d| d.device_id == *dev_id) {
+                if let Some(ip) = dev.metadata.get("ip") {
+                    if !ip.is_empty() && ip != "-" && !ip.contains('(') {
+                        let _ = state.govee_manager.set_color(ip, r, g, b).await;
+                    }
+                }
+                if dev.module_id == "philips-hue" || dev.metadata.get("source").map(|s| s.as_str()) == Some("philips-hue") {
+                    let hue_id = dev.metadata.get("hue_light_id").cloned()
+                        .unwrap_or_else(|| dev.device_id.replace("hue-light-", ""));
+                    let path = format!("/api/lights/{hue_id}/state");
+                    let _ = energy::http_post_json("127.0.0.1", 8125, &path, r#"{"on":true}"#, 2000).await;
+                }
+            }
+        }
+        if dev_id.starts_with("net-") {
+            let ip = dev_id.trim_start_matches("net-").replace('-', ".");
+            let _ = state.govee_manager.set_color(&ip, r, g, b).await;
+        }
+    }
+}
+
+async fn control_devices_temp(
+    state: &WebState,
+    device_ids: &[String],
+    kelvin: u32,
+) {
+    let snapshot = load_snapshot(&state.socket_path).await.ok();
+    let mired = (1_000_000 / kelvin.max(2000).min(6500)).clamp(153, 500);
+    for dev_id in device_ids {
+        if let Some(ref snap) = snapshot {
+            if let Some(dev) = snap.devices.iter().find(|d| d.device_id == *dev_id) {
+                if let Some(ip) = dev.metadata.get("ip") {
+                    if !ip.is_empty() && ip != "-" && !ip.contains('(') {
+                        let _ = state.govee_manager.set_color_temp(ip, kelvin).await;
+                    }
+                }
+                if dev.module_id == "philips-hue" || dev.metadata.get("source").map(|s| s.as_str()) == Some("philips-hue") {
+                    let hue_id = dev.metadata.get("hue_light_id").cloned()
+                        .unwrap_or_else(|| dev.device_id.replace("hue-light-", ""));
+                    let path = format!("/api/lights/{hue_id}/state");
+                    let _ = energy::http_post_json("127.0.0.1", 8125, &path, &format!(r#"{{"on":true,"ct":{mired}}}"#), 2000).await;
+                }
+            }
+        }
+        if dev_id.starts_with("net-") {
+            let ip = dev_id.trim_start_matches("net-").replace('-', ".");
+            let _ = state.govee_manager.set_color_temp(&ip, kelvin).await;
+        }
+    }
+}
+
+async fn light_group_power_handler(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<WebState>,
+    Json(payload): Json<GroupPowerPayload>,
+) -> Response {
+    if let Some(group) = state.light_groups_store.get(&id) {
+        control_devices_power(&state, &group.device_ids, payload.on).await;
+        Json(serde_json::json!({ "status": "ok", "on": payload.on, "group_id": id })).into_response()
+    } else {
+        (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({ "status": "not_found" }))).into_response()
+    }
+}
+
+async fn light_group_brightness_handler(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<WebState>,
+    Json(payload): Json<GroupBrightnessPayload>,
+) -> Response {
+    if let Some(group) = state.light_groups_store.get(&id) {
+        control_devices_brightness(&state, &group.device_ids, payload.brightness).await;
+        Json(serde_json::json!({ "status": "ok", "brightness": payload.brightness, "group_id": id })).into_response()
+    } else {
+        (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({ "status": "not_found" }))).into_response()
+    }
+}
+
+async fn light_group_color_handler(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<WebState>,
+    Json(payload): Json<GroupColorPayload>,
+) -> Response {
+    if let Some(group) = state.light_groups_store.get(&id) {
+        control_devices_color(&state, &group.device_ids, payload.r, payload.g, payload.b).await;
+        Json(serde_json::json!({ "status": "ok", "color": [payload.r, payload.g, payload.b], "group_id": id })).into_response()
+    } else {
+        (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({ "status": "not_found" }))).into_response()
+    }
+}
+
+async fn light_group_temperature_handler(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<WebState>,
+    Json(payload): Json<GroupTempPayload>,
+) -> Response {
+    if let Some(group) = state.light_groups_store.get(&id) {
+        control_devices_temp(&state, &group.device_ids, payload.kelvin).await;
+        Json(serde_json::json!({ "status": "ok", "kelvin": payload.kelvin, "group_id": id })).into_response()
+    } else {
+        (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({ "status": "not_found" }))).into_response()
+    }
+}
+
+async fn room_scene_handler(
+    AxumPath(room): AxumPath<String>,
+    State(state): State<WebState>,
+    Json(payload): Json<RoomScenePayload>,
+) -> Response {
+    let room_lower = room.trim().to_lowercase();
+    let docs = state.docs_store.read().await.clone();
+    let mut target_device_ids = Vec::new();
+
+    if let Ok(snapshot) = load_snapshot(&state.socket_path).await {
+        for dev in &snapshot.devices {
+            let mac = dev.metadata.get("mac").cloned().unwrap_or_default();
+            let doc_key = if !mac.is_empty() { mac.clone() } else { dev.device_id.clone() };
+            let doc = docs.get(&doc_key)
+                .or_else(|| docs.get(&mac))
+                .or_else(|| docs.get(&mac.to_lowercase()))
+                .or_else(|| docs.get(&dev.device_id));
+            let dev_room = doc.and_then(|d| d.room.as_deref())
+                .or_else(|| dev.metadata.get("room").map(|s| s.as_str()))
+                .unwrap_or("");
+            if dev_room.trim().to_lowercase() == room_lower {
+                let is_button_or_sensor = dev.kind == "button"
+                    || dev.metadata.get("category").map(|s| s.as_str()) == Some("button")
+                    || dev.kind == "sensor"
+                    || dev.device_id.starts_with("hue-sensor-");
+
+                let is_light = !is_button_or_sensor && (
+                    dev.metadata.get("category").map(|s| s.as_str()) == Some("lighting")
+                    || dev.kind == "lighting"
+                    || (dev.module_id == "philips-hue" && dev.metadata.get("hue_light_id").is_some())
+                    || dev.display_name.to_lowercase().contains("govee")
+                    || dev.metadata.get("hostname").map(|h| h.to_lowercase().contains("govee")).unwrap_or(false)
+                );
+                if is_light {
+                    target_device_ids.push(dev.device_id.clone());
+                }
+            }
+        }
+    }
+
+    match payload.scene.as_str() {
+        "all_off" => {
+            control_devices_power(&state, &target_device_ids, false).await;
+        }
+        "all_on" => {
+            control_devices_power(&state, &target_device_ids, true).await;
+            control_devices_brightness(&state, &target_device_ids, 100).await;
+            control_devices_temp(&state, &target_device_ids, 4000).await;
+        }
+        "relax" => {
+            control_devices_power(&state, &target_device_ids, true).await;
+            control_devices_brightness(&state, &target_device_ids, 40).await;
+            control_devices_temp(&state, &target_device_ids, 2700).await;
+        }
+        "focus" => {
+            control_devices_power(&state, &target_device_ids, true).await;
+            control_devices_brightness(&state, &target_device_ids, 100).await;
+            control_devices_temp(&state, &target_device_ids, 6500).await;
+        }
+        "night" => {
+            control_devices_power(&state, &target_device_ids, true).await;
+            control_devices_brightness(&state, &target_device_ids, 10).await;
+            control_devices_temp(&state, &target_device_ids, 2200).await;
+        }
+        "cinema" => {
+            control_devices_power(&state, &target_device_ids, true).await;
+            control_devices_brightness(&state, &target_device_ids, 20).await;
+            control_devices_color(&state, &target_device_ids, 0, 100, 255).await;
+        }
+        _ => {}
+    }
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "scene": payload.scene,
+        "room": room,
+        "devices_count": target_device_ids.len()
+    })).into_response()
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1572,10 +2880,132 @@ async fn save_definition_handler(
 // ------------------------------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct UnifiedDevice {
-    primary: DeviceRecord,
-    secondary_interfaces: Vec<DeviceRecord>,
-    merge_candidate: Option<DeviceRecord>,
+pub(crate) struct UnifiedDevice {
+    pub(crate) primary: DeviceRecord,
+    pub(crate) secondary_interfaces: Vec<DeviceRecord>,
+    pub(crate) merge_candidate: Option<DeviceRecord>,
+}
+
+fn extract_shelly_mac_hex(name: &str) -> Option<String> {
+    let name_lower = name.to_lowercase();
+    if !name_lower.contains("shelly") {
+        return None;
+    }
+    let cleaned = name.trim();
+    if let Some(pos) = cleaned.rfind(|c| c == '-' || c == '_' || c == ' ') {
+        let suffix = &cleaned[pos + 1..];
+        if suffix.len() == 12 && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(suffix.to_uppercase());
+        }
+    }
+    if cleaned.len() >= 12 {
+        let suffix = &cleaned[cleaned.len() - 12..];
+        if suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(suffix.to_uppercase());
+        }
+    }
+    None
+}
+
+pub(crate) fn auto_link_deterministic_devices(
+    devices: &[DeviceRecord],
+    links: &mut HashMap<String, Vec<String>>,
+) -> bool {
+    let mut modified = false;
+
+    let mut already_linked_secondaries = std::collections::HashSet::new();
+    for (_, sec_list) in links.iter() {
+        for sec in sec_list {
+            already_linked_secondaries.insert(sec.clone());
+        }
+    }
+
+    let mut net_mac_map: HashMap<String, String> = HashMap::new();
+    let mut net_shelly_prefix_map: HashMap<String, String> = HashMap::new();
+
+    for dev in devices {
+        let is_ble = dev.metadata.get("protocol").map(|s| s.as_str()) == Some("ble")
+            || dev.device_id.starts_with("mobile-ble-")
+            || dev.module_id == "bthome";
+        if is_ble {
+            continue;
+        }
+
+        if let Some(mac) = dev.metadata.get("mac") {
+            let norm_mac = mac.replace([':', '-'], "").to_uppercase();
+            if norm_mac.len() == 12 {
+                net_mac_map.insert(norm_mac.clone(), dev.device_id.clone());
+                if norm_mac.len() >= 10 {
+                    net_mac_map.insert(norm_mac[..10].to_string(), dev.device_id.clone());
+                }
+            }
+        }
+
+        let host = dev.metadata.get("hostname").cloned().unwrap_or_default().to_uppercase();
+        if host.contains("SHELLY") {
+            if let Some(hex_mac) = extract_shelly_mac_hex(&host) {
+                net_mac_map.insert(hex_mac.clone(), dev.device_id.clone());
+                if hex_mac.len() >= 10 {
+                    net_mac_map.insert(hex_mac[..10].to_string(), dev.device_id.clone());
+                }
+            }
+        }
+
+        let name_lower = dev.display_name.to_lowercase();
+        let host_lower = host.to_lowercase();
+        let is_dev_active = dev.metadata.get("is_active").map(|s| s.as_str()) == Some("true")
+            || dev.metadata.get("status").map(|s| s.as_str()) == Some("active");
+        for key in &["shellypro3em", "shellypro4pm", "shellyplus1"] {
+            if name_lower.contains(key) || host_lower.contains(key) {
+                if is_dev_active || !net_shelly_prefix_map.contains_key(*key) {
+                    net_shelly_prefix_map.insert(key.to_string(), dev.device_id.clone());
+                }
+            }
+        }
+    }
+
+    for dev in devices {
+        let is_ble = dev.metadata.get("protocol").map(|s| s.as_str()) == Some("ble")
+            || dev.device_id.starts_with("mobile-ble-")
+            || dev.module_id == "bthome";
+        if !is_ble {
+            continue;
+        }
+
+        if already_linked_secondaries.contains(&dev.device_id) {
+            continue;
+        }
+
+        if let Some(hex_mac) = extract_shelly_mac_hex(&dev.display_name) {
+            let matched_primary = net_mac_map.get(&hex_mac)
+                .or_else(|| if hex_mac.len() >= 10 { net_mac_map.get(&hex_mac[..10]) } else { None })
+                .or_else(|| {
+                    let name_lower = dev.display_name.to_lowercase();
+                    for key in &["shellypro3em", "shellypro4pm", "shellyplus1"] {
+                        if name_lower.contains(key) {
+                            if let Some(target_id) = net_shelly_prefix_map.get(*key) {
+                                return Some(target_id);
+                            }
+                        }
+                    }
+                    None
+                });
+
+            if let Some(primary_dev_id) = matched_primary {
+                if primary_dev_id != &dev.device_id {
+                    let list = links.entry(primary_dev_id.clone()).or_default();
+                    if !list.contains(&dev.device_id) {
+                        info!("Auto-linking Shelly BLE device {} to primary network device {}", dev.display_name, primary_dev_id);
+                        list.push(dev.device_id.clone());
+                        already_linked_secondaries.insert(dev.device_id.clone());
+                        modified = true;
+                    }
+                }
+            }
+        }
+    }
+
+    modified
 }
 
 fn detect_merge_candidate(
@@ -1587,47 +3017,121 @@ fn detect_merge_candidate(
     let host = dev.metadata.get("hostname").cloned().unwrap_or_default().to_lowercase();
     let ip = dev.metadata.get("ip").cloned().unwrap_or_default();
     let mac = dev.metadata.get("mac").cloned().unwrap_or_default();
+    let is_dev_ble = dev.metadata.get("protocol").map(|s| s.as_str()) == Some("ble")
+        || dev.device_id.starts_with("mobile-ble-")
+        || dev.module_id == "bthome";
 
-    // Skip if already linked
+    // Skip if already linked as a secondary
     if links.values().any(|v| v.contains(&dev.device_id) || (!mac.is_empty() && v.contains(&mac))) {
         return None;
     }
-    if let Some(secondaries) = links.get(&dev.device_id).or_else(|| links.get(&mac)) {
-        if !secondaries.is_empty() {
-            return None;
-        }
-    }
+
+    let current_secondaries: &[String] = links.get(&dev.device_id)
+        .or_else(|| if !mac.is_empty() { links.get(&mac) } else { None })
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
 
     for other in all_devices {
         if other.device_id == dev.device_id {
             continue;
         }
-        let other_name = other.display_name.to_lowercase();
-        let other_host = other.metadata.get("hostname").cloned().unwrap_or_default().to_lowercase();
-        let other_ip = other.metadata.get("ip").cloned().unwrap_or_default();
+        let other_mac = other.metadata.get("mac").cloned().unwrap_or_default();
 
-        if other_ip == ip {
+        // Skip if already linked to this dev or linked to another device
+        if current_secondaries.contains(&other.device_id) || (!other_mac.is_empty() && current_secondaries.contains(&other_mac)) {
+            continue;
+        }
+        if links.values().any(|v| v.contains(&other.device_id) || (!other_mac.is_empty() && v.contains(&other_mac))) {
             continue;
         }
 
-        // Heuristic 1: MacBook Pro abbreviation match (e.g. macbookprom2 vs mbp-m2-2)
-        let is_mbp_match = (name.contains("macbook") || host.contains("macbook"))
-            && (other_name.contains("mbp") || other_host.contains("mbp"));
+        let other_name = other.display_name.to_lowercase();
+        let other_host = other.metadata.get("hostname").cloned().unwrap_or_default().to_lowercase();
+        let other_ip = other.metadata.get("ip").cloned().unwrap_or_default();
+        let is_other_ble = other.metadata.get("protocol").map(|s| s.as_str()) == Some("ble")
+            || other.device_id.starts_with("mobile-ble-")
+            || other.module_id == "bthome";
 
-        // Heuristic 2: Suffix match (e.g. host and host-2 or host-wlan)
-        let clean_name1 = name.replace("-2", "").replace(".fritz.box", "");
-        let clean_name2 = other_name.replace("-2", "").replace(".fritz.box", "");
-        let is_suffix_match = clean_name1 == clean_name2 && (name.contains("-2") || other_name.contains("-2"));
+        if !ip.is_empty() && ip == other_ip {
+            continue;
+        }
 
-        if is_mbp_match || is_suffix_match {
+        // Heuristic 1: Shelly 12-Hex MAC match or unique model match
+        let shelly_mac_1 = extract_shelly_mac_hex(&dev.display_name);
+        let shelly_mac_2 = extract_shelly_mac_hex(&other.display_name);
+        if let Some(ref smac) = shelly_mac_1 {
+            let other_norm_mac = other_mac.replace([':', '-'], "").to_uppercase();
+            if !other_norm_mac.is_empty() && (other_norm_mac == *smac || (other_norm_mac.len() >= 10 && smac.starts_with(&other_norm_mac[..10]))) {
+                return Some(other.clone());
+            }
+        }
+        if let Some(ref smac) = shelly_mac_2 {
+            let dev_norm_mac = mac.replace([':', '-'], "").to_uppercase();
+            if !dev_norm_mac.is_empty() && (dev_norm_mac == *smac || (dev_norm_mac.len() >= 10 && smac.starts_with(&dev_norm_mac[..10]))) {
+                return Some(other.clone());
+            }
+        }
+
+        // Heuristic 2: MacBook / Laptop match (e.g. macbookprom2 vs mbp-m2-2 or mbp-m2)
+        let is_mac_1 = name.contains("macbook") || host.contains("macbook") || name.contains("mbp") || host.contains("mbp");
+        let is_mac_2 = other_name.contains("macbook") || other_host.contains("macbook") || other_name.contains("mbp") || other_host.contains("mbp");
+        if is_mac_1 && is_mac_2 {
+            let chip1 = ["m1", "m2", "m3", "m4", "m5"].iter().find(|&&c| name.contains(c) || host.contains(c));
+            let chip2 = ["m1", "m2", "m3", "m4", "m5"].iter().find(|&&c| other_name.contains(c) || other_host.contains(c));
+            if chip1.is_some() && chip1 == chip2 {
+                return Some(other.clone());
+            }
+            if chip1.is_none() && chip2.is_none() {
+                if (name.contains("macbook") && (other_name.contains("mbp") || other_host.contains("mbp")))
+                    || (other_name.contains("macbook") && (name.contains("mbp") || host.contains("mbp"))) {
+                    return Some(other.clone());
+                }
+            }
+        }
+
+        // Heuristic 3: iPad match (e.g. iPad Pro M5 vs iPadM5)
+        let is_ipad_1 = name.contains("ipad") || host.contains("ipad");
+        let is_ipad_2 = other_name.contains("ipad") || other_host.contains("ipad");
+        if is_ipad_1 && is_ipad_2 {
+            let chip1 = ["m1", "m2", "m3", "m4", "m5"].iter().find(|&&c| name.contains(c) || host.contains(c));
+            let chip2 = ["m1", "m2", "m3", "m4", "m5"].iter().find(|&&c| other_name.contains(c) || other_host.contains(c));
+            if chip1.is_some() && chip1 == chip2 {
+                return Some(other.clone());
+            }
+            if chip1.is_none() && chip2.is_none() {
+                let clean1 = name.replace([' ', '-', '_', '.'], "").replace("fritzbox", "");
+                let clean2 = other_name.replace([' ', '-', '_', '.'], "").replace("fritzbox", "");
+                if !clean1.is_empty() && clean1 == clean2 {
+                    return Some(other.clone());
+                }
+            }
+        }
+
+        // Heuristic 4: Suffix match (e.g. host and host-2 or host-wlan)
+        let generic_names = ["switch", "host", "pc", "device", "lan", "wlan"];
+        let clean_name1 = name.replace("-2", "").replace(".fritz.box", "").replace(".local", "");
+        let clean_name2 = other_name.replace("-2", "").replace(".fritz.box", "").replace(".local", "");
+        let is_suffix_match = clean_name1 == clean_name2
+            && (name.contains("-2") || other_name.contains("-2"))
+            && !generic_names.contains(&clean_name1.as_str());
+        if is_suffix_match {
             return Some(other.clone());
+        }
+
+        // Heuristic 5: General Normalized Match between IP and BLE device
+        if (is_dev_ble != is_other_ble) || (!ip.is_empty() && !other_ip.is_empty()) {
+            let norm1: String = name.chars().filter(|c| c.is_alphanumeric()).collect();
+            let norm2: String = other_name.chars().filter(|c| c.is_alphanumeric()).collect();
+            if norm1.len() >= 4 && norm1 == norm2 && !generic_names.contains(&norm1.as_str()) {
+                return Some(other.clone());
+            }
         }
     }
 
     None
 }
 
-fn build_unified_devices(
+pub(crate) fn build_unified_devices(
     devices: &[DeviceRecord],
     links: &HashMap<String, Vec<String>>,
 ) -> Vec<UnifiedDevice> {
@@ -1692,7 +3196,11 @@ fn build_unified_devices(
         }
 
         let mut secondaries = Vec::new();
-        let configured_secs = links.get(&d.device_id).or_else(|| links.get(&mac));
+        let ip = d.metadata.get("ip").cloned().unwrap_or_default();
+        let ip_key = if !ip.is_empty() { format!("net-{}", ip.replace('.', "-")) } else { String::new() };
+        let configured_secs = links.get(&d.device_id)
+            .or_else(|| if !mac.is_empty() { links.get(&mac) } else { None })
+            .or_else(|| if !ip_key.is_empty() { links.get(&ip_key) } else { None });
         if let Some(list) = configured_secs {
             for sec_id in list {
                 let actual_id = mac_map.get(sec_id).unwrap_or(sec_id);
@@ -1702,11 +3210,7 @@ fn build_unified_devices(
             }
         }
 
-        let candidate = if secondaries.is_empty() {
-            detect_merge_candidate(d, &deduped, links)
-        } else {
-            None
-        };
+        let candidate = detect_merge_candidate(d, &deduped, links);
 
         unified.push(UnifiedDevice {
             primary: d.clone(),
@@ -1722,9 +3226,10 @@ fn build_unified_devices(
 // HTML Rendering: Master-Detail Layout
 // ------------------------------------------------------------------------------------------------
 
-fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
+pub(crate) fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
     let dashboard_active = if current_tab == "dashboard" { "class=\"active\"" } else { "" };
     let devices_active = if current_tab == "devices" { "class=\"active\"" } else { "" };
+    let rooms_active = if current_tab == "rooms" { "class=\"active\"" } else { "" };
     let energy_active = if current_tab == "energy" { "class=\"active\"" } else { "" };
     let matter_active = if current_tab == "matter" { "class=\"active\"" } else { "" };
     let catalog_active = if current_tab == "catalog" { "class=\"active\"" } else { "" };
@@ -2140,6 +3645,7 @@ fn page_layout(title: &str, current_tab: &str, content: &str) -> String {
         <nav>
             <a href="/" {dashboard_active}>🏠 Dashboard</a>
             <a href="/devices" {devices_active}>📱 Devices</a>
+            <a href="/rooms" {rooms_active}>🚪 Rooms</a>
             <a href="/energy" {energy_active}>⚡ Energy</a>
             <a href="/matter" {matter_active}>✨ Matter Fabrics</a>
             <a href="/catalog" {catalog_active}>🏢 Hardware Catalog</a>
@@ -2186,7 +3692,7 @@ fn default_category_presentation(key: &str) -> (&'static str, &'static str) {
 
 fn canonical_category_key(key: &str, title: &str) -> &'static str {
     match title {
-        "Buttons & Remote Controls" | "Buttons" | "Taster & Schalter" => "button",
+        "Buttons & Remote Controls" | "Buttons" | "Taster & Schalter" | "Remote Controls & Switches" | "Wall Switch" | "Wandschalter" => "button",
         "Doors & Windows" | "Door & Window" | "Tür & Fenster" => "contact-sensor",
         "Motion Detectors" | "Motion" | "Bewegungsmelder" => "motion-sensor",
         "Smartphones" => "phone",
@@ -2343,6 +3849,9 @@ fn render_devices_page(
     category_overrides: &HashMap<String, String>,
     matter_fabric_metas: &HashMap<String, MatterFabricMeta>,
     verified_gateways: &[VerifiedShellyGateway],
+    ignored_store: &homenode_definitions::IgnoredDevicesStore,
+    rooms: &[RoomRecord],
+    govee_states: &HashMap<String, govee::GoveeDeviceState>,
 ) -> String {
     let verified_gw_ips: std::collections::HashSet<String> = verified_gateways.iter()
         .filter(|g| g.ble_supported)
@@ -2368,28 +3877,52 @@ fn render_devices_page(
     }
 
     let unified_devices = build_unified_devices(&snapshot.devices, links);
-    let total_count = unified_devices.len();
+    let ignored_count = unified_devices
+        .iter()
+        .filter(|u| {
+            let p = &u.primary;
+            let mac = p.metadata.get("mac").map(|s| s.as_str()).unwrap_or("");
+            ignored_store.is_ignored(&p.device_id) || (!mac.is_empty() && ignored_store.is_ignored(mac))
+        })
+        .count();
+
     let active_count = unified_devices
         .iter()
         .filter(|u| {
-            let s = u.primary.metadata.get("status").map(|s| s.as_str()).unwrap_or("active");
+            let p = &u.primary;
+            let mac = p.metadata.get("mac").map(|s| s.as_str()).unwrap_or("");
+            if ignored_store.is_ignored(&p.device_id) || (!mac.is_empty() && ignored_store.is_ignored(mac)) {
+                return false;
+            }
+            let s = p.metadata.get("status").map(|s| s.as_str()).unwrap_or("active");
             s == "active"
         })
         .count();
     let former_count = unified_devices
         .iter()
         .filter(|u| {
-            let s = u.primary.metadata.get("status").map(|s| s.as_str()).unwrap_or("active");
+            let p = &u.primary;
+            let mac = p.metadata.get("mac").map(|s| s.as_str()).unwrap_or("");
+            if ignored_store.is_ignored(&p.device_id) || (!mac.is_empty() && ignored_store.is_ignored(mac)) {
+                return false;
+            }
+            let s = p.metadata.get("status").map(|s| s.as_str()).unwrap_or("active");
             s == "inactive"
         })
         .count();
     let archive_count = unified_devices
         .iter()
         .filter(|u| {
-            let s = u.primary.metadata.get("status").map(|s| s.as_str()).unwrap_or("active");
+            let p = &u.primary;
+            let mac = p.metadata.get("mac").map(|s| s.as_str()).unwrap_or("");
+            if ignored_store.is_ignored(&p.device_id) || (!mac.is_empty() && ignored_store.is_ignored(mac)) {
+                return false;
+            }
+            let s = p.metadata.get("status").map(|s| s.as_str()).unwrap_or("active");
             s == "archive"
         })
         .count();
+    let total_count = active_count + former_count + archive_count;
 
     let mut category_map: HashMap<String, DynamicCategory> = HashMap::new();
     for udev in &unified_devices {
@@ -2473,8 +4006,9 @@ fn render_devices_page(
                 (canon.to_string(), t, i)
             };
 
+            let mac_lower = mac.to_lowercase();
             let doc = docs.get(&doc_key)
-                .or_else(|| if !mac.is_empty() { docs.get(&mac) } else { None })
+                .or_else(|| if !mac.is_empty() { docs.get(&mac).or_else(|| docs.get(&mac_lower)) } else { None })
                 .or_else(|| docs.get(&p.device_id))
                 .cloned()
                 .unwrap_or_default();
@@ -2525,6 +4059,11 @@ fn render_devices_page(
                     "mac": s.metadata.get("mac").cloned().unwrap_or_default(),
                     "vendor": s.metadata.get("vendor").cloned().unwrap_or_default(),
                     "hostname": s.metadata.get("hostname").cloned().unwrap_or_default(),
+                    "protocol": s.metadata.get("protocol").cloned().unwrap_or_default(),
+                    "source": s.metadata.get("source").cloned().unwrap_or_default(),
+                    "scout": s.metadata.get("scout").cloned().unwrap_or_default(),
+                    "rssi": s.metadata.get("rssi").cloned().unwrap_or_default(),
+                    "metadata": s.metadata.clone(),
                 })
             }).collect();
 
@@ -2535,6 +4074,8 @@ fn render_devices_page(
                     "ip": c.metadata.get("ip").cloned().unwrap_or_default(),
                     "mac": c.metadata.get("mac").cloned().unwrap_or_default(),
                     "hostname": c.metadata.get("hostname").cloned().unwrap_or_default(),
+                    "protocol": c.metadata.get("protocol").cloned().unwrap_or_default(),
+                    "source": c.metadata.get("source").cloned().unwrap_or_default(),
                 })
             });
 
@@ -2553,6 +4094,14 @@ fn render_devices_page(
                 sources.push("shelly-gateway".to_string());
             }
             let was_ever_active = p.metadata.get("was_ever_active").map(|s| s.as_str()) == Some("true") || is_active;
+            let is_dev_ignored = ignored_store.is_ignored(&p.device_id) || (!mac.is_empty() && ignored_store.is_ignored(&mac));
+            let effective_room = doc.room.clone().or_else(|| p.metadata.get("room").cloned()).unwrap_or_default();
+            let room_rec = if !effective_room.is_empty() {
+                rooms.iter().find(|r| r.name.eq_ignore_ascii_case(&effective_room))
+            } else {
+                None
+            };
+            let effective_floor = room_rec.and_then(|r| r.floor.clone()).unwrap_or_else(|| deduce_floor_from_name(&effective_room).map(|s| s.to_string()).unwrap_or_default());
 
             serde_json::json!({
                 "device_id": p.device_id,
@@ -2569,7 +4118,8 @@ fn render_devices_page(
                 "web_url": web_url,
                 "doc_key": doc_key,
                 "notes": doc.notes,
-                "room": doc.room.unwrap_or_default(),
+                "room": effective_room,
+                "floor": effective_floor,
                 "manual_url": doc.manual_url.unwrap_or_default(),
                 "updated_at": doc.updated_at,
                 "secondaries": secondaries_json,
@@ -2578,6 +4128,7 @@ fn render_devices_page(
                 "matter_fabrics": dev_matter_fabrics,
                 "status": status,
                 "is_active": is_active,
+                "is_ignored": is_dev_ignored,
                 "was_ever_active": was_ever_active,
                 "sources": sources,
                 "first_seen": first_seen,
@@ -2615,8 +4166,9 @@ fn render_devices_page(
                 let web_url = device.metadata.get("web_url").cloned();
 
                 let doc_key = if !mac.is_empty() { mac.clone() } else { device.device_id.clone() };
+                let mac_lower = mac.to_lowercase();
                 let doc = docs.get(&doc_key)
-                    .or_else(|| if !mac.is_empty() { docs.get(&mac) } else { None })
+                    .or_else(|| if !mac.is_empty() { docs.get(&mac).or_else(|| docs.get(&mac_lower)) } else { None })
                     .or_else(|| docs.get(&device.device_id))
                     .cloned()
                     .unwrap_or_default();
@@ -2640,22 +4192,81 @@ fn render_devices_page(
 
                 let mut iface_badges = String::new();
                 if !udev.secondary_interfaces.is_empty() {
+                    let mut has_lan = false;
+                    let mut has_wlan = false;
+                    let mut has_ble = false;
+
+                    let check_dev = |d: &DeviceRecord, is_secondary: bool, lan: &mut bool, wlan: &mut bool, ble: &mut bool| {
+                        let proto = d.metadata.get("protocol").map(|s| s.as_str()).unwrap_or("");
+                        let src = d.metadata.get("source").map(|s| s.as_str()).unwrap_or("");
+                        let iface = d.metadata.get("interface").map(|s| s.as_str()).unwrap_or("");
+                        let name_lower = d.display_name.to_lowercase();
+                        let host_lower = d.metadata.get("hostname").map(|h| h.to_lowercase()).unwrap_or_default();
+
+                        let is_ble_dev = proto == "ble"
+                            || src == "mobile-ble"
+                            || src == "mobile-scout"
+                            || src == "bthome"
+                            || d.device_id.starts_with("mobile-ble-");
+
+                        if is_ble_dev {
+                            *ble = true;
+                        } else if iface == "wlan" || iface == "wifi"
+                            || name_lower.contains("wlan") || host_lower.contains("wlan")
+                            || name_lower.contains("wifi") || host_lower.contains("wifi")
+                            || name_lower.contains("-2") || host_lower.contains("-2")
+                            || d.kind == "smart-plug" || d.kind == "tablet" || d.kind == "phone" || d.kind == "wearable"
+                            || cat.key == "smart-plug" || cat.key == "tablet" || cat.key == "phone" || cat.key == "wearable"
+                            || name_lower.contains("plug")
+                            || name_lower.contains("plus1")
+                            || name_lower.contains("ipad")
+                            || name_lower.contains("iphone")
+                            || host_lower.contains("ipad")
+                            || host_lower.contains("iphone")
+                            || is_secondary
+                        {
+                            *wlan = true;
+                        } else {
+                            *lan = true;
+                        }
+                    };
+
+                    check_dev(device, false, &mut has_lan, &mut has_wlan, &mut has_ble);
+                    for sec in &udev.secondary_interfaces {
+                        check_dev(sec, true, &mut has_lan, &mut has_wlan, &mut has_ble);
+                    }
+
+                    let mut parts = Vec::new();
+                    if has_lan { parts.push("LAN"); }
+                    if has_wlan { parts.push("WLAN"); }
+                    if has_ble { parts.push("BLE"); }
+                    if parts.is_empty() { parts.push("Multi"); }
+
+                    let badge_label = parts.join(" + ");
+                    let total_count = udev.secondary_interfaces.len() + 1;
+
                     iface_badges.push_str(&format!(
-                        r#" <span class="badge badge-dual" title="Multi-interface device ({} interfaces)">LAN + WLAN ({})</span>"#,
-                        udev.secondary_interfaces.len() + 1,
-                        udev.secondary_interfaces.len() + 1
+                        r#" <span class="badge badge-dual" title="Multi-interface device ({total_count} interfaces)">{badge_label} ({total_count})</span>"#
                     ));
                 }
 
                 let is_zigbee = device.metadata.get("protocol").map(|s| s.as_str()) == Some("zigbee")
                     || device.module_id == "philips-hue"
                     || device.metadata.get("source").map(|s| s.as_str()) == Some("philips-hue");
+                let is_ble = device.metadata.get("protocol").map(|s| s.as_str()) == Some("ble")
+                    || device.module_id == "bthome"
+                    || device.metadata.get("source").map(|s| s.as_str()) == Some("bthome")
+                    || device.metadata.get("source").map(|s| s.as_str()) == Some("mobile-ble");
                 let ip_display = if ip.is_empty() || ip == "Layer 2" || ip == "-" {
                     if is_zigbee {
                         let gw = device.metadata.get("bridge_ip").or_else(|| device.metadata.get("gateway")).map(|s| s.as_str()).unwrap_or("Hue Bridge");
                         format!("Zigbee (via {gw})")
-                    } else {
+                    } else if is_ble {
+                        "Bluetooth LE".to_string()
+                    } else if cat.key == "switch" {
                         "Layer 2 (Unmanaged)".to_string()
+                    } else {
+                        "Non-IP Device".to_string()
                     }
                 } else {
                     ip.clone()
@@ -2745,7 +4356,7 @@ fn render_devices_page(
                         _ => (s, "#64748b"),
                     };
                     scanner_badges.push_str(&format!(
-                        r#" <span class="badge" style="background:{bg_color}; color:#fff; font-size:9px; padding:1px 4px; border-radius:3px; opacity:0.85; margin-left:3px;" title="Scanner: {s}">{badge_text}</span>"#
+                        r#" <span class="badge" style="background:{bg_color}; color:#fff; font-size:9px; padding:1px 4px; border-radius:3px; opacity:0.85; margin-left:3px;" title="Interface: {s}">{badge_text}</span>"#
                     ));
                 }
 
@@ -2773,8 +4384,12 @@ fn render_devices_page(
                         )
                     } else if is_zigbee {
                         r#"<span class="badge" style="background:#fef3c7; color:#92400e; font-size:10px; padding:2px 6px; border:1px solid #fde68a;" title="Zigbee Gerät nicht erreichbar">Offline</span>"#.to_string()
-                    } else {
+                    } else if is_ble {
+                        r#"<span class="badge" style="background:#e0f2fe; color:#0369a1; font-size:10px; padding:2px 6px; border:1px solid #bae6fd;" title="Bluetooth LE Gerät nicht in Reichweite">Offline</span>"#.to_string()
+                    } else if cat.key == "switch" {
                         r#"<span class="badge" style="background:#f1f5f9; color:#94a3b8; font-size:11px; padding:3px 6px; border:1px solid #e2e8f0;" title="Reines Layer-2-Gerät ohne IP-Adresse">L2 Switch</span>"#.to_string()
+                    } else {
+                        r#"<span class="badge" style="background:#f1f5f9; color:#94a3b8; font-size:11px; padding:3px 6px; border:1px solid #e2e8f0;" title="Gerät ohne eigene IP-Adresse">No IP</span>"#.to_string()
                     };
                     if !light_toggle_btn.is_empty() {
                         format!(r#"<div style="display:inline-flex; gap:6px; justify-content:flex-end; align-items:center;">{light_toggle_btn}{ping_btn}</div>"#)
@@ -2789,20 +4404,47 @@ fn render_devices_page(
                     web_button
                 };
 
+                let is_dev_ignored = ignored_store.is_ignored(&device.device_id)
+                    || (!mac.is_empty() && ignored_store.is_ignored(&mac));
+                let ignored_badge = if is_dev_ignored {
+                    r#" <span class="badge" style="background:#fee2e2; color:#b91c1c; font-size:10px; border:1px solid #fca5a5; padding:1px 5px;" title="Nachbargerät / Ignoriert">🚫 Ignoriert</span>"#
+                } else {
+                    ""
+                };
+
+                let dev_room = doc.room.as_deref().or_else(|| device.metadata.get("room").map(|s| s.as_str())).unwrap_or("").trim();
+                let room_rec = if !dev_room.is_empty() {
+                    rooms.iter().find(|r| r.name.eq_ignore_ascii_case(dev_room))
+                } else {
+                    None
+                };
+                let dev_floor = room_rec.and_then(|r| r.floor.as_deref()).unwrap_or_else(|| deduce_floor_from_name(dev_room).unwrap_or(""));
+                let room_badge = if !dev_room.is_empty() {
+                    let icon = room_rec.and_then(|r| r.icon.as_deref()).unwrap_or("🚪");
+                    format!(r#" <span class="badge" style="background:#e0e7ff; color:#3730a3; font-size:10px; padding:1px 5px; border-radius:3px; margin-left:3px;" title="Raum: {dev_room}">{} {}</span>"#, icon, dev_room)
+                } else {
+                    String::new()
+                };
+
                 format!(
-                    r#"<tr class="device-item" data-id="{}" data-status="{}" data-active="{}" data-sources="{}" onclick="selectDevice('{}')">
-                        <td>{}<strong class="dev-display-name">{}</strong>{}{}{}<br><small style="color:var(--muted)">{} &bull; {}</small>{}</td>
+                    r#"<tr class="device-item" data-id="{}" data-status="{}" data-active="{}" data-ignored="{}" data-sources="{}" data-room="{}" data-floor="{}" onclick="selectDevice('{}')">
+                        <td>{}<strong class="dev-display-name">{}</strong>{}{}{}{}{}<br><small style="color:var(--muted)">{} &bull; {}</small>{}</td>
                         <td>{}</td>
                         <td style="text-align:right;">{}</td>
                     </tr>"#,
                     device.device_id,
                     status_val,
                     is_active,
+                    is_dev_ignored,
                     dev_sources_str,
+                    dev_room,
+                    dev_floor,
                     device.device_id,
                     status_dot,
                     effective_display_name,
                     offline_badge,
+                    ignored_badge,
+                    room_badge,
                     doc_icon,
                     matter_badges,
                     device.device_id,
@@ -2841,14 +4483,35 @@ fn render_devices_page(
         ));
     }
 
+    let client_rooms_json = serde_json::to_string(rooms).unwrap_or_else(|_| "[]".to_string());
+    let client_govee_json = serde_json::to_string(govee_states).unwrap_or_else(|_| "{}".to_string());
+    let mut room_filter_options = String::from(r#"<option value="all">Alle Räume</option><option value="unassigned">-- Ohne Raum --</option>"#);
+    let mut floor_groups: std::collections::BTreeMap<String, Vec<&RoomRecord>> = std::collections::BTreeMap::new();
+    for r in rooms {
+        let f = r.floor.clone().unwrap_or_else(|| "Sonstige".to_string());
+        floor_groups.entry(f).or_default().push(r);
+    }
+    for (floor, f_rooms) in &floor_groups {
+        room_filter_options.push_str(&format!(r#"<optgroup label="{}">"#, floor));
+        for r in f_rooms {
+            let icon = r.icon.as_deref().unwrap_or("📍");
+            room_filter_options.push_str(&format!(r#"<option value="{}">{} {}</option>"#, r.name, icon, r.name));
+        }
+        room_filter_options.push_str("</optgroup>");
+    }
+
     let script = format!(
         r#"
     <script>
     const allDevices = {};
     const allProducts = {};
+    let allRooms = {};
+    const allGoveeStates = {};
     let currentCategory = 'all';
     let currentStatusFilter = 'all';
     let currentScannerFilter = 'all';
+    let currentRoomFilter = 'all';
+    let currentFloorFilter = 'all';
     let selectedDeviceId = null;
 
     function selectCategory(cat, el) {{
@@ -2867,6 +4530,16 @@ fn render_devices_page(
 
     function setScannerFilter(sc) {{
         currentScannerFilter = sc.toLowerCase();
+        filterDevices();
+    }}
+
+    function setRoomFilter(r) {{
+        currentRoomFilter = (r || 'all').toLowerCase();
+        filterDevices();
+    }}
+
+    function setFloorFilter(f) {{
+        currentFloorFilter = (f || 'all').toLowerCase();
         filterDevices();
     }}
 
@@ -2913,7 +4586,15 @@ fn render_devices_page(
                 const text = row.innerText.toLowerCase();
                 const matchesSearch = !q || text.includes(q);
                 const status = row.getAttribute('data-status') || 'active';
-                const matchesStatus = (currentStatusFilter === 'all' || currentStatusFilter === status);
+                const isIgnored = row.getAttribute('data-ignored') === 'true';
+
+                let matchesStatus = false;
+                if (currentStatusFilter === 'ignored') {{
+                    matchesStatus = isIgnored;
+                }} else {{
+                    matchesStatus = !isIgnored && (currentStatusFilter === 'all' || currentStatusFilter === status);
+                }}
+
                 const rowSources = (row.getAttribute('data-sources') || '').toLowerCase();
                 const matchesScanner = (currentScannerFilter === 'all'
                     || rowSources.includes(currentScannerFilter)
@@ -2921,9 +4602,24 @@ fn render_devices_page(
                     || (currentScannerFilter === 'matter' && rowSources.includes('matter-mdns'))
                     || (currentScannerFilter === 'bthome' && (rowSources.includes('bthome') || rowSources.includes('shelly-gateway')))
                     || (currentScannerFilter === 'shelly-gateway' && rowSources.includes('shelly-gateway'))
-                    || (currentScannerFilter === 'philips-hue' && (rowSources.includes('philips-hue') || rowSources.includes('hue'))));
+                    || (currentScannerFilter === 'philips-hue' && (rowSources.includes('philips-hue') || rowSources.includes('hue')))
+                    || (currentScannerFilter === 'mobile-scout' && rowSources.includes('mobile-scout')));
 
-                if (matchesSearch && matchesStatus && matchesScanner) {{
+                const rowRoom = (row.getAttribute('data-room') || '').toLowerCase();
+                const rowFloor = (row.getAttribute('data-floor') || '').toLowerCase();
+
+                let matchesRoom = false;
+                if (currentRoomFilter === 'all') {{
+                    matchesRoom = true;
+                }} else if (currentRoomFilter === 'unassigned') {{
+                    matchesRoom = (rowRoom === '');
+                }} else {{
+                    matchesRoom = (rowRoom === currentRoomFilter);
+                }}
+
+                let matchesFloor = (currentFloorFilter === 'all' || rowFloor === currentFloorFilter);
+
+                if (matchesSearch && matchesStatus && matchesScanner && matchesRoom && matchesFloor) {{
                     row.style.display = '';
                     visibleRows++;
                 }} else {{
@@ -3097,10 +4793,37 @@ fn render_devices_page(
         `;
 
         // Secondary / Linked Interfaces
-        let primaryIpDisplay = (!dev.ip || dev.ip === 'Layer 2' || dev.ip === '-') ? 'Layer 2 (Unmanaged)' : dev.ip;
+        let isZigbee = dev.protocol === 'zigbee' || (dev.sources && dev.sources.includes('philips-hue')) || (dev.metadata && (dev.metadata.protocol === 'zigbee' || dev.metadata.source === 'philips-hue'));
+        let isBle = (dev.sources && (dev.sources.includes('bthome') || dev.sources.includes('mobile-ble'))) || dev.protocol === 'ble';
+        let bridgeIp = (dev.metadata && (dev.metadata.bridge_ip || dev.metadata.gateway)) || '';
+
+        function formatDevIp(rawIp) {{
+            if (rawIp && rawIp !== 'Layer 2' && rawIp !== '-' && rawIp.trim() !== '' && !rawIp.includes('(')) {{
+                return rawIp;
+            }}
+            if (isZigbee) {{
+                return bridgeIp ? `Zigbee (via ${{bridgeIp}})` : 'Zigbee Mesh';
+            }}
+            if (isBle) {{
+                return 'Bluetooth LE (BLE)';
+            }}
+            if (dev.category === 'switch') {{
+                return 'Layer 2 (Unmanaged)';
+            }}
+            return 'Non-IP Device';
+        }}
+
+        let isPrimaryBle = isBle || (dev.sources && dev.sources.includes('ble')) || dev.device_id.startsWith('mobile-ble-');
+        let devNameLow = dev.display_name.toLowerCase();
+        let isWlan = devNameLow.includes('wlan') || devNameLow.includes('wifi') || dev.display_name.endsWith('-2')
+            || dev.category === 'tablet' || dev.category === 'phone' || dev.category === 'smart-plug' || dev.category === 'wearable'
+            || devNameLow.includes('ipad') || devNameLow.includes('iphone') || devNameLow.includes('plug') || devNameLow.includes('plus1');
+        let primaryTypeLabel = isPrimaryBle ? 'Bluetooth LE' : (isWlan ? 'WLAN' : 'LAN/Main');
+        let primaryTypeIcon = isPrimaryBle ? '🔵' : (primaryTypeLabel === 'WLAN' ? '📶' : '🔌');
+        let primaryIpDisplay = formatDevIp(dev.ip);
         let ifacesHtml = `
             <div class="iface-card">
-                <strong>Primary Interface (LAN/Main)</strong><br>
+                <strong>${{primaryTypeIcon}} Primary Interface (${{primaryTypeLabel}})</strong><br>
                 <code>${{primaryIpDisplay}}</code> ${{dev.mac ? '&bull; <small>' + dev.mac + '</small>' : ''}}<br>
                 <small style="color:var(--muted)">${{dev.vendor || 'Unknown Vendor'}} ${{dev.hostname ? '&bull; ' + dev.hostname : ''}}</small>
             </div>
@@ -3108,15 +4831,24 @@ fn render_devices_page(
 
         if (dev.secondaries && dev.secondaries.length > 0) {{
             dev.secondaries.forEach(sec => {{
-                let secIpDisplay = (!sec.ip || sec.ip === 'Layer 2' || sec.ip === '-') ? 'Layer 2 (Unmanaged)' : sec.ip;
+                let isSecBle = (sec.protocol === 'ble') || (sec.source === 'mobile-scout') || (sec.source === 'mobile-ble') || sec.device_id.startsWith('mobile-ble-') || sec.ip === 'Bluetooth LE' || !sec.ip || sec.ip === '-';
+                let secIpDisplay = isSecBle ? 'Bluetooth LE' : formatDevIp(sec.ip);
+                let secTitle = isSecBle ? 'Linked Interface (Bluetooth LE)' : 'Linked Interface (WLAN/Secondary)';
+                let secIcon = isSecBle ? '🔵' : '📶';
+                let secMeta = sec.metadata || {{}};
+                let extraBadges = '';
+                if (sec.rssi || secMeta.rssi) extraBadges += ` &bull; <small>📶 ${{sec.rssi || secMeta.rssi}} dBm</small>`;
+                if (sec.scout || secMeta.scout) extraBadges += ` &bull; <small>📱 ${{escapeHtml(sec.scout || secMeta.scout)}}</small>`;
+                if (secMeta.battery) extraBadges += ` &bull; <small>🔋 ${{secMeta.battery}}%</small>`;
+
                 ifacesHtml += `
                     <div class="iface-card">
                         <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <strong>Linked Interface (WLAN/Secondary)</strong>
-                            <button class="btn-sm" style="color:var(--status-red); border:none; padding:2px;" onclick="unlinkInterface('${{dev.device_id}}', '${{sec.device_id}}')">Unlink</button>
+                            <strong>${{secIcon}} ${{secTitle}}</strong>
+                            <button class="btn-sm" style="color:var(--status-red); border:none; padding:2px; cursor:pointer;" onclick="unlinkInterface('${{dev.device_id}}', '${{sec.device_id}}')">Unlink</button>
                         </div>
-                        <code>${{secIpDisplay}}</code> ${{sec.mac ? '&bull; <small>' + sec.mac + '</small>' : ''}}<br>
-                        <small style="color:var(--muted)">${{sec.vendor || 'Unknown Vendor'}} ${{sec.hostname ? '&bull; ' + sec.hostname : ''}}</small>
+                        <code>${{secIpDisplay}}</code> ${{sec.mac ? '&bull; <small>' + sec.mac + '</small>' : ''}}${{extraBadges}}<br>
+                        <small style="color:var(--muted)">${{escapeHtml(sec.name || sec.vendor || 'Secondary Device')}} ${{sec.hostname ? '&bull; ' + escapeHtml(sec.hostname) : ''}}</small>
                     </div>
                 `;
             }});
@@ -3125,16 +4857,50 @@ fn render_devices_page(
         // Candidate merge box
         let candidateBox = '';
         if (dev.candidate) {{
+            let isCandBle = (dev.candidate.protocol === 'ble') || (dev.candidate.source === 'mobile-scout') || (dev.candidate.source === 'mobile-ble') || dev.candidate.device_id.startsWith('mobile-ble-') || !dev.candidate.ip || dev.candidate.ip === '-';
+            let isCurrentBle = isPrimaryBle;
+            let mergeTypeLabel = (isCandBle || isCurrentBle) ? 'WLAN + BLE' : 'LAN + WLAN';
+            let primaryArg = (isCurrentBle && !isCandBle) ? dev.candidate.device_id : dev.device_id;
+            let linkedArg = (isCurrentBle && !isCandBle) ? dev.device_id : dev.candidate.device_id;
+            let candIpDisplay = (dev.candidate.ip && dev.candidate.ip !== '-') ? dev.candidate.ip : 'Bluetooth LE';
+
             candidateBox = `
                 <div class="merge-box">
-                    <strong>💡 Dual-Homed Candidate:</strong><br>
-                    <span>${{dev.candidate.name}} (<code>${{dev.candidate.ip}}</code>)</span><br>
-                    <button class="btn btn-sm btn-primary" style="margin-top:6px;" onclick="linkInterface('${{dev.device_id}}', '${{dev.candidate.device_id}}')">
-                        🔗 Merge Interfaces (LAN + WLAN)
+                    <strong>💡 Merge Candidate (${{mergeTypeLabel}}):</strong><br>
+                    <span>${{escapeHtml(dev.candidate.name)}} (<code>${{escapeHtml(candIpDisplay)}}</code>)</span><br>
+                    <button class="btn btn-sm btn-primary" style="margin-top:6px;" onclick="linkInterface('${{escapeAttr(primaryArg)}}', '${{escapeAttr(linkedArg)}}')">
+                        🔗 Merge Interfaces (${{mergeTypeLabel}})
                     </button>
                 </div>
             `;
         }}
+
+        // Manual interface link dropdown
+        let currentSecondaryIds = (dev.secondaries || []).map(s => s.device_id);
+        let linkableOptions = allDevices
+            .filter(other => other.device_id !== dev.device_id && !currentSecondaryIds.includes(other.device_id))
+            .map(other => {{
+                let otherIsBle = (other.sources && other.sources.includes('ble')) || other.device_id.startsWith('mobile-ble-');
+                let otherIp = (other.ip && other.ip !== '-') ? other.ip : (otherIsBle ? 'Bluetooth LE' : 'No IP');
+                return `<option value="${{escapeAttr(other.device_id)}}">${{escapeHtml(other.display_name)}} (${{escapeHtml(otherIp)}})</option>`;
+            }}).join('');
+
+        let manualLinkHtml = `
+            <div style="margin-top:10px; padding-top:10px; border-top:1px dashed var(--border);">
+                <label style="font-size:11px; font-weight:600; color:var(--muted); display:block; margin-bottom:4px;">
+                    🔗 Weiteres Interface manuell verknüpfen:
+                </label>
+                <div style="display:flex; gap:6px;">
+                    <select id="insp-manual-link-select" class="form-control" style="font-size:11px; flex:1; cursor:pointer;">
+                        <option value="">-- Gerät als Interface auswählen --</option>
+                        ${{linkableOptions}}
+                    </select>
+                    <button type="button" class="btn btn-sm" style="background:var(--badge-bg); color:var(--text); border:1px solid var(--border); font-size:11px; cursor:pointer;" onclick="linkManualInterface('${{escapeAttr(dev.device_id)}}')">
+                        Verknüpfen
+                    </button>
+                </div>
+            </div>
+        `;
 
         let statusBadge = '';
         if (dev.is_active) {{
@@ -3149,9 +4915,10 @@ fn render_devices_page(
             `;
         }} else if (dev.status === 'archive') {{
             let hasValidIp = dev.ip && dev.ip !== 'Layer 2' && dev.ip !== '-' && dev.ip.trim() !== '' && !dev.ip.includes('(');
+            let badgeLabel = isZigbee ? 'Zigbee' : (isBle ? 'BLE' : (dev.category === 'switch' ? 'L2 Switch' : 'No IP'));
             let pingBtnHtml = hasValidIp
                 ? `<button type="button" class="btn-sm btn-ping" style="font-size:11px; padding:2px 8px; cursor:pointer;" onclick="pingDevice('${{dev.device_id}}', this)" title="Ping device to check reachability">📡 Ping</button>`
-                : `<span class="badge" style="background:#f1f5f9; color:#94a3b8; font-size:10px; padding:2px 6px; border:1px solid #e2e8f0;" title="Reines Layer-2-Gerät ohne IP">L2 Switch</span>`;
+                : `<span class="badge" style="background:#f1f5f9; color:#94a3b8; font-size:10px; padding:2px 6px; border:1px solid #e2e8f0;" title="Gerät ohne direkte IP-Adresse">${{badgeLabel}}</span>`;
             statusBadge = `
                 <div style="display:flex; align-items:center; justify-content:space-between; margin-top:8px; padding:6px 10px; background:#f8fafc; border:1px dashed #cbd5e1; border-radius:6px;">
                     <div style="display:flex; align-items:center; gap:6px;">
@@ -3169,9 +4936,10 @@ fn render_devices_page(
             `;
         }} else {{
             let hasValidIp = dev.ip && dev.ip !== 'Layer 2' && dev.ip !== '-' && dev.ip.trim() !== '' && !dev.ip.includes('(');
+            let badgeLabel = isZigbee ? 'Zigbee' : (isBle ? 'BLE' : (dev.category === 'switch' ? 'L2 Switch' : 'No IP'));
             let pingBtnHtml = hasValidIp
                 ? `<button type="button" class="btn-sm btn-ping" style="font-size:11px; padding:2px 8px; cursor:pointer;" onclick="pingDevice('${{dev.device_id}}', this)" title="Ping device to check reachability">📡 Ping</button>`
-                : `<span class="badge" style="background:#f1f5f9; color:#94a3b8; font-size:10px; padding:2px 6px; border:1px solid #e2e8f0;" title="Reines Layer-2-Gerät ohne IP">L2 Switch</span>`;
+                : `<span class="badge" style="background:#f1f5f9; color:#94a3b8; font-size:10px; padding:2px 6px; border:1px solid #e2e8f0;" title="Gerät ohne direkte IP-Adresse">${{badgeLabel}}</span>`;
             statusBadge = `
                 <div style="display:flex; align-items:center; justify-content:space-between; margin-top:8px; padding:6px 10px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:6px;">
                     <div style="display:flex; align-items:center; gap:6px;">
@@ -3204,23 +4972,23 @@ fn render_devices_page(
         `;
 
         const sourceMap = {{
-            'bthome': {{ name: 'BTHome BLE Sensor', icon: '📶', desc: 'Bluetooth Low Energy V2 Sensor-Protokoll' }},
+            'bthome': {{ name: 'BTHome BLE Interface', icon: '📶', desc: 'Bluetooth Low Energy V2 Sensor-Protokoll' }},
             'shelly-gateway': {{ name: 'Shelly BLE Gateway', icon: '📡', desc: 'Lokales Shelly Gen3/Gen2 Outbound WebSocket Gateway' }},
             'bthome-v2': {{ name: 'BTHome V2', icon: '📶', desc: 'BTHome Version 2 BLE Broadcast' }},
-            'ble': {{ name: 'Bluetooth LE', icon: '🔵', desc: 'Bluetooth Low Energy Advertisement' }},
-            'arp': {{ name: 'ARP Scanner', icon: '📡', desc: 'MAC-Adresse & IP-Zuordnung über Layer-2 ARP' }},
-            'ping': {{ name: 'ICMP/TCP Ping', icon: '⚡', desc: 'Aktive IP-Erreichbarkeit' }},
-            'mdns': {{ name: 'mDNS / Bonjour', icon: '🔍', desc: 'Hostname & lokale Netzwerkdienste' }},
-            'ssdp': {{ name: 'SSDP / UPnP', icon: '🌐', desc: 'UPnP Device Description & Hersteller-Information' }},
-            'fritzbox-tr064': {{ name: 'FRITZ!Box TR-064', icon: '🔀', desc: 'Router-Topologie, L2-Switch & DHCP-Eintrag' }},
-            'matter': {{ name: 'Matter Operational', icon: '✨', desc: 'Matter Node & Fabric-Information' }},
-            'matter-mdns': {{ name: 'Matter DNS-SD', icon: '✨', desc: 'Matter Operational Discovery' }},
-            'home-assistant': {{ name: 'Home Assistant', icon: '🏠', desc: 'Home Assistant Hub / API' }},
+            'ble': {{ name: 'Bluetooth LE Interface', icon: '🔵', desc: 'Bluetooth Low Energy Advertisement' }},
+            'arp': {{ name: 'ARP Interface', icon: '📡', desc: 'MAC-Adresse & IP-Zuordnung über Layer-2 ARP' }},
+            'ping': {{ name: 'ICMP/TCP Ping Interface', icon: '⚡', desc: 'Aktive IP-Erreichbarkeit' }},
+            'mdns': {{ name: 'mDNS / Bonjour Interface', icon: '🔍', desc: 'Hostname & lokale Netzwerkdienste' }},
+            'ssdp': {{ name: 'SSDP / UPnP Interface', icon: '🌐', desc: 'UPnP Device Description & Hersteller-Information' }},
+            'fritzbox-tr064': {{ name: 'FRITZ!Box TR-064 Interface', icon: '🔀', desc: 'Router-Topologie, L2-Switch & DHCP-Eintrag' }},
+            'matter': {{ name: 'Matter Operational Interface', icon: '✨', desc: 'Matter Node & Fabric-Information' }},
+            'matter-mdns': {{ name: 'Matter DNS-SD Interface', icon: '✨', desc: 'Matter Operational Discovery' }},
+            'home-assistant': {{ name: 'Home Assistant Interface', icon: '🏠', desc: 'Home Assistant Hub / API' }},
             'mdns_homeassistant': {{ name: 'Home Assistant mDNS', icon: '🏠', desc: 'Home Assistant Service Discovery' }},
-            'http-probe': {{ name: 'HTTP Web Probe', icon: '🌐', desc: 'Weboberfläche auf Standardports' }},
+            'http-probe': {{ name: 'HTTP Web Interface', icon: '🌐', desc: 'Weboberfläche auf Standardports' }},
             'configuration': {{ name: 'Konfiguration', icon: '⚙️', desc: 'Statisch konfigurierter Eintrag' }},
-            'philips-hue': {{ name: 'Philips Hue', icon: '💡', desc: 'Philips Hue Zigbee Bridge Leuchte / Sensor' }},
-            'hue': {{ name: 'Philips Hue', icon: '💡', desc: 'Philips Hue Zigbee Bridge Leuchte / Sensor' }},
+            'philips-hue': {{ name: 'Philips Hue Bridge Interface', icon: '💡', desc: 'Philips Hue Zigbee Bridge Leuchte / Sensor' }},
+            'hue': {{ name: 'Philips Hue Bridge Interface', icon: '💡', desc: 'Philips Hue Zigbee Bridge Leuchte / Sensor' }},
             'documentation': {{ name: 'Benutzer-Notiz', icon: '📝', desc: 'Dokumentierter Geräteeintrag' }}
         }};
 
@@ -3240,13 +5008,16 @@ fn render_devices_page(
 
         let scannerBox = `
             <div class="inspector-sec" style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:8px 10px; margin-top:8px;">
-                <div style="font-size:11px; font-weight:600; color:var(--muted); margin-bottom:4px;">📡 Entdeckt durch Scanner (${{devSources.length}})</div>
+                <div style="font-size:11px; font-weight:600; color:var(--muted); margin-bottom:4px;">🔌 Interfaces (${{devSources.length}})</div>
                 ${{sourcesItems}}
             </div>
         `;
 
         let telemetryBox = '';
-        if (dev.metadata && (dev.metadata.battery || dev.metadata.button_event || dev.metadata.gateway || dev.metadata.shelly_gateway || dev.metadata.protocol || dev.metadata.temperature_c || dev.metadata.contact_state || dev.metadata.rssi)) {{
+        const isBTHomeDevice = devSources.includes('bthome') || devSources.includes('bthome-v2') || (dev.metadata && (dev.metadata.source === 'bthome' || !!dev.metadata.shelly_gateway)) || dev.device_id.startsWith('bthome-');
+        const isHueDevice = isZigbee || devSources.includes('philips-hue') || devSources.includes('hue') || (dev.metadata && (dev.metadata.source === 'philips-hue' || dev.metadata.bridge_ip || dev.metadata.hue_light_id)) || dev.device_id.startsWith('hue-');
+
+        if (dev.metadata && (dev.metadata.battery || dev.metadata.button_event || dev.metadata.gateway || dev.metadata.shelly_gateway || dev.metadata.protocol || dev.metadata.temperature_c || dev.metadata.humidity_pct || dev.metadata.illuminance_lux || dev.metadata.contact_state || dev.metadata.rssi)) {{
             let rows = [];
             if (dev.metadata.button_event) {{
                 let btnName = dev.metadata.button_event;
@@ -3278,18 +5049,44 @@ fn render_devices_page(
             if (dev.metadata.rssi) {{
                 rows.push(`<div><span style="color:var(--muted);">Signalstärke:</span> <strong>📶 ${{dev.metadata.rssi}} dBm</strong></div>`);
             }}
-            if (dev.metadata.shelly_gateway || dev.metadata.gateway) {{
+            if (isBTHomeDevice && (dev.metadata.shelly_gateway || dev.metadata.gateway)) {{
                 let gw = dev.metadata.shelly_gateway || dev.metadata.gateway;
-                rows.push(`<div><span style="color:var(--muted);">Shelly Gateway:</span> <code>${{gw}}</code></div>`);
+                rows.push(`<div><span style="color:var(--muted);">Shelly BLE Gateway:</span> <code>${{gw}}</code></div>`);
+            }} else if (isHueDevice && (dev.metadata.bridge_ip || dev.metadata.gateway)) {{
+                let gw = dev.metadata.bridge_ip || dev.metadata.gateway;
+                rows.push(`<div><span style="color:var(--muted);">Hue Bridge:</span> <code>${{gw}}</code></div>`);
+            }} else if (dev.metadata.gateway) {{
+                rows.push(`<div><span style="color:var(--muted);">Gateway:</span> <code>${{dev.metadata.gateway}}</code></div>`);
             }}
             if (dev.metadata.protocol) {{
-                rows.push(`<div><span style="color:var(--muted);">Protokoll:</span> <span class="badge" style="background:#e2e8f0; color:#334155; font-size:10px; padding:1px 5px; border-radius:3px;">${{dev.metadata.protocol}}</span></div>`);
+                let proto = dev.metadata.protocol;
+                let badgeStyle = "background:#e2e8f0; color:#334155; font-size:10px; padding:1px 5px; border-radius:3px;";
+                if (proto.toLowerCase() === 'zigbee') {{
+                    badgeStyle = "background:rgba(234,179,8,0.2); color:#b45309; font-weight:600; font-size:10px; padding:1px 5px; border-radius:3px;";
+                }} else if (proto.toLowerCase().includes('bthome') || proto.toLowerCase().includes('ble')) {{
+                    badgeStyle = "background:rgba(59,130,246,0.15); color:#2563eb; font-weight:600; font-size:10px; padding:1px 5px; border-radius:3px;";
+                }}
+                rows.push(`<div><span style="color:var(--muted);">Protokoll:</span> <span class="badge" style="${{badgeStyle}}">${{proto}}</span></div>`);
+            }}
+
+            let boxTitle = '📶 BTHome Live Telemetrie';
+            let boxBorderLeft = 'var(--primary)';
+            let titleColor = 'var(--primary)';
+
+            if (isHueDevice) {{
+                boxTitle = '💡 Philips Hue / Zigbee Verbindung';
+                boxBorderLeft = '#eab308';
+                titleColor = '#b45309';
+            }} else if (!isBTHomeDevice) {{
+                boxTitle = '📊 Telemetrie & Verbindung';
+                boxBorderLeft = '#64748b';
+                titleColor = 'var(--text)';
             }}
 
             telemetryBox = `
-                <div class="inspector-sec" style="background:var(--bg); border:1px solid var(--border); border-left:3px solid var(--primary); border-radius:6px; padding:8px 10px; margin-top:8px;">
-                    <div style="font-size:11px; font-weight:700; color:var(--primary); margin-bottom:6px; display:flex; align-items:center; gap:6px;">
-                        <span>📶 BTHome Live Telemetrie</span>
+                <div class="inspector-sec" style="background:var(--bg); border:1px solid var(--border); border-left:3px solid ${{boxBorderLeft}}; border-radius:6px; padding:8px 10px; margin-top:8px;">
+                    <div style="font-size:11px; font-weight:700; color:${{titleColor}}; margin-bottom:6px; display:flex; align-items:center; gap:6px;">
+                        <span>${{boxTitle}}</span>
                     </div>
                     <div style="display:flex; flex-direction:column; gap:4px; font-size:11px;">
                         ${{rows.join('')}}
@@ -3299,18 +5096,21 @@ fn render_devices_page(
         }}
 
         let hueControlCard = '';
-        const isHueDevice = (dev.category === 'lighting' || dev.kind === 'lighting' || devSources.includes('philips-hue') || devSources.includes('hue') || (dev.metadata && dev.metadata.source === 'philips-hue'));
-        if (isHueDevice && dev.metadata && (dev.metadata.hue_light_id || dev.device_id.startsWith('hue-light-') || dev.metadata.on !== undefined)) {{
+        const isHueActuatorOrLight = isHueDevice && (dev.category === 'lighting' || dev.kind === 'lighting' || dev.device_id.startsWith('hue-light-') || (dev.metadata && (dev.metadata.hue_light_id || dev.metadata.on !== undefined)));
+        if (isHueActuatorOrLight && dev.metadata && (dev.metadata.hue_light_id || dev.device_id.startsWith('hue-light-') || dev.metadata.on !== undefined)) {{
             const lightId = dev.metadata.hue_light_id || dev.device_id.replace('hue-light-', '');
             const isOn = dev.metadata.on === 'true';
             const bri = dev.metadata.brightness ? `${{Math.round(parseInt(dev.metadata.brightness, 10) / 254 * 100)}}%` : '';
             const reachable = dev.metadata.reachable !== 'false';
+            const isPlug = (dev.metadata.model && dev.metadata.model.toLowerCase().includes('plug')) || (dev.display_name && (dev.display_name.toLowerCase().includes('steckdose') || dev.display_name.toLowerCase().includes('plug') || dev.display_name.toLowerCase().includes('ventilator')));
+            const cardIcon = isPlug ? '🔌' : '💡';
+            const cardTitle = isPlug ? 'Philips Hue Aktor / Steckdose' : 'Philips Hue Lampe';
             hueControlCard = `
                 <div class="inspector-sec" style="background:linear-gradient(135deg, rgba(234,179,8,0.12) 0%, rgba(245,158,11,0.05) 100%); border:1px solid rgba(234,179,8,0.35); border-radius:8px; padding:10px; margin-top:8px;">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
                         <div>
                             <div style="font-weight:700; font-size:13px; color:#b45309; display:flex; align-items:center; gap:6px;">
-                                <span>💡</span> Philips Hue Lampe
+                                <span>${{cardIcon}}</span> ${{cardTitle}}
                             </div>
                             <div style="font-size:11px; color:var(--muted); margin-top:2px;">
                                 Zustand: <strong>${{isOn ? '🟢 Eingeschaltet' : '⚪ Ausgeschaltet'}}</strong> ${{bri ? '&bull; ' + bri : ''}} ${{!reachable ? '&bull; ⚠️ Offline' : ''}}
@@ -3324,6 +5124,91 @@ fn render_devices_page(
             `;
         }}
 
+        let goveeControlCard = '';
+        let devIp = dev.ip;
+        let devSecondaries = dev.secondaries || [];
+        let goveeIp = null;
+        if (devIp && allGoveeStates[devIp]) {{
+            goveeIp = devIp;
+        }} else {{
+            for (let s of devSecondaries) {{
+                if (s.ip && allGoveeStates[s.ip]) {{
+                    goveeIp = s.ip;
+                    break;
+                }}
+            }}
+        }}
+        if (!goveeIp && devIp && (
+            (dev.hostname && dev.hostname.toLowerCase().includes('govee')) ||
+            (dev.display_name && dev.display_name.toLowerCase().includes('govee')) ||
+            (dev.vendor && dev.vendor.toLowerCase().includes('govee'))
+        )) {{
+            goveeIp = devIp;
+        }}
+
+        if (goveeIp) {{
+            const gState = allGoveeStates[goveeIp] || {{ on: false, brightness: 100, color: {{ r: 255, g: 255, b: 255 }}, color_temp_kelvin: 0 }};
+            const isOn = gState.on;
+            const bri = gState.brightness || 100;
+            const col = gState.color || {{ r: 255, g: 255, b: 255 }};
+            const colorCss = `rgb(${{col.r}}, ${{col.g}}, ${{col.b}})`;
+            const sku = gState.sku ? ` (${{escapeHtml(gState.sku)}})` : '';
+
+            goveeControlCard = `
+                <div class="inspector-sec" style="background:linear-gradient(135deg, rgba(37,99,235,0.08) 0%, rgba(59,130,246,0.04) 100%); border:1px solid rgba(37,99,235,0.3); border-radius:8px; padding:12px; margin-top:8px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                        <div>
+                            <div style="font-weight:700; font-size:13px; color:#1e40af; display:flex; align-items:center; gap:6px;">
+                                <span style="display:inline-block; width:12px; height:12px; border-radius:50%; background:${{colorCss}}; border:1px solid rgba(0,0,0,0.2);"></span>
+                                <span>💡 Govee LAN Steuerung${{sku}}</span>
+                            </div>
+                            <div style="font-size:11px; color:var(--muted); margin-top:2px;">
+                                IP: <code>${{escapeHtml(goveeIp)}}</code> &bull; UDP Port 4003 &bull; Zustand: <strong>${{isOn ? '🟢 Eingeschaltet' : '⚪ Ausgeschaltet'}}</strong>
+                            </div>
+                        </div>
+                        <button type="button" class="btn btn-sm ${{isOn ? 'btn-primary' : ''}}" style="font-size:11px; padding:4px 12px; cursor:pointer;" onclick="toggleGoveeLight('${{goveeIp}}', this)">
+                            ${{isOn ? '💡 An' : '⚪ Aus'}}
+                        </button>
+                    </div>
+
+                    <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px; font-size:12px;">
+                        <span style="font-size:11px; color:var(--muted); min-width:55px;">Helligkeit:</span>
+                        <input type="range" min="1" max="100" value="${{bri}}" style="flex:1; cursor:pointer;" onchange="setGoveeBrightness('${{goveeIp}}', this.value)" oninput="this.nextElementSibling.innerText = this.value + '%'" />
+                        <span style="min-width:35px; text-align:right; font-weight:600; font-size:11px;">${{bri}}%</span>
+                    </div>
+
+                    <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                        <span style="font-size:11px; color:var(--muted); margin-right:4px;">Presets:</span>
+                        <button type="button" class="btn-sm" style="background:#ffddaa; border:1px solid #f59e0b; font-size:10px; padding:2px 6px; cursor:pointer; border-radius:4px;" onclick="setGoveeTemp('${{goveeIp}}', 2700)" title="Warmweiß">Warm (2700K)</button>
+                        <button type="button" class="btn-sm" style="background:#fff4e6; border:1px solid #cbd5e1; font-size:10px; padding:2px 6px; cursor:pointer; border-radius:4px;" onclick="setGoveeTemp('${{goveeIp}}', 4000)" title="Neutralweiß">Neutral (4000K)</button>
+                        <button type="button" class="btn-sm" style="background:#f1f5f9; border:1px solid #cbd5e1; font-size:10px; padding:2px 6px; cursor:pointer; border-radius:4px;" onclick="setGoveeTemp('${{goveeIp}}', 6500)" title="Kaltweiß">Kalt (6500K)</button>
+                        <button type="button" class="btn-sm" style="background:#ef4444; color:#fff; border:none; font-size:10px; padding:2px 6px; cursor:pointer; border-radius:4px;" onclick="setGoveeColor('${{goveeIp}}', 255, 0, 0)">Rot</button>
+                        <button type="button" class="btn-sm" style="background:#10b981; color:#fff; border:none; font-size:10px; padding:2px 6px; cursor:pointer; border-radius:4px;" onclick="setGoveeColor('${{goveeIp}}', 0, 255, 100)">Grün</button>
+                        <button type="button" class="btn-sm" style="background:#3b82f6; color:#fff; border:none; font-size:10px; padding:2px 6px; cursor:pointer; border-radius:4px;" onclick="setGoveeColor('${{goveeIp}}', 0, 100, 255)">Blau</button>
+                        <button type="button" class="btn-sm" style="background:#8b5cf6; color:#fff; border:none; font-size:10px; padding:2px 6px; cursor:pointer; border-radius:4px;" onclick="setGoveeColor('${{goveeIp}}', 160, 32, 240)">Lila</button>
+                        <input type="color" value='#ffffff' style="width:24px; height:24px; padding:0; border:none; border-radius:4px; cursor:pointer; margin-left:auto;" title="Eigene Farbe wählen" onchange="handleGoveeCustomColor('${{goveeIp}}', this.value)" />
+                    </div>
+                </div>
+            `;
+        }}
+
+        let roomOptionsHtml = `<option value="">-- Kein Raum zugewiesen --</option>`;
+        const floorList = ['Dachgeschoss', 'Obergeschoss', 'Erdgeschoss', 'Keller', 'Außenbereich', 'Sonstige'];
+        floorList.forEach(fl => {{
+            const inFloor = allRooms.filter(r => (r.floor || 'Sonstige') === fl);
+            if (inFloor.length > 0) {{
+                roomOptionsHtml += `<optgroup label="${{fl}}">`;
+                inFloor.forEach(r => {{
+                    const isSel = (dev.room && dev.room.toLowerCase() === r.name.toLowerCase()) ? 'selected' : '';
+                    roomOptionsHtml += `<option value="${{escapeAttr(r.name)}}" ${{isSel}}>${{r.icon || '📍'}} ${{escapeHtml(r.name)}}</option>`;
+                }});
+                roomOptionsHtml += `</optgroup>`;
+            }}
+        }});
+        if (dev.room && !allRooms.some(r => r.name.toLowerCase() === dev.room.toLowerCase())) {{
+            roomOptionsHtml += `<option value="${{escapeAttr(dev.room)}}" selected>📍 ${{escapeHtml(dev.room)}} (Benutzerdefiniert)</option>`;
+        }}
+
         panel.innerHTML = `
             <div>
                 <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
@@ -3335,6 +5220,7 @@ fn render_devices_page(
                 </div>
                 ${{statusBadge}}
                 ${{hueControlCard}}
+                ${{goveeControlCard}}
                 ${{telemetryBox}}
                 ${{historyBox}}
                 ${{scannerBox}}
@@ -3352,6 +5238,7 @@ fn render_devices_page(
                 </div>
                 ${{ifacesHtml}}
                 ${{candidateBox}}
+                ${{manualLinkHtml}}
             </div>
 
             <!-- Device Identity & Documentation -->
@@ -3365,8 +5252,13 @@ fn render_devices_page(
                     <input type="text" id="insp-name" class="form-control" value="${{escapeAttr(dev.custom_name || '')}}" placeholder="${{escapeAttr(dev.display_name)}}" />
                 </div>
                 <div style="margin-bottom:8px;">
-                    <label style="font-size:11px; color:var(--muted); font-weight:600;">Raum / Standort (Room / Location)</label>
-                    <input type="text" id="insp-room" class="form-control" value="${{escapeAttr(dev.room || '')}}" placeholder="z.B. Wohnzimmer, Büro, Küche, Flur, Keller..." />
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                        <label style="font-size:11px; color:var(--muted); font-weight:600;">Raum / Standort (Room / Location)</label>
+                        <a href="javascript:void(0)" onclick="openRoomModal()" style="font-size:11px; color:var(--primary); text-decoration:none; font-weight:600;">⚙️ Räume verwalten</a>
+                    </div>
+                    <select id="insp-room" class="form-control" style="cursor:pointer;">
+                        ${{roomOptionsHtml}}
+                    </select>
                 </div>
                 <div style="margin-bottom:8px;">
                     <label style="font-size:11px; color:var(--muted); font-weight:600;">Manual / Documentation URL (Optional)</label>
@@ -3377,6 +5269,34 @@ fn render_devices_page(
                     <textarea id="insp-notes" class="form-control" placeholder="Installation location, credentials hint, firmware version...">${{escapeHtml(dev.notes)}}</textarea>
                 </div>
                 <button type="button" class="btn btn-sm btn-primary" onclick="saveInspectorNotes('${{dev.doc_key}}')">💾 Save Details</button>
+            </div>
+
+            <!-- Device Management & Privacy (Block Neighbor Devices) -->
+            <div class="inspector-sec" style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:10px; margin-top:10px;">
+                <div class="inspector-title" style="margin-bottom:6px;">
+                    <span>⚙️ Geräteverwaltung & Filter</span>
+                </div>
+                ${{dev.is_ignored ? `
+                    <div style="background:rgba(239, 68, 68, 0.08); border:1px solid rgba(239, 68, 68, 0.25); border-radius:6px; padding:8px; margin-bottom:8px; font-size:11px;">
+                        <strong style="color:var(--status-red);">🚫 Nachbargerät (Ignoriert)</strong>
+                        <div style="color:var(--muted); margin-top:2px;">Dieses Gerät ist als Nachbargerät blockiert. Signale werden verworfen und das Gerät erscheint nicht in der Standardliste.</div>
+                    </div>
+                    <button type="button" class="btn btn-sm" style="background:var(--surface); border:1px solid var(--border); font-size:11px;" onclick="unignoreDevice('${{dev.device_id}}', '${{dev.doc_key}}')">
+                        ✅ Nicht mehr ignorieren (Wiederherstellen)
+                    </button>
+                ` : `
+                    <div style="font-size:11px; color:var(--muted); margin-bottom:8px;">
+                        Signale fremder Geräte (z.B. BLE-Sensoren vom Nachbarn) können hier dauerhaft ignoriert werden:
+                    </div>
+                    <button type="button" class="btn btn-sm" style="background:#fee2e2; color:#b91c1c; border:1px solid #fca5a5; font-size:11px;" onclick="ignoreDevice('${{dev.device_id}}', '${{dev.doc_key}}', '${{escapeAttr(dev.display_name)}}')">
+                        🚫 Als Nachbargerät ignorieren
+                    </button>
+                `}}
+                <div style="margin-top:10px; padding-top:8px; border-top:1px solid var(--border);">
+                    <button type="button" class="btn btn-sm" style="color:var(--status-red); border:1px solid var(--border); font-size:11px;" onclick="forgetDevice('${{dev.device_id}}', '${{escapeAttr(dev.display_name)}}')">
+                        🗑️ Aus Verlauf löschen (Forget)
+                    </button>
+                </div>
             </div>
 
             <!-- Analyzer & Port Scan -->
@@ -3470,6 +5390,12 @@ fn render_devices_page(
                     if (titleEl) titleEl.innerText = dev.display_name;
                     const rowNameEl = document.querySelector(`tr[data-id="${{dev.device_id}}"] .dev-display-name`);
                     if (rowNameEl) rowNameEl.innerText = dev.display_name;
+                    const tr = document.querySelector(`tr[data-id="${{dev.device_id}}"]`);
+                    if (tr) {{
+                        tr.setAttribute('data-room', room);
+                        const matchedRoom = allRooms.find(r => r.name.toLowerCase() === room.toLowerCase());
+                        tr.setAttribute('data-floor', matchedRoom ? (matchedRoom.floor || '') : '');
+                    }}
                 }}
                 setTimeout(() => {{ statusEl.innerText = ''; }}, 2000);
             }} else {{
@@ -3598,6 +5524,15 @@ fn render_devices_page(
         }} catch (e) {{
             alert('Failed to unlink interfaces: ' + e);
         }}
+    }}
+
+    function linkManualInterface(primaryId) {{
+        const sel = document.getElementById('insp-manual-link-select');
+        if (!sel || !sel.value) {{
+            alert('Bitte wähle ein Gerät aus der Liste aus.');
+            return;
+        }}
+        linkInterface(primaryId, sel.value);
     }}
 
     async function runInspectorAnalyzer(deviceId, deviceName) {{
@@ -3742,6 +5677,43 @@ fn render_devices_page(
         }}
     }}
 
+    async function ignoreDevice(deviceId, docKey, name) {{
+        if (!confirm(`Möchtest du "${{name || deviceId}}" ignorieren?\n\nSignale dieses Geräts (z.B. BLE-Sensoren vom Nachbarn) werden blockiert und das Gerät wird in der Hauptliste ausgeblendet.`)) {{
+            return;
+        }}
+        try {{
+            const id = docKey || deviceId;
+            const res = await fetch('/api/devices/' + encodeURIComponent(id) + '/ignore', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ name: name, reason: 'Nachbargerät' }})
+            }});
+            if (res.ok) {{
+                window.location.reload();
+            }} else {{
+                alert('Fehler beim Ignorieren des Geräts.');
+            }}
+        }} catch (e) {{
+            alert('Netzwerkfehler: ' + e);
+        }}
+    }}
+
+    async function unignoreDevice(deviceId, docKey) {{
+        try {{
+            const id = docKey || deviceId;
+            const res = await fetch('/api/devices/' + encodeURIComponent(id) + '/unignore', {{
+                method: 'POST'
+            }});
+            if (res.ok) {{
+                window.location.reload();
+            }} else {{
+                alert('Fehler beim Wiederherstellen des Geräts.');
+            }}
+        }} catch (e) {{
+            alert('Netzwerkfehler: ' + e);
+        }}
+    }}
+
     async function toggleHueLight(lightId) {{
         try {{
             const res = await fetch('/api/hue/lights/' + encodeURIComponent(lightId) + '/toggle', {{ method: 'POST' }});
@@ -3753,6 +5725,343 @@ fn render_devices_page(
             }}
         }} catch(e) {{
             alert('Netzwerkfehler: ' + e);
+        }}
+    }}
+
+    async function toggleGoveeLight(ip, btn) {{
+        if (btn) btn.disabled = true;
+        try {{
+            const res = await fetch('/api/govee/lights/' + encodeURIComponent(ip) + '/toggle', {{ method: 'POST' }});
+            const data = await res.json();
+            if (res.ok && data.status === 'ok') {{
+                if (allGoveeStates[ip]) {{
+                    allGoveeStates[ip].on = data.on;
+                }} else {{
+                    allGoveeStates[ip] = {{ on: data.on, brightness: 100 }};
+                }}
+                const dev = allDevices.find(d => d.device_id === selectedDeviceId);
+                if (dev) renderInspector(dev);
+            }} else {{
+                alert('Govee Fehler: ' + (data.error || 'Schalten fehlgeschlagen'));
+            }}
+        }} catch(e) {{
+            alert('Govee UDP Fehler: ' + e);
+        }} finally {{
+            if (btn) btn.disabled = false;
+        }}
+    }}
+
+    async function setGoveeBrightness(ip, val) {{
+        try {{
+            const b = parseInt(val, 10);
+            await fetch('/api/govee/lights/' + encodeURIComponent(ip) + '/brightness', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ brightness: b }})
+            }});
+            if (allGoveeStates[ip]) {{
+                allGoveeStates[ip].brightness = b;
+                allGoveeStates[ip].on = true;
+            }}
+        }} catch(e) {{
+            console.error('Govee Brightness Error:', e);
+        }}
+    }}
+
+    async function setGoveeColor(ip, r, g, b) {{
+        try {{
+            await fetch('/api/govee/lights/' + encodeURIComponent(ip) + '/color', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ r: r, g: g, b: b }})
+            }});
+            if (allGoveeStates[ip]) {{
+                allGoveeStates[ip].color = {{ r: r, g: g, b: b }};
+                allGoveeStates[ip].on = true;
+            }}
+            const dev = allDevices.find(d => d.device_id === selectedDeviceId);
+            if (dev) renderInspector(dev);
+        }} catch(e) {{
+            console.error('Govee Color Error:', e);
+        }}
+    }}
+
+    async function setGoveeTemp(ip, kelvin) {{
+        try {{
+            await fetch('/api/govee/lights/' + encodeURIComponent(ip) + '/temperature', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ kelvin: kelvin }})
+            }});
+            if (allGoveeStates[ip]) {{
+                allGoveeStates[ip].color_temp_kelvin = kelvin;
+                allGoveeStates[ip].on = true;
+            }}
+            const dev = allDevices.find(d => d.device_id === selectedDeviceId);
+            if (dev) renderInspector(dev);
+        }} catch(e) {{
+            console.error('Govee Temp Error:', e);
+        }}
+    }}
+
+    function handleGoveeCustomColor(ip, hex) {{
+        if (!hex || hex.length !== 7) return;
+        const r = parseInt(hex.slice(1, 3), 16);
+        const g = parseInt(hex.slice(3, 5), 16);
+        const b = parseInt(hex.slice(5, 7), 16);
+        setGoveeColor(ip, r, g, b);
+    }}
+
+    // Room Manager Modal Functions
+    function openRoomModal() {{
+        renderModalRooms();
+        const m = document.getElementById('room-manager-modal');
+        if (m) m.style.display = 'block';
+    }}
+
+    function closeRoomModal() {{
+        const m = document.getElementById('room-manager-modal');
+        if (m) m.style.display = 'none';
+    }}
+
+    function renderModalRooms() {{
+        const tbody = document.getElementById('modal-rooms-tbody');
+        const countEl = document.getElementById('modal-room-count');
+        if (!tbody) return;
+
+        countEl.innerText = allRooms.length;
+        if (allRooms.length === 0) {{
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:20px; color:var(--muted);">Noch keine Räume definiert. Klicke oben auf "Aus Philips Hue importieren" oder lege einen Raum an.</td></tr>';
+            return;
+        }}
+
+        tbody.innerHTML = allRooms.map(r => {{
+            const devCount = allDevices.filter(d => (d.room || '').toLowerCase() === r.name.toLowerCase()).length;
+            const matterTag = r.matter_tag || 'CommonSpace';
+            const hueBadge = r.hue_group_id 
+                ? `<span class="badge" style="background:#fef3c7; color:#92400e; font-size:10px;" title="Hue Gruppe #${{r.hue_group_id}}">💡 #${{r.hue_group_id}}</span>`
+                : '<span style="color:var(--muted); font-size:10px;">—</span>';
+
+            return `
+                <tr style="border-bottom:1px solid var(--border);">
+                    <td style="padding:8px 10px; font-weight:600;">
+                        <span style="font-size:16px; margin-right:6px;">${{r.icon || '📍'}}</span>
+                        <span>${{escapeHtml(r.name)}}</span>
+                    </td>
+                    <td style="padding:8px 10px; color:var(--muted);">${{escapeHtml(r.floor || 'Ohne Etage')}}</td>
+                    <td style="padding:8px 10px;">
+                        <span class="badge" style="background:#e0e7ff; color:#3730a3; font-size:10px; padding:2px 6px;" title="Matter Location Tag: ${{matterTag}}">✨ ${{escapeHtml(matterTag)}}</span>
+                    </td>
+                    <td style="padding:8px 10px;">${{hueBadge}}</td>
+                    <td style="padding:8px 10px; text-align:center;">
+                        <span class="badge" style="background:var(--badge-bg); color:var(--text); font-size:11px; font-weight:600;">${{devCount}}</span>
+                    </td>
+                    <td style="padding:8px 10px; text-align:right; white-space:nowrap;">
+                        <button type="button" class="btn-sm" style="font-size:11px; padding:3px 8px; margin-right:4px; cursor:pointer;" onclick="editRoom('${{r.id}}')">✏️ Edit</button>
+                        <button type="button" class="btn-sm" style="color:var(--status-red); border:1px solid var(--border); font-size:11px; padding:3px 6px; cursor:pointer;" onclick="deleteRoom('${{r.id}}', '${{escapeAttr(r.name)}}')">🗑️</button>
+                    </td>
+                </tr>
+            `;
+        }}).join('');
+    }}
+
+    function editRoom(roomId) {{
+        const r = allRooms.find(item => item.id === roomId);
+        if (!r) return;
+
+        document.getElementById('rm-id').value = r.id;
+        document.getElementById('rm-name').value = r.name;
+        document.getElementById('rm-floor').value = r.floor || 'Erdgeschoss';
+        document.getElementById('rm-archetype').value = r.archetype || 'other';
+        document.getElementById('rm-icon').value = r.icon || '📍';
+        document.getElementById('rm-matter').value = r.matter_tag || 'CommonSpace';
+        document.getElementById('rm-hue-group-id').value = r.hue_group_id || '';
+        document.getElementById('rm-hue-class').value = r.hue_class || '';
+
+        const hueSyncWrap = document.getElementById('rm-hue-sync-wrapper');
+        if (hueSyncWrap) {{
+            hueSyncWrap.style.display = r.hue_group_id ? 'block' : 'none';
+        }}
+
+        document.getElementById('room-editor-title').innerText = '✏️ Raum bearbeiten: ' + r.name;
+        document.getElementById('btn-save-room').innerText = '💾 Änderungen speichern';
+        document.getElementById('btn-cancel-room-edit').style.display = 'inline-block';
+        document.getElementById('rm-name').focus();
+    }}
+
+    function cancelEditRoom() {{
+        document.getElementById('rm-id').value = '';
+        document.getElementById('rm-name').value = '';
+        document.getElementById('rm-floor').value = 'Erdgeschoss';
+        document.getElementById('rm-archetype').value = 'living_room';
+        document.getElementById('rm-icon').value = '🛋️';
+        document.getElementById('rm-matter').value = 'LivingRoom';
+        document.getElementById('rm-hue-group-id').value = '';
+        document.getElementById('rm-hue-class').value = '';
+
+        const hueSyncWrap = document.getElementById('rm-hue-sync-wrapper');
+        if (hueSyncWrap) hueSyncWrap.style.display = 'none';
+
+        document.getElementById('room-editor-title').innerText = '➕ Neuen Raum anlegen';
+        document.getElementById('btn-save-room').innerText = '💾 Raum speichern';
+        document.getElementById('btn-cancel-room-edit').style.display = 'none';
+    }}
+
+    function setRoomIcon(emoji) {{
+        const iconInput = document.getElementById('rm-icon');
+        if (iconInput) iconInput.value = emoji;
+    }}
+
+    async function importHueRooms() {{
+        const btn = document.getElementById('btn-import-hue');
+        const statusEl = document.getElementById('room-op-status');
+        if (btn) btn.disabled = true;
+        if (statusEl) {{
+            statusEl.innerText = 'Importiere Räume & Geräte aus Hue...';
+            statusEl.style.color = 'var(--muted)';
+        }}
+
+        try {{
+            const res = await fetch('/api/rooms/import-hue', {{ method: 'POST' }});
+            const json = await res.json();
+            if (res.ok && json.status === 'ok') {{
+                if (statusEl) {{
+                    statusEl.innerText = json.message || 'Import erfolgreich!';
+                    statusEl.style.color = 'var(--status-green)';
+                }}
+                setTimeout(() => {{
+                    window.location.reload();
+                }}, 1000);
+            }} else {{
+                if (statusEl) {{
+                    statusEl.innerText = 'Fehler: ' + (json.message || 'Import fehlgeschlagen');
+                    statusEl.style.color = 'var(--status-red)';
+                }}
+                if (btn) btn.disabled = false;
+            }}
+        }} catch (e) {{
+            if (statusEl) {{
+                statusEl.innerText = 'Netzwerkfehler: ' + e;
+                statusEl.style.color = 'var(--status-red)';
+            }}
+            if (btn) btn.disabled = false;
+        }}
+    }}
+
+    async function submitNewRoom(event) {{
+        event.preventDefault();
+        const id = document.getElementById('rm-id').value.trim();
+        const name = document.getElementById('rm-name').value.trim();
+        if (!name) return;
+        const floor = document.getElementById('rm-floor').value;
+        const archetype = document.getElementById('rm-archetype').value;
+        const icon = document.getElementById('rm-icon').value.trim();
+        const matter = document.getElementById('rm-matter').value.trim();
+        const hueGroupId = document.getElementById('rm-hue-group-id').value.trim();
+        const hueClass = document.getElementById('rm-hue-class').value.trim();
+        const statusEl = document.getElementById('room-op-status');
+
+        try {{
+            const res = await fetch('/api/rooms', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{
+                    id: id,
+                    name: name,
+                    floor: floor,
+                    archetype: archetype,
+                    icon: icon,
+                    matter_tag: matter,
+                    hue_group_id: hueGroupId || null,
+                    hue_class: hueClass || null,
+                }})
+            }});
+            if (res.ok) {{
+                const data = await res.json();
+                if (statusEl) {{
+                    statusEl.innerText = 'Raum gespeichert!';
+                    statusEl.style.color = 'var(--status-green)';
+                }}
+                setTimeout(() => {{
+                    window.location.reload();
+                }}, 500);
+            }} else {{
+                alert('Fehler beim Speichern des Raums');
+            }}
+        }} catch (e) {{
+            alert('Netzwerkfehler: ' + e);
+        }}
+    }}
+
+    async function deleteRoom(id, name) {{
+        if (!confirm(`Möchtest du den Raum "${{name}}" wirklich löschen?`)) {{
+            return;
+        }}
+        try {{
+            const res = await fetch('/api/rooms/' + encodeURIComponent(id), {{ method: 'DELETE' }});
+            if (res.ok) {{
+                window.location.reload();
+            }} else {{
+                alert('Fehler beim Löschen des Raums');
+            }}
+        }} catch (e) {{
+            alert('Netzwerkfehler: ' + e);
+        }}
+    }}
+
+    const archetypeMap = {{
+        'living_room': {{ icon: '🛋️', tag: 'LivingRoom', floor: 'Erdgeschoss' }},
+        'kitchen': {{ icon: '🍳', tag: 'Kitchen', floor: 'Erdgeschoss' }},
+        'dining_room': {{ icon: '🍽️', tag: 'DiningRoom', floor: 'Erdgeschoss' }},
+        'bedroom': {{ icon: '🛏️', tag: 'Bedroom', floor: 'Obergeschoss' }},
+        'kids_room': {{ icon: '🧸', tag: 'KidsRoom', floor: 'Obergeschoss' }},
+        'bathroom': {{ icon: '🛁', tag: 'Bathroom', floor: 'Obergeschoss' }},
+        'toilet': {{ icon: '🚽', tag: 'Bathroom', floor: 'Erdgeschoss' }},
+        'office': {{ icon: '💼', tag: 'Office', floor: 'Obergeschoss' }},
+        'hallway': {{ icon: '🚪', tag: 'Hallway', floor: 'Erdgeschoss' }},
+        'stairs': {{ icon: '🪜', tag: 'Hallway', floor: 'Erdgeschoss' }},
+        'basement': {{ icon: '📦', tag: 'Basement', floor: 'Keller' }},
+        'outdoor': {{ icon: '🌳', tag: 'Outdoor', floor: 'Außenbereich' }},
+        'garage': {{ icon: '🚗', tag: 'Garage', floor: 'Außenbereich' }},
+        'spa': {{ icon: '🧖', tag: 'Bathroom', floor: 'Keller' }},
+        'other': {{ icon: '📍', tag: 'CommonSpace', floor: 'Erdgeschoss' }}
+    }};
+
+    function onArchetypeSelect(arch) {{
+        const info = archetypeMap[arch];
+        if (info) {{
+            const iconEl = document.getElementById('rm-icon');
+            const matterEl = document.getElementById('rm-matter');
+            const floorEl = document.getElementById('rm-floor');
+            if (iconEl) iconEl.value = info.icon;
+            if (matterEl) matterEl.value = info.tag;
+            if (floorEl) floorEl.value = info.floor;
+        }}
+    }}
+
+    function onRoomNameInput(val) {{
+        val = (val || '').toLowerCase();
+        let detected = null;
+        if (val.includes('wohn')) detected = 'living_room';
+        else if (val.includes('küh') || val.includes('kueh')) detected = 'kitchen';
+        else if (val.includes('ess')) detected = 'dining_room';
+        else if (val.includes('schlaf')) detected = 'bedroom';
+        else if (val.includes('kinder') || val.includes('tom') || val.includes('sophie')) detected = 'kids_room';
+        else if (val.includes('bad') || val.includes('bath')) detected = 'bathroom';
+        else if (val.includes('wc') || val.includes('toilet')) detected = 'toilet';
+        else if (val.includes('büro') || val.includes('buero') || val.includes('arbeit')) detected = 'office';
+        else if (val.includes('flur') || val.includes('windfang') || val.includes('diele')) detected = 'hallway';
+        else if (val.includes('keller') || val.includes('ug')) detected = 'basement';
+        else if (val.includes('garten') || val.includes('terrasse') || val.includes('balkon') || val.includes('vordach')) detected = 'outdoor';
+        else if (val.includes('garage') || val.includes('carport')) detected = 'garage';
+        else if (val.includes('sauna') || val.includes('wellness')) detected = 'spa';
+
+        if (detected) {{
+            const archEl = document.getElementById('rm-archetype');
+            if (archEl) {{
+                archEl.value = detected;
+                onArchetypeSelect(detected);
+            }}
         }}
     }}
 
@@ -3768,7 +6077,9 @@ fn render_devices_page(
     </script>
     "#,
         client_devices_json,
-        all_products_str
+        all_products_str,
+        client_rooms_json,
+        client_govee_json
     );
 
     let content = format!(
@@ -3790,10 +6101,11 @@ fn render_devices_page(
             <button type="button" class="status-pill" id="filter-status-active" onclick="setStatusFilter('active', this)">🟢 Active ({})</button>
             <button type="button" class="status-pill" id="filter-status-inactive" onclick="setStatusFilter('inactive', this)" title="Geräte, die HomeNode Server zuvor aktiv erkannt hat, aktuell offline">⚪ Former ({})</button>
             <button type="button" class="status-pill" id="filter-status-archive" onclick="setStatusFilter('archive', this)" title="Reine inaktive Alt-Leases / Geräte im FRITZ!Box Router-Archiv">📦 Router Archive ({})</button>
+            <button type="button" class="status-pill" id="filter-status-ignored" onclick="setStatusFilter('ignored', this)" title="Ignorierte Nachbargeräte & blockierte BLE-Sender" style="color:var(--status-red);">🚫 Ignored ({})</button>
 
-            <span style="font-size:12px; font-weight:600; color:var(--muted); margin-left:12px; margin-right:4px;">Scanner:</span>
+            <span style="font-size:12px; font-weight:600; color:var(--muted); margin-left:12px; margin-right:4px;">Interfaces:</span>
             <select id="scanner-filter" onchange="setScannerFilter(this.value)" style="background:var(--bg-card); color:var(--text); border:1px solid var(--border); border-radius:6px; font-size:12px; padding:3px 8px; cursor:pointer;">
-                <option value="all">All Scanners</option>
+                <option value="all">Alle Interfaces</option>
                 <option value="arp">📡 ARP</option>
                 <option value="ping">⚡ Ping / ICMP</option>
                 <option value="mdns">🔍 mDNS / Bonjour</option>
@@ -3803,7 +6115,25 @@ fn render_devices_page(
                 <option value="bthome">📶 BTHome (BLE Sensors & Buttons)</option>
                 <option value="shelly-gateway">📡 Shelly BLE Gateways</option>
                 <option value="philips-hue">💡 Philips Hue</option>
+                <option value="mobile-scout">📱 mHomeNode Mobile Scout</option>
             </select>
+
+            <span style="font-size:12px; font-weight:600; color:var(--muted); margin-left:12px; margin-right:4px;">Raum:</span>
+            <select id="room-filter" onchange="setRoomFilter(this.value)" style="background:var(--bg-card); color:var(--text); border:1px solid var(--border); border-radius:6px; font-size:12px; padding:3px 8px; cursor:pointer;">
+                {}
+            </select>
+
+            <span style="font-size:12px; font-weight:600; color:var(--muted); margin-left:8px; margin-right:4px;">Etage:</span>
+            <select id="floor-filter" onchange="setFloorFilter(this.value)" style="background:var(--bg-card); color:var(--text); border:1px solid var(--border); border-radius:6px; font-size:12px; padding:3px 8px; cursor:pointer;">
+                <option value="all">Alle Etagen</option>
+                <option value="Dachgeschoss">Dachgeschoss</option>
+                <option value="Obergeschoss">Obergeschoss</option>
+                <option value="Erdgeschoss">Erdgeschoss</option>
+                <option value="Keller">Keller</option>
+                <option value="Außenbereich">Außenbereich</option>
+            </select>
+
+            <button type="button" class="btn-sm" style="margin-left:8px; font-size:11px; cursor:pointer; background:var(--surface); border:1px solid var(--border);" onclick="openRoomModal()">🚪 Räume verwalten</button>
         </div>
         <div class="pills">{}</div>
 
@@ -3833,12 +6163,152 @@ fn render_devices_page(
             </div>
         </div>
 
+        <!-- Room Manager Modal -->
+        <div id="room-manager-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.55); z-index:9999; overflow-y:auto; backdrop-filter:blur(2px);">
+            <div class="card" style="max-width:760px; margin:40px auto; padding:24px; box-shadow:0 12px 35px rgba(0,0,0,0.3);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; border-bottom:1px solid var(--border); padding-bottom:12px;">
+                    <div>
+                        <h3 style="margin:0; display:flex; align-items:center; gap:8px;">
+                            <span>🚪</span> <span>Raum- & Standortverwaltung</span>
+                        </h3>
+                        <div style="font-size:11px; color:var(--muted); margin-top:3px;">
+                            Strukturierte Räume & Etagen • Synchronisierbar mit Apple Home (HMRoom/HMFloor) & Matter 1.3+
+                        </div>
+                    </div>
+                    <button type="button" class="btn-sm" onclick="closeRoomModal()" style="font-size:14px; font-weight:bold; cursor:pointer;">✕</button>
+                </div>
+
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; background:var(--surface); padding:10px 14px; border-radius:8px; border:1px solid var(--border);">
+                    <div>
+                        <div style="font-weight:600; font-size:12px;">💡 Philips Hue Bridge Räume</div>
+                        <div style="font-size:11px; color:var(--muted);">Importiert alle konfigurierten Räume & ordnet Leuchten/Sensoren automatisch zu.</div>
+                    </div>
+                    <button type="button" id="btn-import-hue" class="btn btn-sm btn-primary" onclick="importHueRooms()">
+                        <span>🔄</span> <span>Aus Philips Hue importieren</span>
+                    </button>
+                </div>
+
+                <!-- Room Editor Form (Create or Edit) -->
+                <div style="margin-bottom:16px; background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:14px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                        <span id="room-editor-title" style="font-size:13px; font-weight:700; color:var(--text);">➕ Neuen Raum anlegen</span>
+                        <button type="button" id="btn-cancel-room-edit" class="btn-sm" style="display:none; font-size:11px; cursor:pointer;" onclick="cancelEditRoom()">Abbrechen</button>
+                    </div>
+                    <form id="add-room-form" onsubmit="submitNewRoom(event)">
+                        <input type="hidden" id="rm-id" value="" />
+                        <input type="hidden" id="rm-hue-group-id" value="" />
+                        <input type="hidden" id="rm-hue-class" value="" />
+
+                        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px;">
+                            <div>
+                                <label style="font-size:11px; font-weight:600; color:var(--muted);">Raumname *</label>
+                                <input type="text" id="rm-name" class="form-control" required placeholder="z.B. Wohnzimmer, Büro..." oninput="onRoomNameInput(this.value)" />
+                            </div>
+                            <div>
+                                <label style="font-size:11px; font-weight:600; color:var(--muted);">Etage (Floor)</label>
+                                <select id="rm-floor" class="form-control">
+                                    <option value="Dachgeschoss">Dachgeschoss</option>
+                                    <option value="Obergeschoss">Obergeschoss</option>
+                                    <option value="Erdgeschoss" selected>Erdgeschoss</option>
+                                    <option value="Keller">Keller</option>
+                                    <option value="Außenbereich">Außenbereich</option>
+                                    <option value="Sonstige">Sonstige</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-bottom:12px;">
+                            <div>
+                                <label style="font-size:11px; font-weight:600; color:var(--muted);">Archetyp / Raumtyp</label>
+                                <select id="rm-archetype" class="form-control" onchange="onArchetypeSelect(this.value)">
+                                    <option value="living_room">Wohnzimmer (Living Room)</option>
+                                    <option value="kitchen">Küche (Kitchen)</option>
+                                    <option value="dining_room">Esszimmer (Dining)</option>
+                                    <option value="bedroom">Schlafzimmer (Bedroom)</option>
+                                    <option value="kids_room">Kinderzimmer (Kids)</option>
+                                    <option value="bathroom">Badezimmer (Bathroom)</option>
+                                    <option value="toilet">Toilette / Gäste-WC</option>
+                                    <option value="office">Büro / Arbeitszimmer (Office)</option>
+                                    <option value="hallway">Flur / Diele (Hallway)</option>
+                                    <option value="stairs">Treppenhaus (Stairs)</option>
+                                    <option value="basement">Keller / Lager (Basement)</option>
+                                    <option value="outdoor">Außen / Garten / Terrasse</option>
+                                    <option value="garage">Garage / Carport</option>
+                                    <option value="spa">Sauna / Spa</option>
+                                    <option value="other">Sonstiger Raum</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label style="font-size:11px; font-weight:600; color:var(--muted);">Icon (Emoji)</label>
+                                <div style="display:flex; gap:6px; align-items:center;">
+                                    <input type="text" id="rm-icon" class="form-control" style="width:50px; text-align:center; font-size:16px;" value="🛋️" />
+                                    <div style="display:flex; gap:4px; flex-wrap:wrap;">
+                                        <span style="cursor:pointer; font-size:14px;" onclick="setRoomIcon('🛋️')" title="Wohnzimmer">🛋️</span>
+                                        <span style="cursor:pointer; font-size:14px;" onclick="setRoomIcon('🍳')" title="Küche">🍳</span>
+                                        <span style="cursor:pointer; font-size:14px;" onclick="setRoomIcon('🛏️')" title="Schlafzimmer">🛏️</span>
+                                        <span style="cursor:pointer; font-size:14px;" onclick="setRoomIcon('🛁')" title="Bad">🛁</span>
+                                        <span style="cursor:pointer; font-size:14px;" onclick="setRoomIcon('💼')" title="Büro">💼</span>
+                                        <span style="cursor:pointer; font-size:14px;" onclick="setRoomIcon('🚪')" title="Flur">🚪</span>
+                                        <span style="cursor:pointer; font-size:14px;" onclick="setRoomIcon('📦')" title="Keller">📦</span>
+                                        <span style="cursor:pointer; font-size:14px;" onclick="setRoomIcon('🌳')" title="Garten">🌳</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div>
+                                <label style="font-size:11px; font-weight:600; color:var(--muted);">Matter Area Tag</label>
+                                <input type="text" id="rm-matter" class="form-control" value="LivingRoom" />
+                            </div>
+                        </div>
+
+                        <div id="rm-hue-sync-wrapper" style="display:none; margin-bottom:12px; background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.25); border-radius:6px; padding:8px 10px; font-size:11px;">
+                            <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                                <input type="checkbox" id="rm-sync-hue" checked />
+                                <span>💡 Änderung (Name & Typ) auch direkt an die Philips Hue Bridge übertragen</span>
+                            </label>
+                        </div>
+
+                        <div style="display:flex; justify-content:flex-end; gap:8px;">
+                            <button type="submit" class="btn btn-sm btn-primary" id="btn-save-room">💾 Raum speichern</button>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- Existing Rooms Table -->
+                <div style="font-weight:600; font-size:12px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
+                    <span>Vorhandene Räume (<span id="modal-room-count">0</span>)</span>
+                    <span id="room-op-status" style="font-size:11px; font-weight:normal;"></span>
+                </div>
+                <div style="max-height:360px; overflow-y:auto; border:1px solid var(--border); border-radius:6px;">
+                    <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                        <thead>
+                            <tr style="background:var(--surface); border-bottom:1px solid var(--border); text-align:left;">
+                                <th style="padding:8px 10px;">Raum</th>
+                                <th style="padding:8px 10px;">Etage</th>
+                                <th style="padding:8px 10px;">Matter Tag</th>
+                                <th style="padding:8px 10px;">Hue Bridge</th>
+                                <th style="padding:8px 10px; text-align:center;">Geräte</th>
+                                <th style="padding:8px 10px; text-align:right;">Aktionen</th>
+                            </tr>
+                        </thead>
+                        <tbody id="modal-rooms-tbody">
+                            <!-- Injected via JavaScript -->
+                        </tbody>
+                    </table>
+                </div>
+
+                <div style="display:flex; justify-content:flex-end; margin-top:16px;">
+                    <button type="button" class="btn" style="background:var(--badge-bg); color:var(--text);" onclick="closeRoomModal()">Schließen</button>
+                </div>
+            </div>
+        </div>
+
         {}"#,
         unified_devices.len(),
         total_count,
         active_count,
         former_count,
         archive_count,
+        ignored_count,
+        room_filter_options,
         pills_html,
         group_cards_html,
         script
@@ -5410,7 +7880,7 @@ fn init_tracing() {
 }
 
 fn default_listen_addr() -> String {
-    String::from("127.0.0.1:8080")
+    String::from("0.0.0.0:8080")
 }
 
 fn default_status_title() -> String {

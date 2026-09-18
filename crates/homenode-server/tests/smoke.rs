@@ -156,10 +156,12 @@ config = "{network_config}"
     .await?;
 
     assert_eq!(snapshot.modules.len(), 2);
-    let page = fetch_http_page(&listen_addr).await?;
-    assert!(page.contains("HomeNode Test"));
-    assert!(page.contains("network-discovery"));
-    assert!(page.contains("Network Switch"));
+    let status_page = fetch_http_page(&listen_addr, "/status").await?;
+    assert!(status_page.contains("HomeNode Test"));
+    assert!(status_page.contains("network-discovery"));
+
+    let devices_page = fetch_http_page(&listen_addr, "/devices").await?;
+    assert!(devices_page.contains("Network Switch"));
 
     let _ = shutdown_tx.send(());
     handle.await??;
@@ -313,9 +315,9 @@ async fn wait_for_snapshot(
     }
 }
 
-async fn fetch_http_page(listen_addr: &str) -> Result<String> {
+async fn fetch_http_page(listen_addr: &str, path: &str) -> Result<String> {
     let mut stream = tokio::net::TcpStream::connect(listen_addr).await?;
-    let request = format!("GET / HTTP/1.1\r\nHost: {listen_addr}\r\nConnection: close\r\n\r\n");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {listen_addr}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await?;
 
     let mut response = Vec::new();

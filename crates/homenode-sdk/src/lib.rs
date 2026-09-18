@@ -44,6 +44,7 @@ pub struct ModuleEnvironment {
     pub config_path: PathBuf,
     pub module_id: String,
     pub server_config_path: PathBuf,
+    pub local_ip: Option<String>,
 }
 
 impl ModuleEnvironment {
@@ -60,6 +61,7 @@ impl ModuleEnvironment {
             server_config_path: std::env::var("HOMENODE_SERVER_CONFIG")
                 .map(PathBuf::from)
                 .context("missing HOMENODE_SERVER_CONFIG")?,
+            local_ip: std::env::var("HOMENODE_LOCAL_IP").ok().filter(|s| !s.trim().is_empty() && s != "auto"),
         })
     }
 }
@@ -155,4 +157,57 @@ pub fn module_command(
             .map(|(k, v)| (k.into(), v.into()))
             .collect::<HashMap<_, _>>(),
     }
+}
+
+/// Detect the host system's primary IPv4 address on the local network (LAN)
+pub fn detect_local_network_ip() -> Option<String> {
+    if let Ok(ip) = std::env::var("HOMENODE_LOCAL_IP") {
+        if !ip.trim().is_empty() && ip != "auto" {
+            return Some(ip.trim().to_string());
+        }
+    }
+
+    // 1. Query OS kernel routing table via UDP connect (no network packets actually transmitted)
+    let targets = [
+        "8.8.8.8:80",
+        "1.1.1.1:80",
+        "192.168.178.1:80",
+        "192.168.1.1:80",
+        "192.168.0.1:80",
+        "10.0.0.1:80",
+    ];
+
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        for target in &targets {
+            if socket.connect(target).is_ok() {
+                if let Ok(addr) = socket.local_addr() {
+                    let ip = addr.ip();
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        if let std::net::IpAddr::V4(ipv4) = ip {
+                            return Some(ipv4.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback: inspect network interfaces directly using if-addrs
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if !iface.is_loopback() {
+                if let std::net::IpAddr::V4(ipv4) = iface.ip() {
+                    let octets = ipv4.octets();
+                    if (octets[0] == 192 && octets[1] == 168)
+                        || octets[0] == 10
+                        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                    {
+                        return Some(ipv4.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }

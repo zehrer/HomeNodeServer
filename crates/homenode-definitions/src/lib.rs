@@ -9,6 +9,18 @@ use tracing::{debug, info, warn};
 pub mod catalog;
 pub use catalog::{CatalogDatabase, Product, Vendor};
 
+pub mod ignore_list;
+pub use ignore_list::{normalize_identifier, IgnoredDeviceRecord, IgnoredDevicesStore};
+
+pub mod rooms;
+pub use rooms::{
+    default_icon_for_archetype, deduce_archetype_from_name, deduce_floor_from_name,
+    matter_area_tag_for_archetype, slugify_room_id, RoomRecord, RoomsStore,
+};
+
+pub mod light_groups;
+pub use light_groups::{LightGroup, LightGroupsStore};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceMeta {
     pub id: String,

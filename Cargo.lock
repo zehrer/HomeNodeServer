@@ -1065,6 +1065,7 @@ name = "homenode-definitions"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "rhai",
  "serde",
  "serde_json",
@@ -1080,6 +1081,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "homenode-definitions",
  "homenode-sdk",
  "serde",
  "serde_json",
@@ -1146,6 +1148,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "homenode-definitions",
  "homenode-sdk",
  "reqwest",
  "serde",
@@ -1166,6 +1169,7 @@ dependencies = [
  "chrono",
  "homenode-definitions",
  "homenode-sdk",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -1181,6 +1185,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hyper-util",
+ "if-addrs 0.13.4",
  "prost",
  "protoc-bin-vendored",
  "serde",

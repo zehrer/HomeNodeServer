@@ -133,6 +133,7 @@ struct AppState {
     module_id: String,
     pairing_in_progress: Arc<Mutex<bool>>,
     last_status: Arc<Mutex<String>>,
+    discovered_rooms: Arc<Mutex<Vec<homenode_definitions::RoomRecord>>>,
 }
 
 fn init_tracing() {
@@ -235,6 +236,54 @@ async fn fetch_and_sync_devices(state: &AppState) -> Result<()> {
         return Ok(());
     };
 
+    // Query groups from Hue bridge to map lights and sensors to rooms
+    let groups_url = format!("http://{}:{}/api/{}/groups", ip, port, username);
+    let mut light_to_room: HashMap<String, String> = HashMap::new();
+    let mut sensor_to_room: HashMap<String, String> = HashMap::new();
+    let mut discovered_rooms: Vec<homenode_definitions::RoomRecord> = Vec::new();
+
+    if let Ok(grp_resp) = state.http_client.get(&groups_url).timeout(Duration::from_secs(3)).send().await {
+        if let Ok(grp_val) = grp_resp.json::<Value>().await {
+            if let Some(grp_obj) = grp_val.as_object() {
+                for (gid, g_val) in grp_obj {
+                    let g_type = g_val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if g_type == "Room" {
+                        let g_name = g_val.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let g_class = g_val.get("class").and_then(|v| v.as_str()).unwrap_or("Other").to_string();
+                        if !g_name.is_empty() {
+                            let slug = homenode_definitions::slugify_room_id(&g_name);
+                            let arch = homenode_definitions::deduce_archetype_from_name(&g_name);
+                            let mut room = homenode_definitions::RoomRecord::new(slug, &g_name, None, None, arch);
+                            room.hue_group_id = Some(gid.clone());
+                            room.hue_class = Some(g_class);
+                            discovered_rooms.push(room);
+
+                            if let Some(lights_arr) = g_val.get("lights").and_then(|v| v.as_array()) {
+                                for l in lights_arr {
+                                    if let Some(lid) = l.as_str() {
+                                        light_to_room.insert(lid.to_string(), g_name.clone());
+                                    }
+                                }
+                            }
+                            if let Some(sensors_arr) = g_val.get("sensors").and_then(|v| v.as_array()) {
+                                for s in sensors_arr {
+                                    if let Some(sid) = s.as_str() {
+                                        sensor_to_room.insert(sid.to_string(), g_name.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        let mut r = state.discovered_rooms.lock().await;
+        *r = discovered_rooms;
+    }
+
     let mut device_records = Vec::new();
     let mut lights_cache = HashMap::new();
 
@@ -292,6 +341,9 @@ async fn fetch_and_sync_devices(state: &AppState) -> Result<()> {
         if let Some(cm) = &colormode {
             meta.insert("colormode".to_string(), cm.clone());
         }
+        if let Some(r) = light_to_room.get(id_str) {
+            meta.insert("room".to_string(), r.clone());
+        }
         meta.insert("last_seen".to_string(), Utc::now().to_rfc3339());
 
         let dev_id = if !uniqueid.is_empty() {
@@ -321,7 +373,9 @@ async fn fetch_and_sync_devices(state: &AppState) -> Result<()> {
                     // Only process tangible physical sensors: Motion (ZLLPresence), Dimmer/Tap Switches (ZLLSwitch, ZGPSwitch)
                     if s_type == "ZLLPresence" || s_type == "ZLLSwitch" || s_type == "ZGPSwitch" {
                         let s_name = s_val.get("name").and_then(|v| v.as_str()).unwrap_or("Hue Sensor").to_string();
-                        let _s_model = s_val.get("modelid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let s_model = s_val.get("modelid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let s_product = s_val.get("productname").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let s_manufacturer = s_val.get("manufacturername").and_then(|v| v.as_str()).unwrap_or("Philips Hue (Signify)").to_string();
                         let uniqueid = s_val.get("uniqueid").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let state_obj = s_val.get("state");
                         let config_obj = s_val.get("config");
@@ -342,6 +396,30 @@ async fn fetch_and_sync_devices(state: &AppState) -> Result<()> {
                         meta.insert("sensor_id".to_string(), id_str.clone());
                         meta.insert("uniqueid".to_string(), uniqueid.clone());
                         meta.insert("vendor".to_string(), "Philips Hue (Signify)".to_string());
+                        if !s_model.is_empty() {
+                            meta.insert("model".to_string(), s_model.clone());
+                            meta.insert("model_id".to_string(), s_model.clone());
+                        }
+                        if !s_product.is_empty() {
+                            meta.insert("product_name".to_string(), s_product.clone());
+                        }
+                        if !s_manufacturer.is_empty() {
+                            meta.insert("manufacturer".to_string(), s_manufacturer.clone());
+                        }
+
+                        // Map model ID to known catalog product_id
+                        let product_id = match s_model.as_str() {
+                            "FOHSWITCH" => Some("philips_foh_switch"),
+                            "RDM001" => Some("philips_hue_wall_switch"),
+                            "RWL021" | "RWL022" => Some("philips_hue_dimmer_switch"),
+                            "SML001" | "SML002" => Some("philips_hue_motion_sensor"),
+                            "SML004" => Some("philips_hue_outdoor_motion_sensor"),
+                            _ => None,
+                        };
+                        if let Some(pid) = product_id {
+                            meta.insert("product_id".to_string(), pid.to_string());
+                        }
+
                         meta.insert("source".to_string(), "philips-hue".to_string());
                         meta.insert("sources".to_string(), "philips-hue".to_string());
                         meta.insert("status".to_string(), "active".to_string());
@@ -354,12 +432,15 @@ async fn fetch_and_sync_devices(state: &AppState) -> Result<()> {
                             meta.insert("motion_detected".to_string(), presence.to_string());
                             ("sensor", "Motion Detectors", "🚶")
                         } else {
-                            ("button", "Remote Controls & Switches", "🔘")
+                            ("button", "Buttons & Remote Controls", "🔘")
                         };
 
                         meta.insert("category".to_string(), kind.to_string());
                         meta.insert("category_title".to_string(), title.to_string());
                         meta.insert("category_icon".to_string(), icon.to_string());
+                        if let Some(r) = sensor_to_room.get(id_str) {
+                            meta.insert("room".to_string(), r.clone());
+                        }
                         meta.insert("last_seen".to_string(), Utc::now().to_rfc3339());
 
                         let dev_id = if !uniqueid.is_empty() {
@@ -397,6 +478,7 @@ async fn fetch_and_sync_devices(state: &AppState) -> Result<()> {
             .upsert_devices(UpsertDevicesRequest {
                 module_id: state.module_id.clone(),
                 devices: device_records,
+                replace_all: true,
             })
             .await
         {
@@ -468,6 +550,11 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
             "paired_bridge_ip": creds.as_ref().and_then(|c| c.bridge_ip.clone())
         })),
     )
+}
+
+async fn rooms_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let rooms = state.discovered_rooms.lock().await.clone();
+    (StatusCode::OK, Json(rooms))
 }
 
 async fn pair_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -548,6 +635,31 @@ async fn light_toggle_handler(
                 }
             }
             (StatusCode::OK, Json(json!({"status": "ok", "on": target_on})))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "message": e.to_string()})),
+        ),
+    }
+}
+
+async fn light_state_handler(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match set_light_state(&state, &id, &payload).await {
+        Ok(_) => {
+            if let Some(on_val) = payload.get("on").and_then(|v| v.as_bool()) {
+                let mut lights = state.active_lights.lock().await;
+                if let Some(l) = lights.get_mut(&id) {
+                    l.on = on_val;
+                    if let Some(bri) = payload.get("bri").and_then(|b| b.as_u64()) {
+                        l.bri = bri as u8;
+                    }
+                }
+            }
+            (StatusCode::OK, Json(json!({"status": "ok", "state": payload})))
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -652,6 +764,7 @@ async fn main() -> Result<()> {
         module_id: env.module_id.clone(),
         pairing_in_progress: Arc::new(Mutex::new(false)),
         last_status: Arc::new(Mutex::new(initial_status)),
+        discovered_rooms: Arc::new(Mutex::new(Vec::new())),
     };
 
     // Command subscription listener task
@@ -736,6 +849,8 @@ async fn main() -> Result<()> {
         .route("/api/pair", post(pair_handler))
         .route("/api/lights", get(lights_handler))
         .route("/api/lights/:id/toggle", post(light_toggle_handler))
+        .route("/api/lights/:id/state", post(light_state_handler))
+        .route("/api/rooms", get(rooms_handler))
         .with_state(app_state.clone());
 
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], config.listen_port));

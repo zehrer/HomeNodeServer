@@ -8,22 +8,32 @@ child processes.
 
 The current module classes are:
 
-- `web`: HTTP status surface backed by runtime snapshots
-- `matter-controller`: placeholder for future controller features
-- `matter-bridge`: placeholder for future bridge features
-- `network-discovery`: placeholder for network inventory and standard discovery
-- `bthome`: passive BLE advertisement receiver and decoder for BTHome V1/V2 sensors (Shelly BLU, beacons)
+- `web`: HTTP UI & HMI (Dashboard, Devices inventory, Room & Floor view, Govee LAN control, Matter matrix)
+- `network-discovery`: Network inventory scanner (ARP, ICMP ping sweep, mDNS, SSDP, TR-064, HTTP probe, Matter discovery)
+- `philips-hue`: Local Philips Hue Bridge integration (Zigbee lights & sensors, link-button pairing, real-time control, bi-directional room sync)
+- `bthome`: Passive BLE advertisement receiver and decoder for BTHome V1/V2 sensors (Shelly BLU, beacons) via local Shelly BLE gateways
+- `matter-controller`: Foundation for Matter controller features
+- `matter-bridge`: Foundation for Matter bridge features
 
-Reserved module IDs for later phases:
+Reserved / future module IDs:
 
 - `tuya`
 - `shelly`
-- `govee`
-- `zigbee`
+- `govee` (Local UDP LAN control currently integrated in `modules/web`)
+- `zigbee` (Standalone Zigbee coordinator beyond Hue Bridge)
 - `switchbot`
 - `native-devices`
 - `ai-local`
 - `extensions`
+
+## Persistent State Stores
+
+HomeNode Server persists user customizations and state under `data/`:
+
+- `data/docs_store.json`: Device custom names, assigned room IDs, and documentation notes
+- `data/rooms_store.json`: Floor & room hierarchy with custom emoji icons
+- `data/light_groups_store.json`: Virtual merged light luminaires
+- `data/ignore_list.json`: Filtered/ignored devices and noisy BLE MACs
 
 ## Runtime contract
 

@@ -194,9 +194,21 @@ impl CatalogDatabase {
         let mut best_match: Option<(&Product, usize, bool)> = None;
 
         for product in &self.products {
+            let v_name = self.find_vendor(&product.vendor_id).map(|v| v.name.to_lowercase()).unwrap_or_default();
+            let norm_vendor_id = product.vendor_id.replace('_', " ");
             let vendor_matches = !vendor_lower.is_empty()
                 && (product.vendor_id.eq_ignore_ascii_case(&vendor_lower)
-                    || vendor_lower.contains(&product.vendor_id));
+                    || vendor_lower.contains(&product.vendor_id)
+                    || product.vendor_id.contains(&vendor_lower)
+                    || vendor_lower.contains(&norm_vendor_id)
+                    || (!v_name.is_empty() && (vendor_lower.contains(&v_name) || v_name.contains(&vendor_lower))));
+
+            // If a specific vendor hint was provided, do not match products with conflicting vendors or generic switches
+            if !vendor_lower.is_empty() && !vendor_matches {
+                if product.vendor_id == "generic_switch" || !product.vendor_id.starts_with("generic") {
+                    continue;
+                }
+            }
 
             for pattern in &product.hostname_patterns {
                 let pat = pattern.to_lowercase();
@@ -205,6 +217,8 @@ impl CatalogDatabase {
                 }
                 let is_match = if pat.contains('.') {
                     raw_host == pat || raw_host == format!("{pat}.")
+                } else if pat.len() <= 6 && (pat == "switch" || pat == "hub" || pat == "router" || pat == "bridge") {
+                    host_clean == pat || host_clean.starts_with(&format!("{pat}-")) || host_clean.ends_with(&format!("-{pat}"))
                 } else {
                     host_clean.contains(&pat)
                 };
@@ -405,6 +419,14 @@ mod tests {
             let vpn_peer = catalog.match_product("iphonestephan.fritz.box", Some("WireGuard / FRITZ!Box VPN"), &[]);
             assert!(vpn_peer.is_some());
             assert_eq!(vpn_peer.unwrap().id, "wireguard_vpn_peer");
+
+            // Test Philips Hue Wall Switch / Dimmer vs Network Switch
+            let hue_switch = catalog.match_product("Switch Sophie", Some("Philips Hue (Signify)"), &[]);
+            assert!(hue_switch.is_none() || hue_switch.unwrap().id != "unmanaged_switch_l2");
+
+            let hue_dimmer = catalog.match_product("Hue Dimmer Switch", Some("Philips Hue (Signify)"), &[]);
+            assert!(hue_dimmer.is_some());
+            assert_eq!(hue_dimmer.unwrap().id, "philips_hue_dimmer_switch");
         }
     }
 }

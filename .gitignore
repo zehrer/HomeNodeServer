@@ -3,4 +3,6 @@ target/
 *.sock
 .tmp/
 config/server.toml
+config/modules/*.toml
+!config/modules/*.example.toml
 data/

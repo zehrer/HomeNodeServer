@@ -56,6 +56,17 @@ where
     F: Future<Output = ()> + Send,
 {
     let socket_path = config.server.socket_path.clone();
+
+    // Prevent multiple server instances from conflicting on ports
+    if socket_path.exists() {
+        if homenode_sdk::connect_control_client(&socket_path).await.is_ok() {
+            anyhow::bail!(
+                "Another HomeNode Server instance is already running on {}",
+                socket_path.display()
+            );
+        }
+    }
+
     if let Some(parent) = socket_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -67,6 +78,9 @@ where
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("failed to remove stale socket"),
     }
+
+    let local_ip = homenode_sdk::detect_local_network_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+    info!("Identified primary local network IP: {}", local_ip);
 
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind {}", socket_path.display()))?;
@@ -86,7 +100,7 @@ where
     });
 
     let children = Arc::new(Mutex::new(Vec::new()));
-    launch_modules(&config_path, &config, children.clone()).await?;
+    launch_modules(&config_path, &config, children.clone(), &local_ip).await?;
 
     let (monitor_stop_tx, monitor_stop_rx) = oneshot::channel::<()>();
     let monitor_task = tokio::spawn(monitor_children(
@@ -138,9 +152,10 @@ async fn launch_modules(
     config_path: &Path,
     config: &HomeNodeConfig,
     children: SharedChildren,
+    local_ip: &str,
 ) -> Result<()> {
     for module in enabled_modules(config)? {
-        let child = spawn_module(config_path, &config.server.socket_path, &module).await?;
+        let child = spawn_module(config_path, &config.server.socket_path, &module, local_ip).await?;
         info!(
             alias = %module.alias,
             module_id = %module.module_id,
@@ -162,6 +177,7 @@ async fn spawn_module(
     server_config_path: &Path,
     socket_path: &Path,
     module: &ModuleLaunchSpec,
+    local_ip: &str,
 ) -> Result<Child> {
     let program = resolve_program_path(&module.program);
     let mut command = Command::new(&program);
@@ -171,6 +187,8 @@ async fn spawn_module(
         .env("HOMENODE_MODULE_CONFIG", &module.config_path)
         .env("HOMENODE_MODULE_ID", &module.module_id)
         .env("HOMENODE_SERVER_CONFIG", server_config_path)
+        .env("HOMENODE_LOCAL_IP", local_ip)
+        .env("HOMENODE_HOST", local_ip)
         .kill_on_drop(true);
 
     for (key, value) in &module.env {
